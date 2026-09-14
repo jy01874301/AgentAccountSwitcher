@@ -16,7 +16,7 @@
 wb_switcher/（switcher 系列工具所在目录）
 ├── tw_ui_server.py        # Trae 后端：账号读写/切换 + 本地 HTTP 服务（127.0.0.1:8766）
 ├── switcher_common.py     # 两个切换器共用的 HTTP 骨架 / 文件锁 / 备份裁剪 / 端口避让
-├── tw_ui_index.html       # Trae 前端页面
+├── ui_template.html       # 前端模板（与 WorkBuddy 切换器共用，后端按 UI_CONTEXT 渲染）
 ├── trae_switcher.cmd      # Trae 启动脚本（双击即用）
 ├── tw_auth/               # 切换用账号素材库，每账号放一份 storage.json
 │   ├── trae-wtnong.json
@@ -26,7 +26,7 @@ wb_switcher/（switcher 系列工具所在目录）
 ├── tw_backups/            # 切号时自动备份的登录态（gitignore 排除，超 10 份自动裁剪）
 ├── TraeSwitcher.spec      # 桌面版打包配置：pyinstaller TraeSwitcher.spec
 ├── import_token.py        # 凭据导入（别机 tokens / storage.json → config.json）
-└── wb_ui_*.py / wb_ui_index.html / workbuddy_switcher.cmd   # 同目录下的 WorkBuddy 切换器（姊妹工具）
+└── wb_ui_server.py / wb_ui_app.py / workbuddy_switcher.cmd  # 同目录下的 WorkBuddy 切换器（姊妹工具）
 ```
 
 ---
@@ -95,6 +95,18 @@ python tw_ui_server.py --switch NAME   # 切换为 tw_auth\NAME 账号
 python tw_ui_server.py --serve --port 8766   # 启动本地 HTTP 服务（默认 8766，被占用自动顺延）
 python tw_ui_server.py --prune [N]           # 清理 tw_backups 备份，只留最近 N 份（默认 10）
 ```
+
+### 自动续期
+
+```bash
+python tw_ui_server.py --refresh-all      # 对 tw_auth 全部素材各续期一次
+trae_refresh_all.cmd                      # 同上，双击即可
+```
+
+> ⚠ **跨设备导入的素材无法远程续期**：服务端会返回
+> `20403 Token device not match`（refreshToken 绑定签发它的设备，与素材里的 icube-dc 私钥不匹配）。
+> 这类素材只能靠 Trae 客户端本地续期；`--refresh-all` 会如实报 FAIL 并返回退出码 1，
+> 不影响切换功能本身。
 
 ### 并发与备份策略
 

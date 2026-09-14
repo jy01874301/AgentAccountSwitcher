@@ -3,7 +3,8 @@
 """WorkBuddy 账号切换器 —— 桌面版启动器。
 
 以原生窗口（WebView）内嵌 wb_ui_server 的 Web 界面，双击即可运行，不依赖本机 Python。
-工作目录约定：exe 所在目录是与账号数据（wb_auth）和界面（wb_ui_index.html）同级的目录。
+工作目录约定：exe 所在目录与账号数据（wb_auth）同级；前端模板 ui_template.html
+打包后位于 _internal/，由 common.resolve_data() 依次查找。
 
 打包态注意：PyInstaller 会把 __file__ 指向临时解包目录（_MEIPASS），因此这里在导入
 wb_ui_server 后显式把数据目录纠正为 exe 所在目录。

@@ -471,6 +471,23 @@ def refresh_account_file(file_name):
     return ok, msg
 
 
+def refresh_all():
+    """对 tw_auth 下全部素材各续期一次，供计划任务调用。返回退出码。"""
+    results = []
+    for a in list_accounts():
+        if not a.get("ok"):
+            results.append((a["file"], False, a.get("reason") or "不可用，跳过"))
+            continue
+        ok, msg = refresh_account_file(a["file"])
+        results.append((a["file"], ok, msg))
+        common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "refresh-all", a["file"], ok, msg)
+    ok_n = sum(1 for r in results if r[1])
+    for f, ok, msg in results:
+        print("%-4s %-32s %s" % ("OK" if ok else "FAIL", f, msg))
+    print("---- 续期完成：%d/%d 成功" % (ok_n, len(results)))
+    return 0 if ok_n == len(results) else 1
+
+
 class Handler(common.BaseHandler):
     """Trae 切换器的路由；HTTP 骨架与跨站校验见 switcher_common.BaseHandler。"""
 
@@ -549,6 +566,8 @@ def main():
                     help="清理 tw_backups 备份，只保留最近 N 份（默认 %d）" % TW_BACKUP_KEEP)
     ap.add_argument("--no-auth", action="store_true",
                     help="关闭一次性访问令牌（写操作将只依赖回环 + 同源校验）")
+    ap.add_argument("--refresh-all", action="store_true",
+                    help="对 tw_auth 下全部素材各续期一次（供计划任务调用）")
     args = ap.parse_args()
 
     if args.prune is not None:
@@ -558,6 +577,9 @@ def main():
         common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "prune",
                      "keep=%s" % args.prune, True, "清理 %d 份" % n)
         return 0
+
+    if args.refresh_all:
+        return refresh_all()
 
     if args.list:
         print(json.dumps({"accounts": list_accounts()}, ensure_ascii=False, indent=2))

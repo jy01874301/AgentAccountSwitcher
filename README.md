@@ -169,7 +169,15 @@ python check_ttl.py wb_auth      # 只扫指定目录
 短期通道（`enterprise_switch`）的账号 3 天就到期，靠人工点续期不现实：
 
 ```bash
-python wb_ui_server.py --refresh-all      # 对 wb_auth 全部账号各续期一次，可挂计划任务
+python wb_ui_server.py --refresh-all      # 对 wb_auth 全部账号各续期一次
+refresh_all.cmd                           # 同上，双击即可（失败会暂停显示结果）
+```
+
+挂计划任务（每 12 小时一次，按需调整）：
+
+```bat
+schtasks /create /tn "WB-RefreshAll" /sc hourly /mo 12 ^
+  /tr "\"D:\AI项目\wb_switcher\refresh_all.cmd\"" /f
 ```
 
 refresh 会**滚动 refreshToken**（每次续期后 RT 也复位为 7 天），所以每 ≤3 天跑一次可以一直
