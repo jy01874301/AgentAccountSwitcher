@@ -1,0 +1,41 @@
+# 账号登录态（含 token / 加密登录态，等同长期凭据，切勿提交）
+tw_auth/
+tw_backups/
+wb_auth/
+
+# 续期 token 缓存（含 refreshToken）
+token_cache*.json
+token_cache_workbuddy.json
+
+# 明文凭据导出（import_token.py 的产物 / 中间文件）
+# 注意：不要在这里写 `!tw_auth/` 之类的反向规则 —— 一旦把目录本身取消忽略，
+# git 就会进入目录并把里面的加密登录态（等同凭据）纳入版本控制。
+*tokens*.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 打包产物
+build/
+dist/
+output/
+*.7z
+
+# 跨进程锁文件
+.locks/
+
+# 临时 / 调试残留
+.trash*/
+_imp_err.txt
+_ref_err.txt
+_probe_result.txt
+_probe_write.py
+*.tmp
+
+# 其它
+.trae-html-share-packages/
+
+# 日志
+logs/
+*.log
