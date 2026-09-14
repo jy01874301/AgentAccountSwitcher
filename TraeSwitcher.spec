@@ -16,7 +16,7 @@ a = Analysis(
     ['tw_ui_app.py'],
     pathex=['D:/AI项目/自动签到', 'D:/AI项目/wb_switcher'],
     binaries=[],
-    datas=[('tw_ui_index.html', '.'), ('README_Trae.md', '.')],
+    datas=[('ui_template.html', '.'), ('README_Trae.md', '.')],
     hiddenimports=['webview', 'switcher_common'],
     hookspath=[],
     hooksconfig={},

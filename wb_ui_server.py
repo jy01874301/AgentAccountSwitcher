@@ -103,7 +103,10 @@ def list_accounts():
             "refresh_expires_at": acc["refresh_expires_at"].isoformat() if acc["refresh_expires_at"] else None,
             "auth_id": acc["auth_id"],
         }
-        if not common.token_looks_complete((raw.get("auth") or {}).get("accessToken")):
+        at = (raw.get("auth") or {}).get("accessToken")
+        # 签发通道决定有效期长短：oneid_login 60 天，enterprise_switch 只有 3 天
+        entry["token_source"] = common.token_source(at)
+        if not common.token_looks_complete(at):
             entry["ok"] = False
             entry["reason"] = "accessToken 不完整（疑似粘贴截断），切过去会 401，请重新导出该账号文件"
         out.append(entry)
@@ -368,11 +371,46 @@ def refresh_account_file(file_name):
     return ok, msg
 
 
+def refresh_all():
+    """对 wb_auth 下全部账号各续期一次，供计划任务调用。返回退出码。
+
+    短期通道（enterprise_switch，3 天）账号靠这个保持不掉线：
+    refresh 会滚动 refreshToken，每 ≤3 天跑一次即可无限续。
+    """
+    results = []
+    for a in list_accounts():
+        if not a.get("ok"):
+            results.append((a["file"], False, a.get("reason") or "不可用，跳过"))
+            continue
+        ok, msg = refresh_account_file(a["file"])
+        results.append((a["file"], ok, msg))
+        common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "refresh-all", a["file"], ok, msg)
+    ok_n = sum(1 for r in results if r[1])
+    for f, ok, msg in results:
+        print("%-4s %-32s %s" % ("OK" if ok else "FAIL", f, msg))
+    print("---- 续期完成：%d/%d 成功" % (ok_n, len(results)))
+    return 0 if ok_n == len(results) else 1
+
+
 class Handler(common.BaseHandler):
     """WorkBuddy 切换器的路由；HTTP 骨架与跨站校验见 switcher_common.BaseHandler。"""
 
-    INDEX_NAME = "wb_ui_index.html"   # 在 BASE_DIR 或 _internal 下查找（打包后落在 _internal）
+    INDEX_NAME = "ui_template.html"   # 与 Trae 切换器共用同一份模板
     BASE_DIR = _BIN_DIR
+    UI_CONTEXT = {
+        "TITLE": "WorkBuddy 账号切换器",
+        "LOGO": "&#128172;",
+        "SUBTITLE": "一键切换桌面端登录账号 · 免手机验证码 · 同机共用各账号积分",
+        "TIP": ("账号配置存放在 <b>wb_auth\\</b> 目录，每个文件是一份 <b>.info</b> 登录态"
+                "（<code>%LOCALAPPDATA%\\CodeBuddyExtension\\Data\\Public\\auth\\</code> 下导出的那种）。"
+                "切换即替换桌面端的 <code>workbuddy-desktop.info</code>，旧会话会自动备份。"),
+        "AUTH_DIR": "wb_auth",
+        "ACCEPT": ".info,application/json",
+        "FILE_LABEL": "账号配置文件（.info）",
+        "ADD_HINT": "点击展开，选择或粘贴该账号的 .info 登录态",
+        "EMPTY_HINT": "请把 WorkBuddy 账号登录态文件（<code>workbuddy-*.info</code>）放进去。",
+        "CMD": "workbuddy_switcher.cmd",
+    }
     WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add")
     SOURCE = "wb"
     AUDIT_DIR = _BIN_DIR / "logs"
@@ -432,6 +470,8 @@ def main():
                     help="清理桌面端切号备份，只保留最近 N 份（默认 %d）" % DESKTOP_BACKUP_KEEP)
     ap.add_argument("--no-auth", action="store_true",
                     help="关闭一次性访问令牌（写操作将只依赖回环 + 同源校验）")
+    ap.add_argument("--refresh-all", action="store_true",
+                    help="对 wb_auth 下全部账号各续期一次（供计划任务调用）")
     args = ap.parse_args()
 
     if args.prune is not None:
@@ -442,6 +482,9 @@ def main():
         common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "prune",
                      "keep=%s" % args.prune, True, "清理 %d 份" % n)
         return 0
+
+    if args.refresh_all:
+        return refresh_all()
 
     if args.list:
         print(json.dumps({"accounts": list_accounts()}, ensure_ascii=False, indent=2))

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Trae 账号切换器</title>
+<title>{{TITLE}}</title>
 <style>
   :root {
     --bg: #0f1626;
@@ -89,6 +89,8 @@
   .acct .reason { font-size:12px; color:var(--amber); line-height:1.5; }
   .tag-active { font-size:11px; padding:2px 8px; border-radius:12px; background:rgba(61,220,151,.15); color:var(--green); font-weight:600; }
   .tag-unsafe { font-size:11px; padding:2px 8px; border-radius:12px; background:rgba(255,194,77,.15); color:var(--amber); font-weight:600; }
+  .tag-ttl { font-size:11px; padding:2px 8px; border-radius:12px; background:rgba(139,154,184,.15); color:var(--dim); font-weight:600; }
+  .tag-ttl.short { background:rgba(255,194,77,.15); color:var(--amber); }
   .btn {
     margin-top:auto;
     border:none; border-radius:9px; padding:10px 14px;
@@ -148,29 +150,26 @@
 
   .tip { background:rgba(79,140,255,.08); border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:10px; padding:12px 16px; font-size:12.5px; color:var(--dim); line-height:1.7; margin-bottom:16px; }
   .tip b { color:var(--accent); }
+  .tip code { background:var(--card-2); padding:1px 6px; border-radius:5px; font-size:12px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <div class="logo">✦</div>
+    <div class="logo">{{LOGO}}</div>
     <div>
-      <h1>Trae 账号切换器</h1>
-      <div class="sub">一键切换桌面端登录账号 · 同机共用各账号 Trae 积分</div>
+      <h1>{{TITLE}}</h1>
+      <div class="sub">{{SUBTITLE}}</div>
     </div>
     <div class="status-line">
       <div><span class="status-dot off" id="srvDot"></span><span class="status-text" id="srvText">连接本地服务…</span></div>
     </div>
   </header>
 
-  <div class="tip">
-    账号素材存放在 <b>tw_auth\</b> 目录，每个文件是一份 <b>storage.json</b>（含该账号的
-    加密登录态 <code>iCubeAuthInfo://icube.cloudide</code>）。切换时只替换登录态键，
-    设备密钥与其它 IDE 配置保持不变。
-  </div>
+  <div class="tip">{{TIP}}</div>
 
   <div class="current-card">
-    <div class="logo" style="width:38px;height:38px;font-size:18px;">👤</div>
+    <div class="logo" style="width:38px;height:38px;font-size:18px;">&#128100;</div>
     <div>
       <div class="current-label">当前桌面端账号</div>
       <div class="current-name"><span id="curName">--</span> <span class="badge" id="curBadge" style="display:none">当前</span></div>
@@ -180,20 +179,20 @@
 
   <div class="section-title">
     <div class="bar"></div>
-    <h2>可用账号（来自 tw_auth\）</h2>
+    <h2>可用账号（来自 {{AUTH_DIR}}\）</h2>
     <span class="hint" id="acctCount"></span>
   </div>
 
   <div class="add-card">
     <div class="add-head" onclick="toggleAdd()">
       <span class="add-title">＋ 添加账号</span>
-      <span class="hint" id="addState">点击展开，粘贴该账号的 storage.json 登录态</span>
+      <span class="hint" id="addState">{{ADD_HINT}}</span>
     </div>
     <div class="add-body" id="addBody" style="display:none;">
-      <label class="add-label">账号的 storage.json（含该账号加密登录态）</label>
+      <label class="add-label">{{FILE_LABEL}}</label>
       <div class="file-row">
-        <label class="file-btn" for="addFile">📂 选择 storage.json</label>
-        <input type="file" id="addFile" class="file-inp" accept=".json,application/json">
+        <label class="file-btn" for="addFile">&#128194; 选择文件</label>
+        <input type="file" id="addFile" class="file-inp" accept="{{ACCEPT}}">
         <span class="file-name" id="addFileName">未选择文件</span>
       </div>
       <label class="add-label">账号昵称 / 标识（自动从文件读取，可修改）</label>
@@ -212,7 +211,7 @@
 <div class="modal" id="confirmModal" style="display:none;">
   <div class="modal-box">
     <div class="modal-title">确认删除</div>
-    <div class="modal-body">确定要从 tw_auth\ 删除账号 <b id="delName"></b> 吗？此操作不可撤销。</div>
+    <div class="modal-body">确定要从 {{AUTH_DIR}}\ 删除账号 <b id="delName"></b> 吗？此操作不可撤销。</div>
     <div class="add-actions">
       <button class="btn" onclick="doDelete()">确认删除</button>
       <button class="btn ghost" onclick="closeConfirm()">取消</button>
@@ -221,6 +220,7 @@
 </div>
 
 <script>
+const UI = { authDir: "{{AUTH_DIR}}", cmd: "{{CMD}}" };
 const API = { accounts:'/api/accounts', current:'/api/current', switch:'/api/switch', add:'/api/add', remove:'/api/remove', refresh:'/api/refresh' };
 
 async function req(path){
@@ -252,24 +252,32 @@ function fmtDate(s){
 }
 function remainDays(s){
   if(!s) return null;
-  const ms=new Date(s)-Date.now();
-  return ms/86400000;
+  return (new Date(s)-Date.now())/86400000;
 }
 function initials(name){
   if(!name) return '?';
   const c=name.trim();
   return c.length>=2 ? c.slice(-2) : c;
 }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// 通道标签：oneid_login 才是长期；enterprise_switch 是短期（续期也不会变长）
+function ttlTag(a){
+  const src=a.token_source||'';
+  if(!src) return '';
+  const short = src!=='oneid_login';
+  const text = short ? '短期 '+(a.expires_in_days?a.expires_in_days+'天':'通道') : '长期 60天';
+  return `<span class="tag-ttl${short?' short':''}" title="签发通道 token_source=${esc(src)}">${esc(text)}</span>`;
+}
 
 function isCurrentActive(a, cur){
   if(!cur || cur.length===0) return false;
   const c=cur[0];
-  if(!c) return false;
-  if(c.ok===false) return false;
-  // 素材昵称与本机当前昵称一致，且素材含可切换登录态
-  return a.ok && a.type==='storage' && a.nickname && c.nickname && a.nickname===c.nickname;
+  if(!c || c.ok===false) return false;
+  return !!a.ok && !!a.nickname && !!c.nickname && a.nickname===c.nickname;
 }
 
+let lastCurrent=null;
 async function load(){
   try{
     setSrv(true);
@@ -278,11 +286,11 @@ async function load(){
     renderAccounts(a.accounts, c.current);
   }catch(e){
     setSrv(false);
-    document.getElementById('acctGrid').innerHTML = '<div class="empty">无法连接本地服务。请先运行启动脚本（trae_switcher.cmd）或运行 <code>python tw_ui_server.py --serve</code>。</div>';
+    document.getElementById('acctGrid').innerHTML =
+      '<div class="empty">无法连接本地服务。请先双击 <code>'+esc(UI.cmd)+'</code>，或运行其对应的 --serve 命令。</div>';
     document.getElementById('curName').textContent='未连接';
   }
 }
-let lastCurrent=null;
 function renderCurrent(cur){
   lastCurrent=cur||null;
   if(!cur || cur.length===0){
@@ -298,7 +306,7 @@ function renderCurrent(cur){
     document.getElementById('curBadge').style.display='none';
     return;
   }
-  document.getElementById('curName').textContent=c.nickname || c.file;
+  document.getElementById('curName').textContent=c.nickname || c.file || '未知';
   const rd=remainDays(c.expires_at);
   const el=document.getElementById('curExp');
   if(rd!=null){
@@ -311,7 +319,7 @@ function renderAccounts(list, cur){
   const grid=document.getElementById('acctGrid');
   document.getElementById('acctCount').textContent=list.length+' 个';
   if(list.length===0){
-    grid.innerHTML='<div class="empty">tw_auth\\ 目录下没有账号素材。请放入该账号的 <code>storage.json</code>。</div>';
+    grid.innerHTML='<div class="empty">'+UI.authDir+'\\ 目录下没有账号文件。{{EMPTY_HINT}}</div>';
     return;
   }
   grid.innerHTML='';
@@ -321,12 +329,13 @@ function renderAccounts(list, cur){
     card.className='acct'+(isActive?' active':'');
     const rd=remainDays(a.expires_at);
     const expCls = a.ok && rd!=null && rd<3 ? ' warn':'';
+    const meta = esc(a.file)+(a.region?' · '+esc(a.region):'')+(a.ok?'':' (不可用)');
     card.innerHTML=`
       <div class="top">
         <div class="avatar">${initials(a.nickname)}</div>
         <div>
-          <div class="name">${esc(a.nickname)} ${isActive?'<span class="tag-active">当前</span>':(a.ok?'':'<span class="tag-unsafe">不可用</span>')}</div>
-          <div class="meta">${esc(a.file)}${a.region?' · '+esc(a.region):''}</div>
+          <div class="name">${esc(a.nickname)} ${isActive?'<span class="tag-active">当前</span>':(a.ok?'':'<span class="tag-unsafe">不可用</span>')} ${ttlTag(a)}</div>
+          <div class="meta">${meta}</div>
         </div>
       </div>
       ${ a.ok
@@ -337,20 +346,19 @@ function renderAccounts(list, cur){
         <button class="btn ${isActive?'active':''}" data-file="${esc(a.file)}" data-nick="${esc(a.nickname)}" ${isActive?'disabled':''} ${a.ok?'':'disabled'}>
           ${isActive?'当前账号':'切换到该账号'}
         </button>
-        <button class="btn ghost del-btn" data-file="${esc(a.file)}" data-nick="${esc(a.nickname)}" title="从 tw_auth 删除">删除</button>
+        <button class="btn ghost del-btn" data-file="${esc(a.file)}" data-nick="${esc(a.nickname)}" title="从 ${esc(UI.authDir)} 删除">删除</button>
       </div>
     `;
     grid.appendChild(card);
   });
 }
-function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 let pendingDeleteFile=null, pendingDeleteNick='';
 function toggleAdd(force){
   const body=document.getElementById('addBody');
   const show = force===undefined ? (body.style.display==='none') : force;
   body.style.display = show?'flex':'none';
-  document.getElementById('addState').textContent = show ? '导入后点击保存，内容会写入 tw_auth\\' : '点击展开，粘贴该账号的 storage.json 登录态';
+  document.getElementById('addState').textContent = show ? '导入后点击保存，内容会写入 '+UI.authDir+'\\' : "{{ADD_HINT}}";
 }
 function confirmDelete(file, nick){
   pendingDeleteFile=file; pendingDeleteNick=nick;
@@ -383,14 +391,12 @@ document.getElementById('addFile').addEventListener('change', (e)=>{
   const rd=new FileReader();
   rd.onload=()=>{
     selectedContent=rd.result;
-    // 从文件里尝试提取账号邮箱作为默认标识
     let nick='';
     try{
       const data=JSON.parse(rd.result);
-      const enc=data['iCubeAuthInfo://icube.cloudide'];
-      nick='';
+      nick=(data.account && data.account.nickname) || '';
     }catch(e){}
-    document.getElementById('addName').value= nick||'';
+    document.getElementById('addName').value=nick||'';
     refreshAddState();
   };
   rd.readAsText(f);
@@ -402,7 +408,7 @@ async function doAddFromFile(){
   const content=selectedContent;
   const btn=document.getElementById('addBtn');
   if(!name){ toast('请填写账号昵称/标识','err'); return; }
-  if(!content){ toast('请先选择 storage.json','err'); return; }
+  if(!content){ toast('请先选择账号文件','err'); return; }
   btn.disabled=true; btn.textContent='保存中…';
   try{
     const data=await post(API.add,{name:name,content:content});
@@ -435,10 +441,10 @@ document.getElementById('acctGrid').addEventListener('click', async (e)=>{
     toast(data.message, data.ok?'ok':'err');
     if(data.ok){
       btn.disabled=false; btn.innerHTML='当前账号';
-      // 切换后尝试续期（需素材含设备私钥 + refreshToken，失败时仅提示）
+      // 续期只动本地账号库文件，不必等客户端采纳，切完立即发
       try{
         const sd=await post(API.refresh,{file:file});
-        if(sd.ok) toast(sd.message,'ok');
+        toast(sd.message, sd.ok?'ok':'err');
       }catch(e){}
       await settleAfterSwitch(nick);
     }

@@ -130,9 +130,14 @@ def main():
 
         for label, port in (("[wb]", port_wb), ("[tw]", port_tw)):
             st, raw = call(port, "/")
-            check(label + " GET / 返回前端", st == 200 and "切换器".encode("utf-8") in raw, st)
+            html = raw.decode("utf-8", "replace")
+            check(label + " GET / 返回前端", st == 200 and "切换器" in html, st)
+            check(label + " 模板已渲染（无残留占位符）", "{{" not in html, html[:60])
             st, raw = call(port, "/api/accounts")
             check(label + " GET /api/accounts", st == 200 and json.loads(raw).get("ok"), st)
+            accs = json.loads(raw).get("accounts") or []
+            check(label + " 账号带 token_source 字段",
+                  all("token_source" in a for a in accs), accs[:1])
             st, raw = call(port, "/api/nope")
             check(label + " 未知路径 JSON 404", st == 404 and json.loads(raw).get("ok") is False, st)
             st, raw = call(port, "/api/switch", "POST", {"name": "nope"})

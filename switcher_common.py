@@ -13,6 +13,7 @@ HTTP 骨架（此前已出现修复一处、漏掉另一处的漂移）。这里
 
 业务差异（路由、账号读写）仍留在各自的 server 里，通过 `api_get` / `api_post` 挂钩。
 """
+import base64
 import contextlib
 import datetime
 import json
@@ -54,6 +55,30 @@ def audit(log_dir, source, action, target="", ok=True, detail=""):
 def new_token():
     """生成一次性访问令牌（仅本次进程有效，不落盘）。"""
     return secrets.token_urlsafe(24)
+
+
+def render_template(raw, ctx):
+    """把 HTML 模板里的 {{KEY}} 替换成配置值（两个切换器共用同一份模板）。
+
+    简单字符串替换即可，不上模板引擎 —— 只为了消灭两份几乎相同的前端文件。
+    """
+    text = raw if isinstance(raw, str) else raw.decode("utf-8")
+    for key, val in (ctx or {}).items():
+        text = text.replace("{{%s}}" % key, str(val))
+    return text.encode("utf-8")
+
+
+def token_source(token):
+    """取 JWT payload 里的 token_source（决定有效期长短的签发通道）。"""
+    seg = str(token or "").split(".")
+    if len(seg) < 2:
+        return ""
+    p = seg[1]
+    p += "=" * (-len(p) % 4)
+    try:
+        return str(json.loads(base64.urlsafe_b64decode(p)).get("token_source") or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def resolve_data(base_dir, name):
@@ -263,6 +288,7 @@ class BaseHandler(BaseHTTPRequestHandler):
     INDEX_FILE = None        # 直接指定前端页面路径（可选）
     INDEX_NAME = None        # 或在 BASE_DIR / _internal 下按文件名查找
     BASE_DIR = None          # 查找根目录（打包版会被启动器改成 exe 所在目录）
+    UI_CONTEXT = None        # 模板变量（两个切换器共用 ui_template.html）
     WRITE_ENDPOINTS = ()     # 只允许 POST 的路径
     server_version = "SwitcherHTTP/1.0"
     TOKEN = None             # 一次性访问令牌；非空时写操作必须带 X-Switcher-Token
@@ -363,6 +389,8 @@ class BaseHandler(BaseHTTPRequestHandler):
             self._send(b"index not found", 404, "text/plain; charset=utf-8")
             return
         body = idx.read_bytes()
+        if self.UI_CONTEXT:
+            body = render_template(body, self.UI_CONTEXT)
         if self.TOKEN:
             # 把一次性令牌注入页面：前端拿到后随写请求回传，
             # 进程外的脚本/程序拿不到（除非也去抓取首页并解析）

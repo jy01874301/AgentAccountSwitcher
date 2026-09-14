@@ -182,7 +182,8 @@ def list_accounts():
         if not isinstance(data, dict):
             out.append({"file": f.name, "path": str(f), "ok": False,
                         "type": "unknown", "label": f.stem, "nickname": f.stem,
-                        "expires_at": None, "reason": "不是合法 JSON"})
+                        "expires_at": None, "token_source": "",
+                        "reason": "不是合法 JSON"})
             continue
         kind = _asset_kind(data)
         if kind == "storage":
@@ -190,7 +191,7 @@ def list_accounts():
             if info is None:
                 out.append({"file": f.name, "path": str(f), "ok": False,
                             "type": "storage", "label": f.stem, "nickname": f.stem,
-                            "expires_at": None, "reason": err})
+                            "expires_at": None, "token_source": "", "reason": err})
                 continue
             nick = info["nickname"] or f.stem
             ok = common.token_looks_complete(info["token"])
@@ -200,6 +201,7 @@ def list_accounts():
                 "expires_at": info["expires_at"],
                 "region": info["region"],
                 "has_refresh": bool(info["refresh_token"]),
+                "token_source": common.token_source(info["token"]),
                 "reason": "" if ok else "登录态里的 token 不完整（疑似粘贴截断），切过去会 401",
             })
         elif kind == "tokens":
@@ -211,7 +213,7 @@ def list_accounts():
             out.append({
                 "file": f.name, "path": str(f), "ok": False, "type": "tokens",
                 "label": label, "nickname": label,
-                "expires_at": None,
+                "expires_at": None, "token_source": "",
                 "reason": "签到用 token 配置，无加密登录态，不可切换；请放入该账号的 storage.json",
             })
         else:
@@ -472,8 +474,22 @@ def refresh_account_file(file_name):
 class Handler(common.BaseHandler):
     """Trae 切换器的路由；HTTP 骨架与跨站校验见 switcher_common.BaseHandler。"""
 
-    INDEX_NAME = "tw_ui_index.html"   # 在 BASE_DIR 或 _internal 下查找（打包后落在 _internal）
+    INDEX_NAME = "ui_template.html"   # 与 WorkBuddy 切换器共用同一份模板
     BASE_DIR = _BIN_DIR
+    UI_CONTEXT = {
+        "TITLE": "Trae 账号切换器",
+        "LOGO": "&#10022;",
+        "SUBTITLE": "一键切换桌面端登录账号 · 同机共用各账号 Trae 积分",
+        "TIP": ("账号素材存放在 <b>tw_auth\\</b> 目录，每个文件是一份 <b>storage.json</b>"
+                "（含该账号的加密登录态 <code>iCubeAuthInfo://icube.cloudide</code>）。"
+                "切换时替换登录态键与其附属设备密钥，其它 IDE 配置保持不变。"),
+        "AUTH_DIR": "tw_auth",
+        "ACCEPT": ".json,application/json",
+        "FILE_LABEL": "账号的 storage.json（含该账号加密登录态）",
+        "ADD_HINT": "点击展开，选择该账号的 storage.json 登录态",
+        "EMPTY_HINT": "请放入该账号的 <code>storage.json</code>。",
+        "CMD": "trae_switcher.cmd",
+    }
     WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add")
     SOURCE = "tw"
     AUDIT_DIR = _BIN_DIR / "logs"

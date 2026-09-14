@@ -15,7 +15,7 @@
 wb_switcher/
 ├── wb_ui_server.py        # 后端：账号读写/切换 + 极简本地 HTTP 服务（127.0.0.1:8765）
 ├── switcher_common.py     # 两个切换器共用的 HTTP 骨架 / 文件锁 / 备份裁剪 / 端口避让
-├── wb_ui_index.html       # 前端页面（由后端 / 路由直接返回）
+├── ui_template.html       # 前端模板（两份切换器共用，后端按 UI_CONTEXT 渲染后返回）
 ├── wb_ui_app.py           # 桌面版启动器（pywebview 窗口，可打包 exe）
 ├── workbuddy_switcher.cmd # Windows 启动脚本（双击即用）
 ├── wb_auth/               # 切换用的账号配置库，放置 *.info 登录态文件
@@ -23,7 +23,7 @@ wb_switcher/
 │   ├── workbuddy-wtnong.info
 │   ├── workbuddy-wtnong1.info
 │   └── workbuddy-星空.info
-├── tw_ui_server.py / tw_ui_index.html / tw_ui_app.py / trae_switcher.cmd  # Trae 姊妹工具，见 README_Trae.md
+├── tw_ui_server.py / tw_ui_app.py / trae_switcher.cmd  # Trae 姊妹工具，见 README_Trae.md
 ├── TraeSwitcher.spec      # Trae 桌面版打包配置（pyinstaller TraeSwitcher.spec）
 ├── import_token.py        # Trae 凭据导入（别机 tokens / storage.json → config.json）
 ├── check_ttl.py           # 登录态体检：签发通道 / 剩余天数 / accessToken 完整性（只读）
@@ -164,6 +164,28 @@ python check_ttl.py wb_auth      # 只扫指定目录
 
 ---
 
+## 自动续期
+
+短期通道（`enterprise_switch`）的账号 3 天就到期，靠人工点续期不现实：
+
+```bash
+python wb_ui_server.py --refresh-all      # 对 wb_auth 全部账号各续期一次，可挂计划任务
+```
+
+refresh 会**滚动 refreshToken**（每次续期后 RT 也复位为 7 天），所以每 ≤3 天跑一次可以一直
+不掉线。上级「自动签到」项目的 `config.json` 里 `wb_auth_dirs` 已加入本目录：
+
+```json
+"wb_auth_dirs": ["D:\\AI项目\\自动签到\\wb_auth", "D:\\AI项目\\wb_switcher\\wb_auth"]
+```
+
+`discover_accounts()` 按 uid 全局去重，两个目录放着相同账号也只处理一次，不会重复签到。
+
+前端账号卡上会显示签发通道标签：**长期 60 天**（`oneid_login`）或**短期 3 天**
+（`enterprise_switch`，橙色告警）。
+
+---
+
 ## 打包桌面版
 
 ```bash
@@ -182,7 +204,7 @@ python check_ttl.py wb_auth      # 只扫指定目录
 python smoke_test.py
 ```
 
-42 项断言，覆盖：
+46 项断言，覆盖：
 
 - 备份裁剪、文件锁（超时/串行）、端口避让
 - 两个切换器的接口行为：200 / 401 / 403 / 404 / 405 / 同源放行
@@ -190,6 +212,7 @@ python smoke_test.py
 - 审计日志：记录切号、记录令牌失败、**不含凭据**
 - 令牌完整性校验（add 拒绝、列表标记、拒绝切换）、增删闭环
 - 错误脱敏（500 响应不含用户目录）、依赖契约（缺模块/缺成员的可读报错）
+- 前端模板渲染（无残留占位符）、账号带 token_source 字段
 
 不改动真实登录态（切号用不存在的账号名触发，增删用临时文件后清理）。
 改完代码建议跑一遍，退出码非 0 即有失败项。
