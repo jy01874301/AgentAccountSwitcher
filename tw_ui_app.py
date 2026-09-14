@@ -37,6 +37,7 @@ import switcher_common as common  # noqa: E402
 srv._BIN_DIR = BASE_DIR
 srv.TW_AUTH_DIR = BASE_DIR / "tw_auth"
 srv.LOCK_DIR = BASE_DIR / ".locks"
+srv.Handler.BASE_DIR = BASE_DIR          # 前端页面按 exe 目录 → _internal 依次查找
 srv.Handler.AUDIT_DIR = BASE_DIR / "logs"
 
 PORT = srv.DEFAULT_PORT

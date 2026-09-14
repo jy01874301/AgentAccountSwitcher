@@ -41,6 +41,8 @@ srv._BIN_DIR = BASE_DIR
 srv.SCRIPT_DIR = PROJECT_ROOT
 srv.AUTH_DIR = BASE_DIR / "wb_auth"
 srv.LOCK_DIR = BASE_DIR / ".locks"
+srv.Handler.BASE_DIR = BASE_DIR          # 前端页面按 exe 目录 → _internal 依次查找
+srv.Handler.AUDIT_DIR = BASE_DIR / "logs"
 
 PORT = srv.DEFAULT_PORT
 

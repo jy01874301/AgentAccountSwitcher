@@ -56,6 +56,19 @@ def new_token():
     return secrets.token_urlsafe(24)
 
 
+def resolve_data(base_dir, name):
+    """定位随包数据文件（前端页面等）。
+
+    PyInstaller 6 把 datas 放到 `_internal/` 而不是 exe 同级，所以打包后按 exe 同级
+    找 html 会 404。这里先找 exe 同级（方便自行替换），再回退到 `_internal`。
+    """
+    base = Path(base_dir)
+    for cand in (base / name, base / "_internal" / name):
+        if cand.is_file():
+            return cand
+    return base / name
+
+
 _HOME = str(Path.home()).replace("\\", "/")
 
 
@@ -247,7 +260,9 @@ def bind_server(handler_cls, port, host="127.0.0.1", tries=10):
 class BaseHandler(BaseHTTPRequestHandler):
     """HTTP 骨架。子类只需提供 INDEX_FILE / WRITE_ENDPOINTS 与 api_get / api_post。"""
 
-    INDEX_FILE = None        # Path：前端页面
+    INDEX_FILE = None        # 直接指定前端页面路径（可选）
+    INDEX_NAME = None        # 或在 BASE_DIR / _internal 下按文件名查找
+    BASE_DIR = None          # 查找根目录（打包版会被启动器改成 exe 所在目录）
     WRITE_ENDPOINTS = ()     # 只允许 POST 的路径
     server_version = "SwitcherHTTP/1.0"
     TOKEN = None             # 一次性访问令牌；非空时写操作必须带 X-Switcher-Token
@@ -336,8 +351,14 @@ class BaseHandler(BaseHTTPRequestHandler):
     def api_post(self, url, params):
         raise NotImplementedError
 
+    def _index_path(self):
+        if self.INDEX_FILE:
+            return Path(self.INDEX_FILE)
+        name = self.INDEX_NAME or "index.html"
+        return resolve_data(self.BASE_DIR or Path(__file__).resolve().parent, name)
+
     def _serve_index(self):
-        idx = Path(self.INDEX_FILE) if self.INDEX_FILE else None
+        idx = self._index_path()
         if not idx or not idx.is_file():
             self._send(b"index not found", 404, "text/plain; charset=utf-8")
             return

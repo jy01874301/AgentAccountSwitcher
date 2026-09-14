@@ -164,6 +164,18 @@ python check_ttl.py wb_auth      # 只扫指定目录
 
 ---
 
+## 打包桌面版
+
+```bash
+"C:\Program Files\Python313\python.exe" -m PyInstaller WorkBuddySwitcher.spec --noconfirm
+"C:\Program Files\Python313\python.exe" -m PyInstaller TraeSwitcher.spec --noconfirm
+```
+
+产物在 `dist\WorkBuddySwitcher\`、`dist\TraeSwitcher\`。把账号目录（`wb_auth\`、`tw_auth\`）
+放到 exe 同级即可识别；未安装 `pywebview` 时会自动退回系统浏览器打开。
+
+---
+
 ## 自检
 
 ```bash

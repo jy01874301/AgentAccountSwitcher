@@ -472,7 +472,8 @@ def refresh_account_file(file_name):
 class Handler(common.BaseHandler):
     """Trae 切换器的路由；HTTP 骨架与跨站校验见 switcher_common.BaseHandler。"""
 
-    INDEX_FILE = _BIN_DIR / "tw_ui_index.html"
+    INDEX_NAME = "tw_ui_index.html"   # 在 BASE_DIR 或 _internal 下查找（打包后落在 _internal）
+    BASE_DIR = _BIN_DIR
     WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add")
     SOURCE = "tw"
     AUDIT_DIR = _BIN_DIR / "logs"
