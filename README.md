@@ -369,13 +369,38 @@ powershell -ExecutionPolicy Bypass -File install_refresh_task.ps1
 
 ## 打包桌面版
 
-```bash
-"C:\Program Files\Python313\python.exe" -m PyInstaller WorkBuddySwitcher.spec --noconfirm
-"C:\Program Files\Python313\python.exe" -m PyInstaller TraeSwitcher.spec --noconfirm
+打包用的解释器**必须装了 `pywebview`**，否则 `hiddenimports` 里的 `webview` 会被静默跳过，
+打出来的 exe 虽然能跑，但每次启动都退回"打开系统浏览器"。推荐用隔离环境：
+
+```powershell
+# 一次性准备（不污染系统 Python）
+C:\Users\Administrator\.workbuddy-ai\binaries\python\versions\3.13.12\python.exe -m venv `
+  C:\Users\Administrator\.workbuddy-ai\binaries\python\envs\default
+$VENV = C:\Users\Administrator\.workbuddy-ai\binaries\python\envs\default
+& "$VENV\Scripts\python.exe" -m pip install pywebview pyinstaller
+
+# 打包
+& "$VENV\Scripts\python.exe" -m PyInstaller WorkBuddySwitcher.spec --noconfirm
+& "$VENV\Scripts\python.exe" -m PyInstaller TraeSwitcher.spec --noconfirm
 ```
 
 产物在 `dist\WorkBuddySwitcher\`、`dist\TraeSwitcher\`。把账号目录（`wb_auth\`、`tw_auth\`）
-放到 exe 同级即可识别；未安装 `pywebview` 时会自动退回系统浏览器打开。
+放到 exe 同级即可识别。验证 `webview` 确实打进去了：`dist\*\ _internal\` 下应能看到
+`webview\`、`pythonnet\`、`clr_loader\` 三个目录。
+
+### 桌面版 exe 的命令行开关
+
+```bat
+WorkBuddySwitcher.exe                  :: 正常：开原生窗口
+WorkBuddySwitcher.exe --serve          :: 只跑本地 HTTP 服务，不开窗口（便于 curl 冒烟）
+WorkBuddySwitcher.exe --serve --port 8790
+```
+
+窗口版没有控制台，出了问题看不到任何提示。所以：
+
+- `--serve` 是唯一的排障入口（能用 curl 直接打接口）。
+- WebView 起不来时会退回系统浏览器，同时把原因写进 exe 同级的
+  `logs\desktop-start.log` —— 否则用户只会看到"浏览器突然弹出来"，无从判断。
 
 打包要点（改 spec 前先看）：
 
@@ -387,6 +412,12 @@ powershell -ExecutionPolicy Bypass -File install_refresh_task.ps1
 - 运行时若找得到 `..\自动签到\config.json` 就优先读它的 `endpoint` 等配置；找不到则用
   内置默认值（`https://copilot.tencent.com`），不影响切号与续期。
 - **源码改动后必须重新打包**，`dist\` 不会自动跟随源码。
+- ⚠️ **重新打包前先手工删掉 `dist\` 与 `build\`，并且先结束正在运行的 exe。**
+  本机的 `rm` 是 WorkBuddy CLI 注入的安全删除 shim（走回收站），删大目录会
+  `Some operations were aborted` 并 fail-closed；PyInstaller 内部的 `shutil.rmtree`
+  同样被拦，表现为 `OSError: [safe-delete] 操作失败`，于是**旧产物没删掉、新产物没生成**，
+  留下一个 exe 是旧的、`_internal` 是半新半旧的混合目录（很能骗人）。
+  被 exe 占用的 `.pyd` 还会 `Permission denied`，所以顺序是：杀进程 → `rm -rf dist build` → 打包。
 
 ---
 

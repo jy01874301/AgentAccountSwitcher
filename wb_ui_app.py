@@ -64,18 +64,54 @@ def _port_alive(port, timeout=0.6):
     return False
 
 
+def _parse_args(argv):
+    """只认两个开关，够用即可，不引 argparse。
+
+    --serve / --no-window：只跑本地 HTTP 服务，不开窗口。桌面版 exe 是 windowed
+      构建（没有控制台），出问题时既看不到报错也拿不到接口响应；带上这个开关就能
+      用 curl 直接冒烟，也方便让别的脚本复用这份服务。
+    --port N：指定起始端口（被占用时仍会自动顺延）。
+    """
+    headless = any(a in ("--serve", "--no-window") for a in argv)
+    port = PORT
+    for i, a in enumerate(argv):
+        if a == "--port" and i + 1 < len(argv):
+            try:
+                port = int(argv[i + 1])
+            except ValueError:
+                pass
+    return headless, port
+
+
 def main():
+    headless, requested = _parse_args(sys.argv[1:])
     server = None
+    port = requested
     # 若端口已被占用（如旧服务仍在运行），直接复用现有服务；否则自动避让到空闲端口
-    if _port_alive(PORT):
-        port = PORT
+    if _port_alive(port):
+        pass
     else:
-        server, port = common.bind_server(srv.Handler, PORT)
-        if port != PORT:
-            print("[提示] 默认端口 %d 被占用，已改用 %d" % (PORT, port))
+        server, port = common.bind_server(srv.Handler, port)
+        # 与"请求的端口"比，而不是与默认端口常量比 —— 否则显式传 --port 时会误报
+        if port != requested:
+            print("[提示] 端口 %d 被占用，已改用 %d" % (requested, port))
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
     url = "http://127.0.0.1:%d/" % port
+
+    if headless:
+        print("本地服务已启动：%s  (Ctrl+C 停止)" % url, flush=True)
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if server:
+                server.shutdown()
+                server.server_close()
+        return 0
+
     try:
         import webview
         webview.create_window(
@@ -87,7 +123,17 @@ def main():
         )
         webview.start()
     except Exception as e:  # noqa: BLE001  # 无 WebView 运行库时退回默认浏览器
-        print("WebView 启动失败，退回浏览器打开：%s (%s)" % (url, e))
+        # 桌面版是 windowed 构建，print 没有任何去处 —— 同时落一份日志，
+        # 否则用户只会看到"浏览器突然弹出来"，完全无从判断为什么没开窗口。
+        msg = "WebView 启动失败，退回浏览器打开：%s (%s)" % (url, e)
+        print(msg)
+        try:
+            log_dir = BASE_DIR / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "desktop-start.log", "a", encoding="utf-8") as fh:
+                fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        except OSError:
+            pass
         import webbrowser
         webbrowser.open(url)
         if server:

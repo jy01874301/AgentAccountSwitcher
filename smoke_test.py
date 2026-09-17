@@ -225,6 +225,11 @@ def main():
         else:
             good = Path(usable[0]["path"]).read_text(encoding="utf-8")
 
+            # 先清掉上一轮可能残留的测试文件：本机删除走安全删除 shim，被中断的运行
+            # 可能 fail-closed 把文件留在原地，下一次跑就会让"未落盘"断言假失败。
+            bad_file.unlink(missing_ok=True)
+            (wb.AUTH_DIR / "workbuddy-__smoke.info").unlink(missing_ok=True)
+
             # 残缺登录态：add 必须拒绝，且不能留下文件
             broken = json.loads(good)
             broken["auth"]["accessToken"] = "eyJx"
