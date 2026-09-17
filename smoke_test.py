@@ -315,6 +315,22 @@ def main():
             wb.Handler.TOKEN = None
             wb.Handler.AUDIT_DIR = BIN / "logs"
 
+    print("\n== 6b. 审计日志轮转 ==")
+    # 日志只追加不封顶会一直吃盘；把上限压到很小，几条就该滚出 .1
+    with tempfile.TemporaryDirectory() as td:
+        orig_max = common.AUDIT_MAX_BYTES
+        common.AUDIT_MAX_BYTES = 200
+        try:
+            for i in range(10):
+                common.audit(Path(td), "wb", "switch", "acct-%d" % i, True, "x" * 60)
+        finally:
+            common.AUDIT_MAX_BYTES = orig_max
+        cur = Path(td) / common.AUDIT_NAME
+        rolled = Path(td) / (common.AUDIT_NAME + ".1")
+        check("超过上限后滚出 .1", rolled.is_file(), [p.name for p in Path(td).iterdir()])
+        check("当前日志被压回上限附近", cur.stat().st_size < 500, cur.stat().st_size)
+        check("轮转后最新记录仍在当前日志", "acct-9" in cur.read_text(encoding="utf-8"), "")
+
     print("\n== 7. 错误脱敏与依赖契约 ==")
     check("scrub 抹掉用户目录",
           "Administrator" not in common.scrub("C:/Users/Administrator/secret/x")
@@ -423,6 +439,29 @@ def main():
     check("积分：单账号失败不影响整体结构",
           bad["ok"] and bad["queried"] == 0 and all("reason" in a for a in bad["accounts"]),
           bad["queried"])
+
+    print("\n== 9. 打包配置（spec）==")
+    # 打包出的 exe 不在自检范围内，但 spec 的静态缺陷可以在这里拦住：
+    # hiddenimports 漏项属于「构建成功但双击一闪而过」，跑一次构建才发现，代价高。
+    import ast
+    for spec_name, dep in (("WorkBuddySwitcher.spec", "workbuddy_checkin"),
+                           ("TraeSwitcher.spec", "trae_work_checkin")):
+        spec = BIN / spec_name
+        text = spec.read_text(encoding="utf-8") if spec.is_file() else ""
+        check("%s 存在" % spec_name, bool(text), spec)
+        # switcher_common 与 checkin 模块都是运行时动态导入，静态分析扫不到
+        check("%s 的 hiddenimports 含 switcher_common 与 %s" % (spec_name, dep),
+              "'switcher_common'" in text and ("'%s'" % dep) in text, text[:0])
+        check("%s 用 SPEC 变量做相对定位" % spec_name, "SPEC" in text, text[:0])
+        # 「是否写死绝对路径」只看代码：注释和模块 docstring 里提到旧路径是允许的
+        # （否则说明性注释反而会把断言逼成假阳性）。
+        try:
+            code = text.replace(ast.get_docstring(ast.parse(text)) or "", "")
+        except SyntaxError:
+            code = text
+        code = "\n".join(ln.split("#", 1)[0] for ln in code.splitlines())
+        check("%s 代码中未写死 D:/AI项目 绝对路径" % spec_name,
+              "D:/AI项目" not in code and "D:\\AI项目" not in code, text[:0])
 
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0

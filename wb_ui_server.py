@@ -216,7 +216,7 @@ def switch_account(target_name):
             try:
                 DESKTOP_INFO.replace(backup)
             except OSError as e:
-                return False, "轮换旧登录态失败：%s" % e
+                return False, "轮换旧登录态失败：%s" % common.scrub(e)
             pruned = common.prune_backups(
                 DESKTOP_DIR, "workbuddy-desktop.*.info",
                 keep=DESKTOP_BACKUP_KEEP, exclude={"workbuddy-desktop.info"})
@@ -234,7 +234,8 @@ def switch_account(target_name):
                 tmp.unlink()
             except OSError:
                 pass
-            return False, "写入新登录态失败：%s%s" % (e, _restore_backup(backup))
+            # OSError 文本会带出本机绝对路径（如桌面端 auth 目录），先脱敏再回给前端
+            return False, "写入新登录态失败：%s%s" % (common.scrub(e), _restore_backup(backup))
 
         # 3. 清理登出标记
         marker_path = DESKTOP_DIR / ("workbuddy-desktop.info" + LOGOUT_SUFFIX)

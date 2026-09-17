@@ -238,8 +238,9 @@ def current_account():
         return [{"ok": False, "nickname": "未登录", "uid": "", "expires_at": None,
                  "reason": err}]
     ok = common.token_looks_complete(info["token"])
+    # uid 与 wb 侧对齐（此前恒为空串，前端若按 uid 比对当前账号会拿不到值）
     return [{"file": sp.name, "ok": ok, "nickname": info["nickname"] or "未知",
-             "uid": "", "expires_at": info["expires_at"], "region": info["region"],
+             "uid": _uid_of(info), "expires_at": info["expires_at"], "region": info["region"],
              "reason": "" if ok else "当前登录态的 token 不完整，客户端可能会要求重新登录"}]
 
 
@@ -329,7 +330,7 @@ def switch_account(file_name):
         try:
             backup.write_bytes(raw)
         except OSError as e:
-            return False, "备份本机登录态失败：%s" % e
+            return False, "备份本机登录态失败：%s" % common.scrub(e)
         pruned = common.prune_backups(backup_dir, "storage.*.json", keep=TW_BACKUP_KEEP)
 
         # 写入目标账号登录态 + 附属设备密钥（其余键保留本机的）
@@ -346,7 +347,7 @@ def switch_account(file_name):
                 sp.write_bytes(tmp.read_bytes())
                 tmp.unlink(missing_ok=True)
         except OSError as e:
-            return False, "写入新登录态失败：%s" % e
+            return False, "写入新登录态失败：%s" % common.scrub(e)
 
         # 写后自校验：确认登录态确实已落到文件并变成目标账号
         after = _read_json(sp)

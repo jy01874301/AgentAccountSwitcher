@@ -28,6 +28,9 @@ from urllib.parse import urlparse, parse_qs
 
 _AUDIT_LOCK = threading.Lock()
 AUDIT_NAME = "switcher.log"
+# 单份审计日志的大小上限（1 MiB）。超过就滚成 <名字>.1（覆盖旧 .1）。
+# 本地工具不必上多代轮转，但只追加不封顶会一直吃盘。
+AUDIT_MAX_BYTES = 1 << 20
 
 
 def audit(log_dir, source, action, target="", ok=True, detail=""):
@@ -46,7 +49,14 @@ def audit(log_dir, source, action, target="", ok=True, detail=""):
             ts, source, action, "OK" if ok else "FAIL",
             (target or "-")[:32], str(detail or "").replace("\n", " ")[:160])
         with _AUDIT_LOCK:
-            with open(d / AUDIT_NAME, "a", encoding="utf-8") as fh:
+            path = d / AUDIT_NAME
+            try:
+                # 轮转失败不能影响写入：所以单独 try 包住，失败就继续往原文件追加
+                if path.exists() and path.stat().st_size >= AUDIT_MAX_BYTES:
+                    path.replace(d / (AUDIT_NAME + ".1"))
+            except OSError:
+                pass
+            with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line)
     except OSError:
         pass

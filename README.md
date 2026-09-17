@@ -53,7 +53,8 @@ WorkBuddy 桌面端的本地登录态保存在：
 2. 确保桌面端 auth 目录存在；
 3. 把当前正式文件 `workbuddy-desktop.info` 改名为带时间戳的备份
    （`workbuddy-desktop.<日期>.<pid>.<随机>.info`，与客户端的 `clean()` 命名一致，保留其可用登录态）；
-4. 把目标账号内容写入为新的 `workbuddy-desktop.info`；
+4. 把目标账号内容写入为新的 `workbuddy-desktop.info`；**写盘失败会自动回滚** —— 把第 3 步
+   的备份改回正式名，否则桌面端会停在"没有 `workbuddy-desktop.info`"的无登录态；
 5. 清理残留的 `.logged-out` 登出标记；
 6. **写后自校验**：重新读取桌面端文件，确认其中的 uid 已是目标账号（与 Trae 切换器一致），
    未通过则如实报失败，避免"报成功但实际没生效"。
@@ -64,6 +65,12 @@ WorkBuddy 桌面端的本地登录态保存在：
 
 > 切号生成的备份文件本身仍是服务端有效的登录态。识别当前账号时会扫描该目录下全部 `.info`，
 > 跳过已登出（带 `.logged-out` 标记）的，其余按修改时间降序，最新的标记为当前账号。
+
+> **本工具只接管 `workbuddy-desktop.info`**。同一目录下若还出现 `workbuddy-desktop-ai.info`
+> 及其 `workbuddy-desktop-ai.<时间戳>...info` 备份，那是 **WorkBuddy AI 客户端自己的登录态**
+> （`expiresAt` 为一年期，命名格式也由客户端自己生成），本工具既不读取、也不切换、也不裁剪它。
+> 备份裁剪的通配 `workbuddy-desktop.*.info` 匹配不到 `workbuddy-desktop-ai.*`（`desktop` 后面
+> 是连字符而不是点），所以那一族会原样保留 —— 这是预期行为，不是漏清理。
 
 ### 并发与备份策略
 
