@@ -482,6 +482,40 @@ def main():
           (len(got_paths) >= 1) == expect_found,
           "%d 条 / 预期%s" % (len(got_paths), expect_found))
 
+    print("\n== 11. 续期门卫（计划任务默认不强制刷新）==")
+    # 计划任务每天跑一次 --refresh-all，但默认 force=False，交给上级
+    # workbuddy_checkin.refresh_account 按「剩余 < 3 天 + 24 小时冷却」判断，
+    # 免得每天无谓地重写 5 个 .info。UI 手动点「续期」才 force=True。
+    import inspect
+    sig_file = inspect.signature(wb.refresh_account_file).parameters
+    sig_all = inspect.signature(wb.refresh_all).parameters
+    check("refresh_account_file 默认 force=True（UI 手动续期）",
+          sig_file["force"].default is True, sig_file["force"].default)
+    check("refresh_all 默认 force=False（计划任务走门卫）",
+          sig_all["force"].default is False, sig_all["force"].default)
+
+    captured = []
+    real_refresh = wb.wb.refresh_account
+
+    def fake_refresh(acc, script_dir, cfg, log, force=False, threshold=None):
+        captured.append(force)
+        return True, "fake-skipped", "skipped"
+
+    wb.wb.refresh_account = fake_refresh
+    try:
+        usable = [a for a in wb.list_accounts() if a.get("ok")]
+        if usable:
+            wb.refresh_account_file(usable[0]["file"], force=False)
+            check("force=False 透传到上级门卫", captured[-1] is False, captured)
+            wb.refresh_account_file(usable[0]["file"], force=True)
+            check("force=True 透传到上级门卫", captured[-1] is True, captured)
+            check("门卫返回 skipped 时不写盘（消息原样回传）",
+                  wb.refresh_account_file(usable[0]["file"], force=False)[1] == "fake-skipped")
+        else:
+            check("[wb] 无可用账号素材，跳过门卫透传用例", True, "wb_auth 下没有可解析的 .info")
+    finally:
+        wb.wb.refresh_account = real_refresh
+
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0
 

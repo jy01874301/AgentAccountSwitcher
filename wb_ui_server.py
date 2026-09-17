@@ -393,11 +393,17 @@ def _recalc_expiry(path):
     tmp.replace(path)
 
 
-def refresh_account_file(file_name):
+def refresh_account_file(file_name, force=True):
     r"""切换后对目标账号执行真正的 HTTP 续期，并把新有效期写回 wb_auth\<file>。
 
     与「把桌面端到期时间复制回素材」不同，本函数直接拿目标文件的 refreshToken
     向 WorkBuddy 服务器续期，返回全新 accessToken / expiresAt，剩余时间即刻更新。
+
+    force=True（默认，UI 上手动点「续期」用）：无条件刷新。
+    force=False（计划任务用）：交给上级 workbuddy_checkin.refresh_account 判断 ——
+      剩余天数 ≥ REFRESH_THRESHOLD_DAYS（3 天）或距上次实际续期不足
+      refresh_min_interval_hours（默认 24 小时）就跳过，返回 kind="skipped"。
+      与上级 refresh_guard.py / --refresh 的门卫语义一致，避免每天无谓地重写 .info。
     """
     base = os.path.basename((file_name or "").replace("\\", "/"))
     if os.path.dirname((file_name or "").replace("\\", "/")):
@@ -413,25 +419,30 @@ def refresh_account_file(file_name):
     cfg = wb.load_config(SCRIPT_DIR / "config.json")
     # 续期是「换 token + 写回文件」，与切号/同步互斥，否则会互相覆盖
     with common.file_lock("wb-auth-" + base, LOCK_DIR):
-        ok, msg, kind = wb.refresh_account(acc, SCRIPT_DIR, cfg, _NULLLOG, force=True)
+        ok, msg, kind = wb.refresh_account(acc, SCRIPT_DIR, cfg, _NULLLOG, force=force)
         if kind == "refreshed" and ok:
             _recalc_expiry(target)
             return True, "已续期并更新 %s 的到期时间" % base
     return ok, msg
 
 
-def refresh_all():
-    """对 wb_auth 下全部账号各续期一次，供计划任务调用。返回退出码。
+def refresh_all(force=False):
+    """对 wb_auth 下全部账号跑一遍续期，供计划任务调用。返回退出码。
 
-    短期通道（enterprise_switch，3 天）账号靠这个保持不掉线：
-    refresh 会滚动 refreshToken，每 ≤3 天跑一次即可无限续。
+    默认 force=False —— 走上级的门卫（剩余 < 3 天且距上次 ≥ 24 小时才真刷），
+    所以「每天跑一次」的实际开销通常只有几次本地文件读取，不产生任何写盘。
+    只有 --refresh-all --force 才无条件全刷。
+
+    为什么要门卫：现在新登账号一律是 enterprise_switch（access 30 天），
+    access 到期前续一次就不会掉线；而无条件续期会重写 5 个 .info，
+    客户端在跑时属于没必要的写冲突风险。与上级 refresh_guard.py 的语义一致。
     """
     results = []
     for a in list_accounts():
         if not a.get("ok"):
             results.append((a["file"], False, a.get("reason") or "不可用，跳过"))
             continue
-        ok, msg = refresh_account_file(a["file"])
+        ok, msg = refresh_account_file(a["file"], force=force)
         results.append((a["file"], ok, msg))
         common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "refresh-all", a["file"], ok, msg)
     ok_n = sum(1 for r in results if r[1])
@@ -733,7 +744,9 @@ def main():
     ap.add_argument("--no-auth", action="store_true",
                     help="关闭一次性访问令牌（写操作将只依赖回环 + 同源校验）")
     ap.add_argument("--refresh-all", action="store_true",
-                    help="对 wb_auth 下全部账号各续期一次（供计划任务调用）")
+                    help="对 wb_auth 下全部账号跑一遍续期（供计划任务调用；默认走门卫，见 --force）")
+    ap.add_argument("--force", action="store_true",
+                    help="配合 --refresh-all：跳过门卫（剩余天数阈值 + 冷却），无条件全刷")
     args = ap.parse_args()
 
     if args.prune is not None:
@@ -746,7 +759,7 @@ def main():
         return 0
 
     if args.refresh_all:
-        return refresh_all()
+        return refresh_all(force=args.force)
 
     if args.list:
         print(json.dumps({"accounts": list_accounts()}, ensure_ascii=False, indent=2))

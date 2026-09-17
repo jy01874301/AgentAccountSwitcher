@@ -290,30 +290,46 @@ python check_ttl.py wb_auth      # 只扫指定目录
 
 **⚠️ 新登账号一律是 `enterprise_switch`（30 天），无法避免（见上一章节）。**
 所以自动续期不是可选项，是必需品 —— 没有它，账号每 30 天就会掉线一次。
-靠人工点续期不现实：
+
+### 门卫：默认只续快到期的，不做无谓写盘
+
+`--refresh-all` **默认走门卫**（`force=False`），交给上级
+`workbuddy_checkin.refresh_account` 判断 —— 只有同时满足两个条件才真正刷新：
+
+| 闸门 | 默认值 | 来自 |
+|---|---|---|
+| accessToken 剩余天数 | < **3 天** | `REFRESH_THRESHOLD_DAYS` |
+| 距上次实际续期 | ≥ **24 小时** | `refresh_min_interval_hours`（config.json 可调） |
+
+不满足就返回 `kind="skipped"`，**一个字节都不写盘**。这与上级
+`refresh_guard.py` / `workbuddy_checkin.py --refresh` 的门卫语义一致。
 
 ```bash
-python wb_ui_server.py --refresh-all      # 对 wb_auth 全部账号各续期一次
-refresh_all.cmd                           # 同上，双击即可（失败会暂停显示结果）
+python wb_ui_server.py --refresh-all            # 走门卫（计划任务用）
+python wb_ui_server.py --refresh-all --force    # 跳过门卫，无条件全刷
+refresh_all.cmd                                 # 双击跑；加 --force 同上
 ```
 
-注册计划任务（推荐用脚本，比手写 schtasks 省事）：
+UI 上手动点「续期」按钮走的是 `force=True`（你点了就是要刷，不再判断）。
+
+### 计划任务
+
+**每天 07:30 一次**（对齐上级「自动签到」项目的旧规则：`checkin_task.xml` 每天 00:01、
+`refresh_task.xml` 每天 07:30）。因为门卫挡着，日常开销只有几次本地读取，真正刷新
+只发生在快到期时 —— 所以不需要更高频次。
 
 ```powershell
-# 每 12 小时一次；-Hours 8 改间隔，-Trae 注册 Trae 侧，-Remove 移除
+# 默认每天 07:30；-At 06:00 改时刻，-Hours 12 改成每 12 小时，-Remove 移除
 powershell -ExecutionPolicy Bypass -File install_refresh_task.ps1
 ```
 
-等价的手写命令：
-
-```bat
-schtasks /create /tn "WB-RefreshAll" /sc hourly /mo 12 ^
-  /tr "\"D:\AI项目\wb_switcher\refresh_all.cmd\"" /f
-```
+> 本机 PowerShell 的 ExecutionPolicy 禁止直接运行 `.ps1`。要么加
+> `-ExecutionPolicy Bypass`，要么把内容读成 scriptblock 执行
+> （后者会让 `$MyInvocation.MyCommand.Path` 为空，得手工补 `$root`）。
 
 `refresh_all.cmd` 支持 `/nopause`（计划任务是非交互环境，不加会让任务一直挂住），
 `install_refresh_task.ps1` 已自动带上。refresh 会把 refreshToken 重置为新的 60 天，
-所以按天/周级跑一次即可一直不掉线。上级「自动签到」项目的 `config.json` 里
+所以按天级跑一次即可一直不掉线。上级「自动签到」项目的 `config.json` 里
 `wb_auth_dirs` 已加入本目录：
 
 ```json
