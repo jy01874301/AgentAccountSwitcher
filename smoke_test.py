@@ -12,6 +12,9 @@
 import http.client
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -149,13 +152,40 @@ def main():
             html = raw.decode("utf-8", "replace")
             check(label + " GET / 返回前端", st == 200 and "切换器" in html, st)
             check(label + " 模板已渲染（无残留占位符）", "{{" not in html, html[:60])
+            # 三个工具按钮都默认隐藏，由 loadCredits / loadCheckin 按后端能力点亮
+            check(label + " 工具条含三个按钮",
+                  'id="credBtn"' in html and 'id="ckBtn"' in html and 'id="rfBtn"' in html, st)
+            check(label + " 一键续期按钮已接上",
+                  "doRefreshAll()" in html and "/api/refresh-all" in html, st)
             if label == "[wb]":
                 check("[wb] 前端含积分明细模板", "积分明细" in html and "credBtn" in html, st)
                 # 时间与已使用量同行、两端对齐；两块 nowrap 保证不会"一侧折行一侧单行"
                 check("[wb] 积分明细同行布局", "ci-info" in html and "ci-when" in html, st)
+                check("[wb] 签到功能开启", 'checkin: "1"' in html and "doCheckinAll()" in html, st)
+                check("[wb] 可用账号用列表行渲染（不再是 grid 卡片）",
+                      'id="acctList"' in html and 'class="list"' in html and 'id="acctGrid"' not in html, st)
+                check("[wb] 当前账号与列表行共用同一套行模板",
+                      "function rowHtml" in html and 'class="avatar"' in html, st)
+                check("[wb] 列表里过滤掉当前账号",
+                      "a.file!==curFile" in html, st)
+                # 只读签到状态必须与写接口分开：WRITE_ENDPOINTS 里的路径 GET 一律 405
+                st2, raw2 = call(port, "/api/checkin-status")
+                check("[wb] GET /api/checkin-status 可用（只读）",
+                      st2 == 200 and json.loads(raw2).get("ok"), st2)
+                st2, _ = call(port, "/api/checkin", "GET")
+                check("[wb] GET /api/checkin 405（写接口只收 POST）", st2 == 405, st2)
+                st2, _ = call(port, "/api/refresh-all", "GET")
+                check("[wb] GET /api/refresh-all 405", st2 == 405, st2)
+                check("[wb] 两个写接口已登记进 WRITE_ENDPOINTS",
+                      "/api/checkin" in wb.Handler.WRITE_ENDPOINTS
+                      and "/api/refresh-all" in wb.Handler.WRITE_ENDPOINTS, wb.Handler.WRITE_ENDPOINTS)
             else:
                 check("[tw] 无积分接口时不显示刷新按钮",
-                      'id="credBtn" style="margin-left:12px;display:none"' in html, st)
+                      'id="credBtn" style="display:none"' in html, st)
+                check("[tw] 无签到接口时不显示签到按钮",
+                      'id="ckBtn" style="display:none"' in html and 'checkin: ""' in html, st)
+                check("[tw] 一键续期接口可用",
+                      "/api/refresh-all" in tw.Handler.WRITE_ENDPOINTS, tw.Handler.WRITE_ENDPOINTS)
             st, raw = call(port, "/api/accounts")
             check(label + " GET /api/accounts", st == 200 and json.loads(raw).get("ok"), st)
             accs = json.loads(raw).get("accounts") or []
@@ -482,6 +512,24 @@ def main():
           (len(got_paths) >= 1) == expect_found,
           "%d 条 / 预期%s" % (len(got_paths), expect_found))
 
+    # wb 侧的 %LOCALAPPDATA% 同款坑：变量"存在但为空串"时 os.environ.get(k, d) 会返回 ""，
+    # Path("") 解析成当前目录，于是静默去 ./CodeBuddyExtension/... 找登录态，
+    # 表现为「当前账号为空」且不报错。必须用 `or` 回退。
+    saved_local = os.environ.pop("LOCALAPPDATA", None)
+    try:
+        os.environ["LOCALAPPDATA"] = ""            # 关键：置空而不是删除
+        got_local = wb._localappdata_dir()
+        # 复现模块级表达式：DESKTOP_DIR 在 import 时就算好了，直接读它测不出环境变量变化
+        got_desktop = Path(wb._localappdata_dir()) / wb.wb.AUTH_REL_DIR
+    finally:
+        os.environ.pop("LOCALAPPDATA", None)
+        if saved_local is not None:
+            os.environ["LOCALAPPDATA"] = saved_local
+    check("LOCALAPPDATA 为空串时回退到 ~/AppData/Local",
+          bool(got_local) and "AppData" in got_local and "Local" in got_local, repr(got_local))
+    check("LOCALAPPDATA 为空串时 DESKTOP_DIR 仍是绝对路径（不会落到当前目录）",
+          got_desktop.is_absolute() and "CodeBuddyExtension" in str(got_desktop), str(got_desktop))
+
     print("\n== 11. 续期门卫（计划任务默认不强制刷新）==")
     # 计划任务每天跑一次 --refresh-all，但默认 force=False，交给上级
     # workbuddy_checkin.refresh_account 按「剩余 < 3 天 + 24 小时冷却」判断，
@@ -515,6 +563,29 @@ def main():
             check("[wb] 无可用账号素材，跳过门卫透传用例", True, "wb_auth 下没有可解析的 .info")
     finally:
         wb.wb.refresh_account = real_refresh
+
+    print("\n== 12. 前端模板：占位符与 JS 语法 ==")
+    # 模板是两个切换器共用的，任何一边漏配 UI_CONTEXT 都会在页面上留下裸 {{KEY}}；
+    # 而脚本里一个语法错误会让整页白屏，且只有打开浏览器才看得出来 —— 这里一并守住。
+    tpl = (BIN / "ui_template.html").read_text(encoding="utf-8")
+    for label, ctx in (("[wb]", wb.Handler.UI_CONTEXT), ("[tw]", tw.Handler.UI_CONTEXT)):
+        rendered = common.render_template(tpl, ctx).decode("utf-8")
+        left = sorted(set(re.findall(r"\{\{[A-Za-z0-9_]+\}\}", rendered)))
+        check("%s 模板占位符全部有值" % label, not left, left)
+    scripts = re.findall(r"<script>(.*?)</script>", rendered, re.S)
+    main_js = max(scripts, key=len) if scripts else ""
+    check("模板含主脚本（rowHtml / renderAccounts）",
+          "function rowHtml" in main_js and "function renderAccounts" in main_js, len(main_js))
+    node = shutil.which("node")
+    if node:
+        with tempfile.TemporaryDirectory() as td:
+            js = Path(td) / "tpl.js"
+            js.write_text(main_js, encoding="utf-8")
+            r = subprocess.run([node, "--check", str(js)], capture_output=True, text=True)
+        check("前端 JS 通过 node --check", r.returncode == 0,
+              (r.stderr or r.stdout or "").strip()[-200:])
+    else:
+        check("跳过前端 JS 语法检查（node 不在 PATH）", True, "")
 
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0

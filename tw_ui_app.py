@@ -73,9 +73,9 @@ def main():
         webview.create_window(
             "Trae 账号切换器",
             url,
-            width=1120,
-            height=780,
-            min_size=(900, 600),
+            width=1180,          # 与 WorkBuddy 侧同款列表布局，窗口尺寸保持一致
+            height=900,
+            min_size=(900, 640),
         )
         webview.start()
     except Exception as e:  # noqa: BLE001  # 无 WebView 运行库时退回默认浏览器

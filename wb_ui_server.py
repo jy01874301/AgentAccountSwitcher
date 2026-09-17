@@ -51,7 +51,17 @@ wb = common.require_module(
 # 与 PROJECT_ROOT（复用自动签到项目的解析/续期逻辑）解耦，避免指向兄弟项目。
 SCRIPT_DIR = PROJECT_ROOT
 AUTH_DIR = _BIN_DIR / "wb_auth"
-DESKTOP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / wb.AUTH_REL_DIR
+def _localappdata_dir():
+    r"""%LOCALAPPDATA% 目录；变量缺失**或为空串**时回退到 ~/AppData/Local。
+
+    注意必须用 `or` 而不是 `os.environ.get(k, default)`：环境变量存在但为空串时
+    get() 返回 ""，Path("") 会解析成当前工作目录，于是去 ./CodeBuddyExtension/... 找
+    登录态 —— 表现为「当前账号为空」而不报任何错。Trae 侧的 %APPDATA% 踩过同一个坑。
+    """
+    return os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+
+
+DESKTOP_DIR = Path(_localappdata_dir()) / wb.AUTH_REL_DIR
 DESKTOP_INFO = DESKTOP_DIR / "workbuddy-desktop.info"
 LOGOUT_SUFFIX = wb.LOGOUT_MARKER_SUFFIX  # ".logged-out"
 LOCK_DIR = _BIN_DIR / ".locks"      # 跨进程锁文件（不放进客户端配置目录）
@@ -131,12 +141,15 @@ def current_account():
         if (DESKTOP_DIR / ("%s.info%s" % (root_id, LOGOUT_SUFFIX))).exists():
             continue  # 该 id 会话已登出
         acc = wb.session_from_info_file(f)
+        # token_source 让「当前账号」也能显示通道标签，和账号列表里的一致
+        raw_at = ((_read_info(f) or {}).get("auth") or {}).get("accessToken")
         entries.append({
             "file": f.name,
             "ok": bool(acc),
             "nickname": acc["nickname"] if acc else (root_id),
             "uid": acc["uid"] if acc else "",
             "expires_at": acc["expires_at"].isoformat() if acc and acc["expires_at"] else None,
+            "token_source": common.token_source(raw_at) if acc else "",
             "is_backup": bool(is_backup),
             "mtime": f.stat().st_mtime,
         })
@@ -426,6 +439,31 @@ def refresh_account_file(file_name, force=True):
     return ok, msg
 
 
+def _refresh_all_collect(force):
+    """遍历账号库跑一遍续期，返回 [(file, ok, msg)]。CLI 与 UI 共用这一份遍历。"""
+    results = []
+    for a in list_accounts():
+        if not a.get("ok"):
+            results.append((a["file"], False, a.get("reason") or "不可用，跳过"))
+            continue
+        ok, msg = refresh_account_file(a["file"], force=force)
+        results.append((a["file"], ok, msg))
+        common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "refresh-all", a["file"], ok, msg)
+    return results
+
+
+def _results_payload(results, label):
+    """把 [(file, ok, msg)] 整理成前端要的统一结构。"""
+    ok_n = sum(1 for r in results if r[1])
+    return {
+        "ok": ok_n == len(results),
+        "message": "%s：%d/%d 成功" % (label, ok_n, len(results)),
+        "ok_count": ok_n,
+        "total": len(results),
+        "results": [{"file": f, "ok": ok, "message": msg} for f, ok, msg in results],
+    }
+
+
 def refresh_all(force=False):
     """对 wb_auth 下全部账号跑一遍续期，供计划任务调用。返回退出码。
 
@@ -437,19 +475,160 @@ def refresh_all(force=False):
     access 到期前续一次就不会掉线；而无条件续期会重写 5 个 .info，
     客户端在跑时属于没必要的写冲突风险。与上级 refresh_guard.py 的语义一致。
     """
+    results = _refresh_all_collect(force)
+    for f, ok, msg in results:
+        print("%-4s %-32s %s" % ("OK" if ok else "FAIL", f, msg))
+    print("---- 续期完成：%d/%d 成功" % (sum(1 for r in results if r[1]), len(results)))
+    return 0 if all(r[1] for r in results) else 1
+
+
+# ---------------------------------------------------------------------------
+# 每日签到（只读查询 + 一键领取）
+# ---------------------------------------------------------------------------
+# 签到接口与计费接口同一个网关、同一套请求头，只是路径不同：
+#   POST {endpoint}/v2/billing/meter/checkin-activity-status  ← 只读查状态
+#   POST {endpoint}/v2/billing/meter/daily-checkin            ← 真正领取
+# 查询走 _billing_post（UA 有要求）；领取直接复用上级 checkin_account 的实现，
+# 免得两处各写一份业务码判断（BIZ_ALREADY_CLAIMED / NOT_ELIGIBLE / EVENT_ENDED）。
+CHECKIN_STATUS_PATH = getattr(wb, "STATUS_PATH", "/v2/billing/meter/checkin-activity-status")
+CHECKIN_TTL = 300.0       # 缓存秒数：和积分一样，一次查询要按账号数发请求
+
+_CHECKIN_LOCK = threading.Lock()
+_CHECKIN_CACHE = {"ts": 0.0, "payload": None}
+
+
+def query_checkin(acc, cfg):
+    """只读查询单个账号的签到状态（不发领取请求）。"""
+    headers = wb.build_headers(acc)
+    code, body = _billing_post(cfg["endpoint"] + CHECKIN_STATUS_PATH, headers)
+    if code in (401, 403):
+        return {"ok": False, "reason": "登录态无效或已过期（HTTP %d），请重新登录该账号" % code}
+    if code != 200:
+        return {"ok": False, "reason": "签到状态接口 HTTP %s" % code}
+    if not isinstance(body, dict) or body.get("code") not in (None, 0):
+        return {"ok": False, "reason": "签到状态接口业务错误（code=%s）"
+                % (body or {}).get("code")}
+    st = body.get("data")
+    if not isinstance(st, dict):
+        return {"ok": False, "reason": "签到状态接口结构异常"}
+
+    if st.get("active") is False:
+        return {"ok": True, "active": False, "checked_in": False,
+                "streak_days": None, "total_credits": None, "daily_credit": None,
+                "msg": "签到活动未开启"}
+
+    checked = bool(st.get("today_checked_in"))
+    streak = st.get("streak_days")
+    total = st.get("total_credits")
+    daily = st.get("daily_credit")
+    if checked:
+        msg = "今日已签到"
+        if streak is not None:
+            msg += " · 连续 %s 天" % streak
+    else:
+        msg = "今日未签到"
+        if daily is not None:
+            msg += " · 可领 %s 积分" % daily
+    return {"ok": True, "active": True, "checked_in": checked,
+            "streak_days": streak, "total_credits": total, "daily_credit": daily,
+            "msg": msg}
+
+
+def checkin_snapshot(force=False):
+    """汇总 wb_auth 全部账号的签到状态（并发查询 + 进程内缓存）。"""
+    now = time.time()
+    with _CHECKIN_LOCK:
+        cached = _CHECKIN_CACHE["payload"]
+        if not force and cached and now - _CHECKIN_CACHE["ts"] < CHECKIN_TTL:
+            return dict(cached, cached=True)
+
+    cfg = wb.load_config(SCRIPT_DIR / "config.json")
+    accounts = list_accounts()
+
+    def _one(a):
+        entry = {"file": a["file"], "uid": a.get("uid") or "",
+                 "nickname": a.get("nickname") or a["file"], "ok": False}
+        if not a.get("ok"):
+            entry["reason"] = a.get("reason") or "账号不可用"
+            return entry
+        acc = wb.session_from_info_file(AUTH_DIR / a["file"])
+        if not acc:
+            entry["reason"] = "登录态无法解析"
+            return entry
+        try:
+            entry.update(query_checkin(acc, cfg))
+        except Exception as e:  # noqa: BLE001  单个账号失败不能拖垮整张表
+            entry["reason"] = "签到查询异常：%s" % common.scrub(e, 80)
+        return entry
+
+    workers = min(6, max(1, len(accounts)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        items = list(pool.map(_one, accounts))
+    payload = {
+        "ok": True,
+        "accounts": items,
+        "checked": sum(1 for i in items if i.get("checked_in")),
+        "total": len(items),
+        "ts": datetime.datetime.now().strftime("%H:%M:%S"),
+        "cached": False,
+    }
+    with _CHECKIN_LOCK:
+        _CHECKIN_CACHE["ts"] = time.time()
+        _CHECKIN_CACHE["payload"] = payload
+    return payload
+
+
+def checkin_account_file(file_name):
+    """对 wb_auth 里的单个账号执行签到（会真正领取）。返回 (ok, msg)。
+
+    与 refresh_account_file 同款：只接受文件名、加文件锁、成功后清签到缓存。
+    这里不复用上级的 history 记录 —— 那是 main() 的职责，UI 侧只负责把奖励领到。
+    """
+    base = os.path.basename((file_name or "").replace("\\", "/"))
+    if os.path.dirname((file_name or "").replace("\\", "/")):
+        return False, "非法的文件路径"
+    if not base.endswith(".info"):
+        return False, "只能对 .info 账号文件签到"
+    target = AUTH_DIR / base
+    if not target.is_file():
+        return False, "wb_auth 中不存在账号文件：%s" % base
+    if not hasattr(wb, "checkin_account"):
+        return False, "上级模块缺少 checkin_account，无法签到"
+    acc = wb.session_from_info_file(target)
+    if not acc:
+        return False, "账号文件无法解析，无法签到"
+    cfg = wb.load_config(SCRIPT_DIR / "config.json")
+    # 签到会读账号文件（并可能触发续期写回），与切号/续期互斥
+    with common.file_lock("wb-auth-" + base, LOCK_DIR):
+        ok, msg, kind = wb.checkin_account(acc, cfg, False, _NULLLOG)
+    if kind == "claimed":
+        _invalidate_checkin_cache()
+    return ok, msg
+
+
+def _invalidate_checkin_cache():
+    with _CHECKIN_LOCK:
+        _CHECKIN_CACHE["payload"] = None
+        _CHECKIN_CACHE["ts"] = 0.0
+
+
+def checkin_all():
+    """一键签到：对 wb_auth 下全部可用账号各签一次。返回统一结构。"""
     results = []
     for a in list_accounts():
         if not a.get("ok"):
             results.append((a["file"], False, a.get("reason") or "不可用，跳过"))
             continue
-        ok, msg = refresh_account_file(a["file"], force=force)
+        ok, msg = checkin_account_file(a["file"])
         results.append((a["file"], ok, msg))
-        common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "refresh-all", a["file"], ok, msg)
-    ok_n = sum(1 for r in results if r[1])
-    for f, ok, msg in results:
-        print("%-4s %-32s %s" % ("OK" if ok else "FAIL", f, msg))
-    print("---- 续期完成：%d/%d 成功" % (ok_n, len(results)))
-    return 0 if ok_n == len(results) else 1
+        common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "checkin", a["file"], ok, msg)
+    _invalidate_checkin_cache()
+    return _results_payload(results, "一键签到完成")
+
+
+def refresh_all_ui():
+    """一键续期（UI 按钮）：用户显式点了就是要刷，所以跳过门卫。"""
+    return _results_payload(_refresh_all_collect(True), "一键续期完成")
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +804,10 @@ def credits_snapshot(force=False):
     accounts = list_accounts()
 
     def _one(a):
-        entry = {"file": a["file"], "nickname": a.get("nickname") or a["file"], "ok": False}
+        # uid 是前端把「当前桌面端账号」映射到这条积分记录的唯一键：
+        # 当前账号可能不在账号库里（手动登录的），只有 uid 能对上。
+        entry = {"file": a["file"], "uid": a.get("uid") or "",
+                 "nickname": a.get("nickname") or a["file"], "ok": False}
         if not a.get("ok"):
             entry["reason"] = a.get("reason") or "账号不可用"
             return entry
@@ -679,13 +861,16 @@ class Handler(common.BaseHandler):
         "ADD_HINT": "点击展开，选择或粘贴该账号的 .info 登录态",
         "EMPTY_HINT": "请把 WorkBuddy 账号登录态文件（<code>workbuddy-*.info</code>）放进去。",
         "CMD": "workbuddy_switcher.cmd",
-        "CREDITS": "1",            # 账号卡上展示积分明细（Trae 侧无该接口，置空即隐藏）
+        "CREDITS": "1",            # 展示积分明细 + 「刷新积分」按钮（Trae 侧无该接口，置空即隐藏）
+        "CHECKIN": "1",            # 展示签到状态 + 「一键签到」按钮（Trae 侧无该接口，置空即隐藏）
     }
-    WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add")
+    WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add",
+                       "/api/checkin", "/api/refresh-all")
     SOURCE = "wb"
     AUDIT_DIR = _BIN_DIR / "logs"
     AUDIT_ACTIONS = {"/api/switch": "switch", "/api/remove": "remove",
-                     "/api/refresh": "refresh", "/api/add": "add"}
+                     "/api/refresh": "refresh", "/api/add": "add",
+                     "/api/checkin": "checkin", "/api/refresh-all": "refresh-all"}
 
     def api_get(self, u):
         if u.path == "/api/accounts":
@@ -695,6 +880,10 @@ class Handler(common.BaseHandler):
         if u.path == "/api/credits":
             # ?force=1 强制回源，否则走 CREDITS_TTL 秒的进程内缓存
             return 200, credits_snapshot(force="force=1" in (u.query or ""))
+        if u.path == "/api/checkin-status":
+            # 只读查签到状态。必须与 POST /api/checkin 分开：
+            # BaseHandler 对 WRITE_ENDPOINTS 里的路径一律拒绝 GET（405）。
+            return 200, checkin_snapshot(force="force=1" in (u.query or ""))
         return 404, {"ok": False, "message": "404"}
 
     def api_post(self, u, p):
@@ -706,6 +895,12 @@ class Handler(common.BaseHandler):
             ok, msg = refresh_account_file(str(p.get("file") or ""))
         elif u.path == "/api/add":
             ok, msg = add_account(str(p.get("name") or ""), str(p.get("content") or ""))
+        elif u.path == "/api/checkin":
+            # 一键签到：对账号库全部可用账号各签一次
+            return 200, checkin_all()
+        elif u.path == "/api/refresh-all":
+            # 一键续期：跳过门卫，无条件全刷
+            return 200, refresh_all_ui()
         else:
             return 404, {"ok": False, "message": "404"}
         return 200, {"ok": ok, "message": msg}

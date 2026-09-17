@@ -486,8 +486,8 @@ def refresh_account_file(file_name):
     return ok, msg
 
 
-def refresh_all():
-    """对 tw_auth 下全部素材各续期一次，供计划任务调用。返回退出码。"""
+def _refresh_all_collect():
+    """遍历素材目录各续期一次，返回 [(file, ok, msg)]。CLI 与 UI 共用。"""
     results = []
     for a in list_accounts():
         if not a.get("ok"):
@@ -496,11 +496,29 @@ def refresh_all():
         ok, msg = refresh_account_file(a["file"])
         results.append((a["file"], ok, msg))
         common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "refresh-all", a["file"], ok, msg)
-    ok_n = sum(1 for r in results if r[1])
+    return results
+
+
+def refresh_all():
+    """对 tw_auth 下全部素材各续期一次，供计划任务调用。返回退出码。"""
+    results = _refresh_all_collect()
     for f, ok, msg in results:
         print("%-4s %-32s %s" % ("OK" if ok else "FAIL", f, msg))
-    print("---- 续期完成：%d/%d 成功" % (ok_n, len(results)))
-    return 0 if ok_n == len(results) else 1
+    print("---- 续期完成：%d/%d 成功" % (sum(1 for r in results if r[1]), len(results)))
+    return 0 if all(r[1] for r in results) else 1
+
+
+def refresh_all_ui():
+    """一键续期（UI 按钮）。返回前端要的统一结构。"""
+    results = _refresh_all_collect()
+    ok_n = sum(1 for r in results if r[1])
+    return {
+        "ok": ok_n == len(results),
+        "message": "一键续期完成：%d/%d 成功" % (ok_n, len(results)),
+        "ok_count": ok_n,
+        "total": len(results),
+        "results": [{"file": f, "ok": ok, "message": msg} for f, ok, msg in results],
+    }
 
 
 class Handler(common.BaseHandler):
@@ -521,13 +539,16 @@ class Handler(common.BaseHandler):
         "ADD_HINT": "点击展开，选择该账号的 storage.json 登录态",
         "EMPTY_HINT": "请放入该账号的 <code>storage.json</code>。",
         "CMD": "trae_switcher.cmd",
-        "CREDITS": "",             # Trae 侧无 /api/credits，置空隐藏积分明细
+        "CREDITS": "",             # Trae 侧无 /api/credits，置空隐藏积分明细与「刷新积分」
+        "CHECKIN": "",             # Trae 侧无 /api/checkin，置空隐藏签到状态与「一键签到」
     }
-    WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add")
+    WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add",
+                       "/api/refresh-all")
     SOURCE = "tw"
     AUDIT_DIR = _BIN_DIR / "logs"
     AUDIT_ACTIONS = {"/api/switch": "switch", "/api/remove": "remove",
-                     "/api/refresh": "refresh", "/api/add": "add"}
+                     "/api/refresh": "refresh", "/api/add": "add",
+                     "/api/refresh-all": "refresh-all"}
 
     def api_get(self, u):
         if u.path == "/api/accounts":
@@ -545,6 +566,8 @@ class Handler(common.BaseHandler):
             ok, msg = refresh_account_file(str(p.get("file") or ""))
         elif u.path == "/api/add":
             ok, msg = add_account(str(p.get("name") or ""), str(p.get("content") or ""))
+        elif u.path == "/api/refresh-all":
+            return 200, refresh_all_ui()
         else:
             return 404, {"ok": False, "message": "404"}
         return 200, {"ok": ok, "message": msg}

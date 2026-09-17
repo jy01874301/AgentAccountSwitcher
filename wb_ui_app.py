@@ -81,9 +81,9 @@ def main():
         webview.create_window(
             "WorkBuddy 账号切换器",
             url,
-            width=1120,
-            height=920,          # 顶部多了一块「积分概览」，比原先的 780 高
-            min_size=(900, 720),
+            width=1180,          # 账号改成列表行（身份 / 积分 / 操作 三段）后需要更宽
+            height=1040,         # 当前账号行 + 积分明细 + 签到，比原先的 780 高不少
+            min_size=(900, 700),
         )
         webview.start()
     except Exception as e:  # noqa: BLE001  # 无 WebView 运行库时退回默认浏览器
