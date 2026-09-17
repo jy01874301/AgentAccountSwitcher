@@ -68,15 +68,26 @@ TW_BACKUP_KEEP = 10              # tw_backups 保留份数（备份本身是有�
 DEFAULT_PORT = 8766
 
 
+def _appdata_dir():
+    """%APPDATA% 目录；缺失时回退到 ~/AppData/Roaming。
+
+    不能只写 os.environ.get("APPDATA")：某些启动方式（计划任务、精简环境、
+    从非登录 shell 拉起）下该变量为空，而这里一旦拿到空串就会静默返回空路径
+    列表，界面表现为"未发现 storage.json"——即使文件就在那儿，且切号也会被
+    拒。WorkBuddy 侧（wb_ui_server.DESKTOP_DIR 与 workbuddy_checkin.auth_dirs）
+    一直带同样的回退，这里补齐对齐。
+    """
+    return os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+
+
 def desktop_storage_paths():
     """本机 Trae 可能的 storage.json（按候选目录优先级）。"""
-    appdata = os.environ.get("APPDATA")
+    appdata = _appdata_dir()
     res = []
-    if appdata:
-        for d in tw.CANDIDATE_DIRS:
-            p = Path(appdata) / d / "User" / "globalStorage" / "storage.json"
-            if p.is_file():
-                res.append(p)
+    for d in tw.CANDIDATE_DIRS:
+        p = Path(appdata) / d / "User" / "globalStorage" / "storage.json"
+        if p.is_file():
+            res.append(p)
     return res
 
 

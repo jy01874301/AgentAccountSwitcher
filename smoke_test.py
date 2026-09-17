@@ -463,6 +463,25 @@ def main():
         check("%s 代码中未写死 D:/AI项目 绝对路径" % spec_name,
               "D:/AI项目" not in code and "D:\\AI项目" not in code, text[:0])
 
+    print("\n== 10. Trae 登录态路径的 APPDATA 回退 ==")
+    # 此前 tw 侧只写 os.environ.get("APPDATA")，变量为空就静默返回空列表，
+    # 表现为「未发现 storage.json」（哪怕文件就在那儿），切号也会被拒。
+    real_appdata = Path.home() / "AppData" / "Roaming"
+    expect_found = any((real_appdata / d / "User" / "globalStorage" / "storage.json").is_file()
+                       for d in tw.tw.CANDIDATE_DIRS)
+    saved_appdata = os.environ.pop("APPDATA", None)
+    try:
+        got_dir = tw._appdata_dir()
+        got_paths = tw.desktop_storage_paths()
+    finally:
+        if saved_appdata is not None:
+            os.environ["APPDATA"] = saved_appdata
+    check("APPDATA 缺失时回退到 ~/AppData/Roaming",
+          bool(got_dir) and "AppData" in got_dir and "Roaming" in got_dir, got_dir)
+    check("APPDATA 缺失时仍能找到本机 storage.json",
+          (len(got_paths) >= 1) == expect_found,
+          "%d 条 / 预期%s" % (len(got_paths), expect_found))
+
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0
 
