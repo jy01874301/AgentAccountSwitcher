@@ -184,14 +184,21 @@ def _asset_token_entries(data):
 
 
 def list_accounts():
-    """列出 tw_auth 目录下所有账号素材。返回每条带 file/ok/label/nickname/expires_at/type。"""
+    """列出 tw_auth 目录下所有账号素材。
+
+    每条带 file/ok/label/nickname/uid/expires_at/type。**uid 必须给**：
+    两个切换器共用同一份前端模板，模板靠 uid 把「当前账号」映射回账号库里的文件
+    （既用来显示积分/签到，也用来把当前账号从列表里滤掉）。wb 侧一直有 uid，
+    tw 侧曾经没有 —— 结果是 Trae 页面里当前账号永远显示"不在账号库中"，
+    并且列表里还会和当前账号重复出现一条。
+    """
     out = []
     if not TW_AUTH_DIR.is_dir():
         return out
     for f in sorted(TW_AUTH_DIR.glob("*.json")):
         data = _read_json(f)
         if not isinstance(data, dict):
-            out.append({"file": f.name, "path": str(f), "ok": False,
+            out.append({"file": f.name, "path": str(f), "ok": False, "uid": "",
                         "type": "unknown", "label": f.stem, "nickname": f.stem,
                         "expires_at": None, "token_source": "",
                         "reason": "不是合法 JSON"})
@@ -200,7 +207,7 @@ def list_accounts():
         if kind == "storage":
             info, err = _parse_storage(data)
             if info is None:
-                out.append({"file": f.name, "path": str(f), "ok": False,
+                out.append({"file": f.name, "path": str(f), "ok": False, "uid": "",
                             "type": "storage", "label": f.stem, "nickname": f.stem,
                             "expires_at": None, "token_source": "", "reason": err})
                 continue
@@ -209,6 +216,7 @@ def list_accounts():
             out.append({
                 "file": f.name, "path": str(f), "ok": ok, "type": "storage",
                 "label": nick, "nickname": nick,
+                "uid": _uid_of(info),
                 "expires_at": info["expires_at"],
                 "region": info["region"],
                 "has_refresh": bool(info["refresh_token"]),
@@ -222,13 +230,13 @@ def list_accounts():
             e = entries[0]
             label = str(e.get("label") or f.stem) if isinstance(e, dict) else f.stem
             out.append({
-                "file": f.name, "path": str(f), "ok": False, "type": "tokens",
-                "label": label, "nickname": label,
+                "file": f.name, "path": str(f), "ok": False, "uid": "",
+                "type": "tokens", "label": label, "nickname": label,
                 "expires_at": None, "token_source": "",
                 "reason": "签到用 token 配置，无加密登录态，不可切换；请放入该账号的 storage.json",
             })
         else:
-            out.append({"file": f.name, "path": str(f), "ok": False,
+            out.append({"file": f.name, "path": str(f), "ok": False, "uid": "",
                         "type": "unknown", "label": f.stem, "nickname": f.stem,
                         "expires_at": None, "reason": "无法识别素材格式"})
     return out

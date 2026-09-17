@@ -191,6 +191,16 @@ def main():
             accs = json.loads(raw).get("accounts") or []
             check(label + " 账号带 token_source 字段",
                   all("token_source" in a for a in accs), accs[:1])
+            # 两个切换器共用同一份前端模板，模板靠 uid 把「当前账号」映射回账号库里的
+            # 文件（既用于显示积分/签到，也用于把当前账号从列表里滤掉）。
+            # tw 侧曾经不返回 uid，导致 Trae 页面里当前账号永远显示"不在账号库中"、
+            # 列表还和当前账号重复一条 —— 这条断言就是防它再次漂移。
+            check(label + " 账号条目都带 uid 字段",
+                  all("uid" in a for a in accs), accs[:1])
+            usable_accs = [a for a in accs if a.get("ok")]
+            check(label + " 可用账号解析出非空 uid",
+                  all(a.get("uid") for a in usable_accs),
+                  [(a["file"], a.get("uid")) for a in usable_accs])
             st, raw = call(port, "/api/nope")
             check(label + " 未知路径 JSON 404", st == 404 and json.loads(raw).get("ok") is False, st)
             st, raw = call(port, "/api/switch", "POST", {"name": "nope"})
