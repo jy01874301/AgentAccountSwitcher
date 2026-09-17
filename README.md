@@ -18,16 +18,19 @@ wb_switcher/
 ├── ui_template.html       # 前端模板（两份切换器共用，后端按 UI_CONTEXT 渲染后返回）
 ├── wb_ui_app.py           # 桌面版启动器（pywebview 窗口，可打包 exe）
 ├── workbuddy_switcher.cmd # Windows 启动脚本（双击即用）
-├── wb_auth/               # 切换用的账号配置库，放置 *.info 登录态文件
+├── wb_auth/               # 切换用的账号配置库，放置 *.info 登录态文件（唯一真源，见下）
+│   ├── workbuddy-jhan.info
 │   ├── workbuddy-Maggie ya.info
 │   ├── workbuddy-wtnong.info
 │   ├── workbuddy-wtnong1.info
 │   └── workbuddy-星空.info
 ├── tw_ui_server.py / tw_ui_app.py / trae_switcher.cmd  # Trae 姊妹工具，见 README_Trae.md
-├── TraeSwitcher.spec      # Trae 桌面版打包配置（pyinstaller TraeSwitcher.spec）
+├── WorkBuddySwitcher.spec / TraeSwitcher.spec  # 桌面版打包配置（pyinstaller <spec> --noconfirm）
 ├── import_token.py        # Trae 凭据导入（别机 tokens / storage.json → config.json）
 ├── check_ttl.py           # 登录态体检：签发通道 / 剩余天数 / accessToken 完整性（只读）
 ├── smoke_test.py          # 回归自检：裁剪 / 文件锁 / 端口 / 接口 / 令牌校验（不碰真实登录态）
+├── refresh_all.cmd / trae_refresh_all.cmd      # 全量续期（计划任务用，支持 /nopause）
+├── install_refresh_task.ps1  # 注册「每 N 小时全量续期」计划任务（-Trae / -Remove / -Hours）
 └── README.md
 ```
 
@@ -51,7 +54,9 @@ WorkBuddy 桌面端的本地登录态保存在：
 3. 把当前正式文件 `workbuddy-desktop.info` 改名为带时间戳的备份
    （`workbuddy-desktop.<日期>.<pid>.<随机>.info`，与客户端的 `clean()` 命名一致，保留其可用登录态）；
 4. 把目标账号内容写入为新的 `workbuddy-desktop.info`；
-5. 清理残留的 `.logged-out` 登出标记。
+5. 清理残留的 `.logged-out` 登出标记；
+6. **写后自校验**：重新读取桌面端文件，确认其中的 uid 已是目标账号（与 Trae 切换器一致），
+   未通过则如实报失败，避免"报成功但实际没生效"。
 
 **切换后的续期**：前端切换成功后会调用 `/api/refresh`，用目标账号的 `refreshToken` 向 WorkBuddy
 服务器真正续期（`POST /v2/plugin/auth/token/refresh`），拿到全新 `accessToken / expiresAt`，
@@ -91,7 +96,26 @@ python wb_ui_server.py --prune [N]      # 清理桌面端切号备份，只留�
 
 ### 前端操作
 
-- **查看当前桌面端账号**：顶部的“当前桌面端账号”卡片。
+- **查看积分**：每张账号卡片底部给出该账号的**总剩余积分**与**积分明细**，分两档
+  （口径与客户端「积分明细」一致，取自计费网关的资源包接口）：
+
+  | 档位 | 含义 | 展示的时间 | 聚合方式 |
+  |------|------|-----------|----------|
+  | 套餐基础积分 | 套餐额度，按周期滚动 | **下次刷新时间** = 本周期结束 + 1 秒 | 周期内多个包取最早结束 |
+  | 平台奖励积分 | 赠送 / 裂变包，一包一到期 | **最近到期时间** = 各包中最早到期 | 全部有效包容量与用量求和 |
+
+  每个档位三行：档位名、时间与已使用量（同一行、两端对齐）、进度条。
+
+  > 账号网格最小宽度设为 **300px**（原 270px）：920px 内容宽下排成 2 列而非 3 列，
+  > 卡片内容宽约 421px，才容得下「时间 + 已使用量」约 350px 的一行 —— 3 列时内容宽仅
+  > 265px，左侧折行而右侧不折，基线就会错开。两块文本都设为 `nowrap` 并允许整块换行，
+  > 因此在极窄窗口下退化为整齐的两行，不会出现半边折行的错位。
+
+  进度条长度 = **已使用比例**（与客户端一致）。已失效的资源包（`Status != 0`）不计入明细，
+  也不参与「最近到期时间」，否则会显示成早已过去的时间。账号名下没有资源包时显示「暂无可用积分包」。
+  数据缓存 10 分钟，标题栏「刷新积分」强制回源。各账号**并发**查询（实测 6 个账号 1.96s → 0.38s），
+  既省等待，也减少「等太久用户刷新页面把请求取消」的情况。
+- **查看当前桌面端账号**：顶部的"当前桌面端账号"卡片。
 - **切换账号**：点击账号卡片上的“切换到该账号”，切换成功后自动续期并刷新剩余天数。
 - **添加账号**：展开"＋ 添加账号"，选择 `.info` 配置文件（或粘贴内容），填标识后保存。
   内容会写入 `wb_auth\workbuddy-<标识>.info`，并以解析器校验有效性，无效则回滚删除。
@@ -113,6 +137,7 @@ python wb_ui_server.py --prune [N]      # 清理桌面端切号备份，只留�
 | GET  | `/` | — | 返回前端页面 |
 | GET  | `/api/accounts` | — | 列出 `wb_auth` 可用账号 |
 | GET  | `/api/current` | — | 桌面端当前账号 |
+| GET  | `/api/credits` | `?force=1` | 积分明细：各账号总剩余积分 + 套餐基础 / 平台奖励明细（缓存 10 分钟，`force` 强制回源） |
 | POST | `/api/switch` | `{name: "<文件名>"}` | 切换账号 |
 | POST | `/api/remove` | `{file: "<文件名>"}` | 从 `wb_auth` 删除账号 |
 | POST | `/api/refresh` | `{file: "<文件名>"}` | 对目标账号真正 HTTP 续期并写回 |
@@ -124,25 +149,46 @@ python wb_ui_server.py --prune [N]      # 清理桌面端切号备份，只留�
 
 ## 账号库说明（当前 `wb_auth\`）
 
-| 文件 | 昵称 | uid | uin | 手机号（尾号） |
-|------|------|-----|-----|----------------|
-| `workbuddy-Maggie ya.info` | Maggie ya | a2b31245-7d42-4207-af9b-8162fee183e3 | 330118970606 | 2679 |
-| `workbuddy-wtnong.info` | wtnong | b592a5dd-3f86-4360-b0cc-4df5b196098b | 330116013866 | 1461 |
-| `workbuddy-wtnong1.info` | wtnong1 | ae528206-0a31-494f-9a3a-4e19363edf55 | 330116014385 | 7608 |
-| `workbuddy-星空.info` | 星空 | ba575b06-7a96-46ff-b18f-d7f959c74f0f | 330107846428 | 7575 |
+> 下表为 2026-09-17 快照，账号会增删 —— **实际以 `wb_auth\` 目录与 `check_ttl.py` 输出为准**。
+
+| 文件 | 昵称 | uid | uin | 手机号（尾号） | 签发通道 |
+|------|------|-----|-----|----------------|----------|
+| `workbuddy-jhan.info` | 13677759422 | c6297850-7a78-4ec5-b46a-8748ffd28a58 | 330119838223 | 9422 | `enterprise_switch`（短期 30 天） |
+| `workbuddy-Maggie ya.info` | Maggie ya | a2b31245-7d42-4207-af9b-8162fee183e3 | 330118970606 | 2679 | `enterprise_switch`（短期 30 天） |
+| `workbuddy-wtnong.info` | wtnong | b592a5dd-3f86-4360-b0cc-4df5b196098b | 330116013866 | 1461 | `oneid_login`（长期 55 天） |
+| `workbuddy-wtnong1.info` | wtnong1 | ae528206-0a31-494f-9a3a-4e19363edf55 | 330116014385 | 7608 | `oneid_login`（长期 55 天） |
+| `workbuddy-星空.info` | 星空 | ba575b06-7a96-46ff-b18f-d7f959c74f0f | 330107846428 | 7575 | 早期令牌（无 `token_source`，按 55 天） |
+
+> 其中 `jhan` 与 `Maggie ya` 是 30 天短期通道，靠下面的自动续期保持不掉线。
+
+### 唯一账号库约定（重要）
+
+`wb_switcher\wb_auth\` 是**唯一**的 WorkBuddy 账号库。上级 `自动签到\wb_auth\`
+必须**保持为空**，不要把账号文件拷进去 —— 同一账号存在两份副本时，两份凭据会各自
+按自己的周期到期（续期只延长被续的那一份），容易出现"一边还能用、另一边已过期"的
+错觉，排查成本很高。`自动签到\config.json` 的 `_说明4b` 也记了这条约定。
+
+> 实测补充：服务端**不会**在续期后立刻作废旧 refreshToken（旧 RT 仍返回 200），
+> 所以副本不会瞬间互相失效；真正的问题是两份凭据的有效期各自漂移。
 
 ---
 
 ## 登录态有效期与签发通道
 
-同一个账号、同一台机器，剩余天数也可能和别的账号差 20 倍 —— 有效期由服务端按
-**登录通道**决定，写死在 JWT 的 `token_source` 里，续期只会沿用同一通道：
+同一个账号、同一台机器，剩余天数也可能和别的账号差近 2 倍 —— 有效期由服务端按
+**登录通道**决定，写死在 JWT 的 `token_source` 里，续期只会沿用同一通道。
+
+下表为 **2026-09-17 实测**（取自续期响应 `data.expiresIn`，与 JWT 的 `exp` 一致）：
 
 | `token_source` | access | refresh | 产生方式 |
 |---|---|---|---|
-| `oneid_login` | 60 天 | 90 天 | 常规 OneID 手机号登录 |
-| `enterprise_switch` | 3 天 | 7 天 | 客户端切到企业空间的会话 |
-| （无该字段，早期令牌） | 60 天 | 90 天 | 早期签发 |
+| `oneid_login` | 55 天（`expiresIn=4752000`） | 60 天 | 常规 OneID 手机号登录 |
+| `enterprise_switch` | 30 天（`expiresIn=2592000`） | 60 天 | 客户端切到企业空间的会话 |
+| （无该字段，早期令牌） | 55 天 | 60 天 | 早期签发 |
+
+> 早期文档写的「`oneid_login` 60/90、`enterprise_switch` 3/7」已与现状不符：现在
+> 企业空间通道是 **30 天**（不是 3 天），两条通道的 refresh 都是 **60 天**。
+> TTL 由服务端下发、可能随时调整，**以 `check_ttl.py` 的实时输出为准**。
 
 - **改本地文件/配置没用**：`accessToken` 是 RS256（服务端私钥签名）、`refreshToken` 是 HS512，
   改任何字符都会验签失败；`.info` 里的 `expiresAt` / `expiresIn` 只是本地镜像，改了只骗自己。
@@ -150,8 +196,12 @@ python wb_ui_server.py --prune [N]      # 清理桌面端切号备份，只留�
   oneid_login / 不带该头，返回恒为同一 TTL，`sessionState` 也不变 —— TTL 绑在服务端会话上。
 - **唯一有效办法**：退出企业空间 → 退出登录 → 用手机号验证码重新登录 → 整份复制
   `workbuddy-desktop.info` 覆盖素材。
-- 短期账号不会因续期变长期，但 **refresh 会滚动 refreshToken**（每次续期后 RT 也重置 7 天），
-  所以每 ≤3 天续一次可以一直不掉线。
+- 短期账号不会因续期变长期（`token_source` 原样保留），但 **refresh 会把 refreshToken
+  重置为新的 60 天**，所以只要在 access 到期前续一次就能一直不掉线。
+- **旧 refreshToken 不会立刻作废**：实测拿续期前的旧 RT 再请求，仍返回 200。因此
+  "续期会踢掉另一份副本"并不成立；副本的真实风险是两份凭据的有效期各自漂移。
+- **续期不保证延长**：若服务端本次签发较短 TTL，续期后剩余天数反而可能变少
+  （实测 `oneid_login` 从 60 天变 55 天）。要延长先看 `check_ttl.py` 的剩余天数再决定。
 
 体检命令：
 
@@ -161,35 +211,46 @@ python check_ttl.py wb_auth      # 只扫指定目录
 ```
 
 输出每个账号的 `token_source`、剩余天数、续期窗口，以及 `accessToken` 是否完整。
+（`..\自动签到\wb_auth` 按约定应保持为空，扫不到文件是正常的。）
 
 ---
 
 ## 自动续期
 
-短期通道（`enterprise_switch`）的账号 3 天就到期，靠人工点续期不现实：
+短期通道（`enterprise_switch`）的账号只有 30 天有效期，靠人工点续期不现实：
 
 ```bash
 python wb_ui_server.py --refresh-all      # 对 wb_auth 全部账号各续期一次
 refresh_all.cmd                           # 同上，双击即可（失败会暂停显示结果）
 ```
 
-挂计划任务（每 12 小时一次，按需调整）：
+注册计划任务（推荐用脚本，比手写 schtasks 省事）：
+
+```powershell
+# 每 12 小时一次；-Hours 8 改间隔，-Trae 注册 Trae 侧，-Remove 移除
+powershell -ExecutionPolicy Bypass -File install_refresh_task.ps1
+```
+
+等价的手写命令：
 
 ```bat
 schtasks /create /tn "WB-RefreshAll" /sc hourly /mo 12 ^
   /tr "\"D:\AI项目\wb_switcher\refresh_all.cmd\"" /f
 ```
 
-refresh 会**滚动 refreshToken**（每次续期后 RT 也复位为 7 天），所以每 ≤3 天跑一次可以一直
-不掉线。上级「自动签到」项目的 `config.json` 里 `wb_auth_dirs` 已加入本目录：
+`refresh_all.cmd` 支持 `/nopause`（计划任务是非交互环境，不加会让任务一直挂住），
+`install_refresh_task.ps1` 已自动带上。refresh 会把 refreshToken 重置为新的 60 天，
+所以按天/周级跑一次即可一直不掉线。上级「自动签到」项目的 `config.json` 里
+`wb_auth_dirs` 已加入本目录：
 
 ```json
 "wb_auth_dirs": ["D:\\AI项目\\自动签到\\wb_auth", "D:\\AI项目\\wb_switcher\\wb_auth"]
 ```
 
 `discover_accounts()` 按 uid 全局去重，两个目录放着相同账号也只处理一次，不会重复签到。
+**但不要把账号文件放回 `自动签到\wb_auth`**（见上面的「唯一账号库约定」）。
 
-前端账号卡上会显示签发通道标签：**长期 60 天**（`oneid_login`）或**短期 3 天**
+前端账号卡上会显示签发通道标签：**长期 55 天**（`oneid_login`）或**短期 30 天**
 （`enterprise_switch`，橙色告警）。
 
 ---
@@ -204,6 +265,17 @@ refresh 会**滚动 refreshToken**（每次续期后 RT 也复位为 7 天），
 产物在 `dist\WorkBuddySwitcher\`、`dist\TraeSwitcher\`。把账号目录（`wb_auth\`、`tw_auth\`）
 放到 exe 同级即可识别；未安装 `pywebview` 时会自动退回系统浏览器打开。
 
+打包要点（改 spec 前先看）：
+
+- **exe 自带解析/续期逻辑**。`switcher_common` 与 `workbuddy_checkin` / `trae_work_checkin`
+  都是运行时动态导入，静态分析扫不到，必须列进 `hiddenimports` —— 漏了不会构建失败，
+  而是**打包后双击一闪而过**（窗口版没有控制台，`require_module` 的 SystemExit 提示看不到）。
+  排查办法：在 cmd 里直接跑 exe，能看到 `找不到依赖模块 ...` 的字样。
+- `pathex` / `ICON` 已改成基于 `SPEC` 的相对定位，换机器或换盘符不必再改 spec。
+- 运行时若找得到 `..\自动签到\config.json` 就优先读它的 `endpoint` 等配置；找不到则用
+  内置默认值（`https://copilot.tencent.com`），不影响切号与续期。
+- **源码改动后必须重新打包**，`dist\` 不会自动跟随源码。
+
 ---
 
 ## 自检
@@ -212,13 +284,17 @@ refresh 会**滚动 refreshToken**（每次续期后 RT 也复位为 7 天），
 python smoke_test.py
 ```
 
-46 项断言，覆盖：
+64 项断言，覆盖：
 
-- 备份裁剪、文件锁（超时/串行）、端口避让
+- 备份裁剪、文件锁（超时/串行/**锁文件不随加锁次数增长**）、端口避让
+- 令牌注入健壮性（`<head>` 带属性时仍能注入）
+- **客户端中途断开后服务仍可用**、服务端使用 `QuietHTTPServer`
+- 积分明细（造假响应、**不联网**）：套餐 / 奖励两档归类、**下次刷新时间（周期结束 +1 秒）**、
+  最近到期时间、**已失效包被排除**、容量与用量合计、总剩余、单账号失败不污染整体
 - 两个切换器的接口行为：200 / 401 / 403 / 404 / 405 / 同源放行
 - 一次性令牌：首页注入、缺令牌 401、错令牌 401、正确令牌放行、读接口不受影响
 - 审计日志：记录切号、记录令牌失败、**不含凭据**
-- 令牌完整性校验（add 拒绝、列表标记、拒绝切换）、增删闭环
+- 令牌完整性校验（add 拒绝、列表标记、拒绝切换）、**拒绝路径穿越的 name**、增删闭环
 - 错误脱敏（500 响应不含用户目录）、依赖契约（缺模块/缺成员的可读报错）
 - 前端模板渲染（无残留占位符）、账号带 token_source 字段
 
@@ -233,6 +309,10 @@ python smoke_test.py
   禁止提交到 Git / 上传公网 / 转发他人。`wb_auth\`、`token_cache_workbuddy.json` 等
   均应在 `.gitignore` 中排除。
 - 本工具只在本机 `127.0.0.1` 提供服务，不要修改为对外监听。
+- **客户端中途断开属正常现象**：刷新页面、切换账号会取消尚未完成的请求（积分查询要打若干
+  外部接口，耗时可到秒级），服务端随后写响应会拿到 `WinError 10053`。控制台**不会**再刷
+  traceback —— 写响应做了连接异常兜底、路由层不再二次回写 500，服务端也用 `QuietHTTPServer`
+  静默这类错误（真实故障照常打印）。
 - 服务对 `Host` / `Origin` 做回环校验，且写操作仅接受 POST，可阻断外部网页的跨站调用；
   但这只是第二道防线，仍不要把端口暴露到局域网。
 - **一次性访问令牌**：服务启动时随机生成，只存在于本次进程内存，随首页注入给前端，

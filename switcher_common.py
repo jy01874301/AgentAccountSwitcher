@@ -189,15 +189,23 @@ def file_lock(key, lock_dir, timeout=15.0):
     d = Path(lock_dir)
     d.mkdir(parents=True, exist_ok=True)
     lp = d / ("%s.lock" % re.sub(r"[^0-9A-Za-z_.-]", "_", str(key)))
-    fh = open(lp, "a+")
+    # 先确保锁文件存在（"r+b" 不会创建）。不用 "a+b"：Windows 下追加模式打开的句柄
+    # 没有读权限，seek/read 会抛 PermissionError。
+    if not lp.exists():
+        lp.touch()
+    fh = open(lp, "r+b")
     locked = False
     deadline = time.time() + timeout
     try:
+        # 锁的是第 0 字节，文件必须至少有 1 字节才能上锁。此处只在文件为空时补一个字节，
+        # 之后不再写任何内容 —— 早期实现每次加锁都 append 一次 pid，锁文件会随调用次数
+        # 无限增长（每次 ~6 字节），而 pid 信息实际无人读取。
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"0")
+            fh.flush()
         while True:
             try:
-                fh.seek(0)
-                fh.write("%d\n" % os.getpid())
-                fh.flush()
                 fh.seek(0)
                 if os.name == "nt":
                     import msvcrt
@@ -265,6 +273,24 @@ def port_in_use(host="127.0.0.1", port=8765, timeout=0.25):
         return False
 
 
+class QuietHTTPServer(ThreadingHTTPServer):
+    """本地服务用的 HTTP 服务端：客户端中途断开不该在控制台刷 traceback。
+
+    浏览器刷新页面、切换账号会取消尚未完成的请求（积分查询要打若干外部接口，
+    耗时可到秒级），服务器随后写响应便会拿到 WinError 10053 ConnectionAborted。
+    这是正常现象，但 socketserver 默认把它当错误打到 stderr，看起来像程序出了问题。
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        import sys as _sys
+        exc = _sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, BrokenPipeError, TimeoutError)):
+            return
+        ThreadingHTTPServer.handle_error(self, request, client_address)
+
+
 def bind_server(handler_cls, port, host="127.0.0.1", tries=10):
     """绑定本地服务；端口被占用时自动顺延到下一个可用端口。
 
@@ -276,7 +302,7 @@ def bind_server(handler_cls, port, host="127.0.0.1", tries=10):
             last = OSError("端口 %d 已被占用" % p)
             continue
         try:
-            return ThreadingHTTPServer((host, p), handler_cls), p
+            return QuietHTTPServer((host, p), handler_cls), p
         except OSError as e:
             last = e
     raise OSError("端口 %s 起连续 %d 个端口都不可用：%s" % (port, tries, last))
@@ -301,12 +327,18 @@ class BaseHandler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, body, code=200, ctype="application/json; charset=utf-8"):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        """写响应。客户端提前断开（刷新页面、取消未完成的请求）是常态，不是故障：
+        此时再往上抛只会让 socketserver 打一堆 traceback，所以连接类异常一律静默收尾。
+        """
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionError, BrokenPipeError, TimeoutError):
+            self.close_connection = True
 
     def _send_json(self, payload, code=200):
         self._send(_json(payload)[1], code)
@@ -348,6 +380,9 @@ class BaseHandler(BaseHTTPRequestHandler):
                 return
             code, payload = self.api_get(u)
             self._send_json(payload, code)
+        except (ConnectionError, BrokenPipeError, TimeoutError):
+            # 客户端已断开：无处回送，直接收尾，别再去写 500（那会二次抛错）
+            self.close_connection = True
         except Exception as e:  # noqa: BLE001
             self._send_json(err_payload(e), 500)
 
@@ -368,6 +403,8 @@ class BaseHandler(BaseHTTPRequestHandler):
                       self.AUDIT_ACTIONS.get(u.path, u.path),
                       target, bool(payload.get("ok")), payload.get("message"))
             self._send_json(payload, code)
+        except (ConnectionError, BrokenPipeError, TimeoutError):
+            self.close_connection = True
         except Exception as e:  # noqa: BLE001
             self._send_json(err_payload(e), 500)
 
@@ -395,7 +432,21 @@ class BaseHandler(BaseHTTPRequestHandler):
             # 把一次性令牌注入页面：前端拿到后随写请求回传，
             # 进程外的脚本/程序拿不到（除非也去抓取首页并解析）
             inject = ('<script>window.SWITCHER_TOKEN="%s";</script>' % self.TOKEN).encode("utf-8")
-            head = body.find(b"<head>")
-            if head != -1:
-                body = body[:head + 6] + b"\n" + inject + body[head + 6:]
+            body = self._inject_head(body, inject)
         self._send(body, 200, "text/html; charset=utf-8")
+
+    @staticmethod
+    def _inject_head(body, inject):
+        r"""把脚本插到 <head> 之后。
+
+        早期实现按精确的 b"<head>" 定位，一旦模板改成 <head lang="zh"> 这类带属性的写法
+        就会静默失配 —— 页面照常打开，但前端拿不到令牌，所有写操作一律 401，且错误信息
+        完全指不到这里。因此用正则匹配带属性的 head，head 缺失时依次退回 <body> 与文件头。
+        """
+        m = re.search(rb"<head\b[^>]*>", body, re.IGNORECASE)
+        if m:
+            return body[:m.end()] + b"\n" + inject + body[m.end():]
+        m = re.search(rb"<body\b[^>]*>", body, re.IGNORECASE)
+        if m:
+            return body[:m.end()] + b"\n" + inject + body[m.end():]
+        return inject + b"\n" + body

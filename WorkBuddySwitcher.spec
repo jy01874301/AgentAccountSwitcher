@@ -3,22 +3,33 @@
 
 构建：
     pyinstaller WorkBuddySwitcher.spec --noconfirm
-产物在 dist\\WorkBuddySwitcher\\；把 wb_auth\\ 与 exe 放同级即可识别账号库。
+产物在 dist\\WorkBuddySwitcher\\；把账号目录 wb_auth\\ 与 exe 放同级即可识别账号库。
 
-注意：switcher_common 是在 wb_ui_server 里 sys.path.insert 之后动态导入的，
-静态分析扫不到，必须列进 hiddenimports，否则打包后启动即 ModuleNotFoundError。
+两个必须写进 hiddenimports 的模块（静态分析扫不到）：
+  - switcher_common：在 wb_ui_server 里 sys.path.insert 之后动态导入；
+  - workbuddy_checkin：由 common.require_module() 运行时导入，不捆绑则打包后
+    启动即抛 SystemExit（窗口版没有控制台，表现为双击后窗口一闪而过）。
+    捆绑后 exe 自带解析/续期逻辑，不再依赖同级 ../自动签到 项目。
+    若能找到 ../自动签到/config.json，运行时仍会优先读取它的 endpoint 等配置。
 """
 import os
 
-ICON = next((p for p in ['D:/AI项目/自动签到/app.ico', 'app.ico'] if os.path.isfile(p)), None)
+# SPEC 由 PyInstaller 注入；用相对定位替代原先写死的 D:/AI项目/... 绝对路径，
+# 换机器/换盘符后无需再改 spec。
+HERE = os.path.dirname(os.path.abspath(SPEC))
+PARENT = os.path.dirname(HERE)
+SIBLING = os.path.join(PARENT, "自动签到")
+
+ICON = next((p for p in [os.path.join(SIBLING, "app.ico"),
+                         os.path.join(HERE, "app.ico")] if os.path.isfile(p)), None)
 
 
 a = Analysis(
     ['wb_ui_app.py'],
-    pathex=['D:/AI项目/自动签到', 'D:/AI项目/wb_switcher'],
+    pathex=[SIBLING, HERE],
     binaries=[],
     datas=[('ui_template.html', '.'), ('README.md', '.'), ('check_ttl.py', '.')],
-    hiddenimports=['webview', 'switcher_common'],
+    hiddenimports=['webview', 'switcher_common', 'workbuddy_checkin'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

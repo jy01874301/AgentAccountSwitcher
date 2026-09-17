@@ -463,9 +463,12 @@ def refresh_account_file(file_name):
     acc = tw.account_from_storage(target)
     cfg = tw.load_config(Path(target.parent.parent) / "config.json") \
         if (Path(target.parent.parent) / "config.json").is_file() else tw.load_config(PROJECT_ROOT / "config.json")
+    # script_dir 必须用 PROJECT_ROOT（自动签到）：trae_work_checkin 会把轮换后的
+    # refreshToken 写进 script_dir/token_cache.json，此前传素材目录的父级（wb_switcher）
+    # 等于另起一份缓存，与签到脚本各持一代 refreshToken —— 一方轮换后另一方的旧凭据即失效。
     with common.file_lock("tw-auth-" + base, LOCK_DIR):
         try:
-            ok, msg, kind = tw.refresh_account(acc, target.parent.parent, cfg, _NULLLOG)
+            ok, msg, kind = tw.refresh_account(acc, PROJECT_ROOT, cfg, _NULLLOG)
         except Exception as e:
             return False, "续期异常：%s" % e
     return ok, msg
@@ -506,6 +509,7 @@ class Handler(common.BaseHandler):
         "ADD_HINT": "点击展开，选择该账号的 storage.json 登录态",
         "EMPTY_HINT": "请放入该账号的 <code>storage.json</code>。",
         "CMD": "trae_switcher.cmd",
+        "CREDITS": "",             # Trae 侧无 /api/credits，置空隐藏积分明细
     }
     WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add")
     SOURCE = "tw"

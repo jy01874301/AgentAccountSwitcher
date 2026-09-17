@@ -62,7 +62,9 @@
   .section-title h2 { font-size:16px; font-weight:600; }
   .section-title .hint { margin-left:auto; color:var(--dim); font-size:13px; }
 
-  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(270px,1fr)); gap:14px; }
+  /* 最小 300px（原 270）：920px 内容宽下排成 2 列而非 3 列，卡片内容宽约 421px，
+     积分明细那一行（时间 + 已使用量，约 340px）才放得下、不会被挤到折行 */
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; }
   .acct {
     background:var(--card);
     border:1px solid var(--border);
@@ -151,6 +153,27 @@
   .tip { background:rgba(79,140,255,.08); border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:10px; padding:12px 16px; font-size:12.5px; color:var(--dim); line-height:1.7; margin-bottom:16px; }
   .tip b { color:var(--accent); }
   .tip code { background:var(--card-2); padding:1px 6px; border-radius:5px; font-size:12px; }
+
+  .mini-btn { background:transparent; border:1px solid var(--border); color:var(--dim); border-radius:9px; padding:6px 11px; font-size:12.5px; cursor:pointer; flex-shrink:0; }
+  .mini-btn:hover { border-color:var(--accent); color:var(--text); }
+  .mini-btn:disabled { opacity:.5; cursor:not-allowed; }
+
+  .credits { border-top:1px solid var(--border); padding-top:10px; display:flex; flex-direction:column; gap:9px; }
+  .credits-total { font-size:12.5px; color:var(--dim); }
+  .credits-total b { color:var(--text); font-size:16px; font-weight:700; }
+  .credits-title { font-size:12px; color:var(--dim); letter-spacing:.3px; }
+  .credits-msg { font-size:12px; color:var(--dim); line-height:1.5; }
+  .credits-msg.err { color:var(--amber); }
+  .ci { display:flex; flex-direction:column; gap:5px; }
+  /* 时间与已使用量同一行、两端对齐。两块都 nowrap：实在放不下时整块换到下一行，
+     绝不会出现"一侧折行、另一侧单行"那种基线错位 */
+  .ci-info { display:flex; justify-content:space-between; align-items:baseline; gap:8px; flex-wrap:wrap; }
+  .ci-info > span { white-space:nowrap; }
+  .ci-name { font-size:13px; font-weight:600; color:var(--text); white-space:nowrap; }
+  .ci-used { font-size:12px; color:var(--text); }
+  .ci-when { font-size:12px; color:var(--dim); }
+  .ci-bar { height:5px; border-radius:3px; background:var(--card-2); overflow:hidden; margin-top:1px; }
+  .ci-bar i { display:block; height:100%; border-radius:3px; background:#2bbfa8; }
 </style>
 </head>
 <body>
@@ -181,6 +204,8 @@
     <div class="bar"></div>
     <h2>可用账号（来自 {{AUTH_DIR}}\）</h2>
     <span class="hint" id="acctCount"></span>
+    <button class="mini-btn" id="credBtn" style="margin-left:12px;display:none"
+            onclick="loadCredits(true)">&#8635; 刷新积分</button>
   </div>
 
   <div class="add-card">
@@ -220,8 +245,8 @@
 </div>
 
 <script>
-const UI = { authDir: "{{AUTH_DIR}}", cmd: "{{CMD}}" };
-const API = { accounts:'/api/accounts', current:'/api/current', switch:'/api/switch', add:'/api/add', remove:'/api/remove', refresh:'/api/refresh' };
+const UI = { authDir: "{{AUTH_DIR}}", cmd: "{{CMD}}", credits: "{{CREDITS}}" };
+const API = { accounts:'/api/accounts', current:'/api/current', switch:'/api/switch', add:'/api/add', remove:'/api/remove', refresh:'/api/refresh', credits:'/api/credits' };
 
 async function req(path){
   const r = await fetch(path);
@@ -266,7 +291,11 @@ function ttlTag(a){
   const src=a.token_source||'';
   if(!src) return '';
   const short = src!=='oneid_login';
-  const text = short ? '短期 '+(a.expires_in_days?a.expires_in_days+'天':'通道') : '长期 60天';
+  // 后端并不返回 expires_in_days，直接用它会恒为 undefined（短期标签永远显示"通道"），
+  // 因此改由 expires_at 现算剩余天数
+  const rd=remainDays(a.expires_at);
+  const days=(rd!=null&&rd>=0)?Math.round(rd):(a.expires_in_days||0);
+  const text = short ? '短期 '+(days?days+'天':'通道') : '长期 60天';
   return `<span class="tag-ttl${short?' short':''}" title="签发通道 token_source=${esc(src)}">${esc(text)}</span>`;
 }
 
@@ -275,6 +304,61 @@ function isCurrentActive(a, cur){
   const c=cur[0];
   if(!c || c.ok===false) return false;
   return !!a.ok && !!a.nickname && !!c.nickname && a.nickname===c.nickname;
+}
+
+// 积分明细（仅 WorkBuddy 侧有该接口；Trae 侧 UI.credits 为空，整块跳过）
+let creditsMap={}, creditsTs='';
+function fmtNum(v){
+  const n=Number(v);
+  if(!isFinite(n)) return '0';
+  return n.toLocaleString('zh-CN',{maximumFractionDigits:2});
+}
+function creditsBlock(file){
+  if(UI.credits!=='1') return '';
+  const c=creditsMap[file];
+  if(!c) return '<div class="credits"><div class="credits-msg">积分读取中…</div></div>';
+  if(!c.ok){
+    return '<div class="credits"><div class="credits-title">积分明细</div>'
+      +'<div class="credits-msg err">'+esc(c.reason||'积分查询失败')+'</div></div>';
+  }
+  let h='<div class="credits"><div class="credits-total">总剩余积分 <b>'
+    +fmtNum(c.total_remain)+'</b></div>';
+  const items=c.items||[];
+  if(!items.length){
+    return h+'<div class="credits-msg">暂无可用积分包</div></div>';
+  }
+  h+='<div class="credits-title">积分明细</div>';
+  items.forEach(function(it){
+    const pct=Math.max(0,Math.min(100,Number(it.used_percent)||0));
+    // 时间在左、已使用量在右，同一行；两块都 nowrap，极窄卡片下整块换行也不会错位
+    h+='<div class="ci">'
+      +'<div class="ci-name">'+esc(it.label)+'</div>'
+      +'<div class="ci-info">'
+      +'<span class="ci-when">'+esc(it.time_label)+' '+esc(it.time||'-')+'</span>'
+      +'<span class="ci-used">已使用 '+fmtNum(it.used)+'/'+fmtNum(it.total)
+      +' 剩余'+esc(it.remain_percent)+'%</span></div>'
+      +'<div class="ci-bar"><i style="width:'+pct+'%"></i></div>'
+      +'</div>';
+  });
+  return h+'</div>';
+}
+async function loadCredits(force){
+  if(UI.credits!=='1') return;
+  const btn=document.getElementById('credBtn');
+  if(btn){ btn.style.display='inline-flex'; btn.disabled=true; btn.textContent='查询中…'; }
+  try{
+    const d=await req(API.credits+(force?'?force=1':''));
+    const map={};
+    (d.accounts||[]).forEach(function(a){ map[a.file]=a; });
+    creditsMap=map;
+    creditsTs=d.ts||'';
+    if(btn) btn.textContent=d.cached?'↻ 刷新积分':'↻ 刷新积分';
+  }catch(err){
+    if(btn) btn.textContent='积分查询失败，点击重试';
+  }finally{
+    if(btn) btn.disabled=false;
+    if(lastList.length) renderAccounts(lastList, lastCurrent);
+  }
 }
 
 let lastCurrent=null;
@@ -315,9 +399,12 @@ function renderCurrent(cur){
   } else el.textContent='登录态有效期未知';
   document.getElementById('curBadge').style.display='inline-block';
 }
+let lastList=[];
 function renderAccounts(list, cur){
+  lastList=list||[];
   const grid=document.getElementById('acctGrid');
-  document.getElementById('acctCount').textContent=list.length+' 个';
+  document.getElementById('acctCount').textContent=list.length+' 个'
+    + (creditsTs?(' · 积分更新于 '+creditsTs):'');
   if(list.length===0){
     grid.innerHTML='<div class="empty">'+UI.authDir+'\\ 目录下没有账号文件。{{EMPTY_HINT}}</div>';
     return;
@@ -342,6 +429,7 @@ function renderAccounts(list, cur){
         ? `<div class="exp${expCls}">登录态 ${rd!=null?(rd>=0?'剩余 <b>'+rd.toFixed(1)+'</b> 天':'<b>已过期</b>'):'有效期未知'} · ${fmtDate(a.expires_at)}</div>`
         : `<div class="reason">${esc(a.reason||'不可用')}</div>`
       }
+      ${creditsBlock(a.file)}
       <div class="btn-row">
         <button class="btn ${isActive?'active':''}" data-file="${esc(a.file)}" data-nick="${esc(a.nickname)}" ${isActive?'disabled':''} ${a.ok?'':'disabled'}>
           ${isActive?'当前账号':'切换到该账号'}
@@ -470,6 +558,7 @@ async function settleAfterSwitch(nick, tries=6, gap=500){
 }
 
 load();
+loadCredits();
 </script>
 </body>
 </html>

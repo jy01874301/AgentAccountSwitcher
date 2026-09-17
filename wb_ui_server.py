@@ -22,6 +22,8 @@ import os
 import re
 import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # 复用现有脚本的解析/常量
@@ -145,6 +147,28 @@ def current_account():
     return entries
 
 
+def _restore_backup(backup):
+    """写入失败时把已轮换出去的备份改回正式文件名，避免桌面端陷入"无登录态"。
+
+    switch_account 的顺序是「旧文件改名 → 写新文件」，中间那一步失败的话
+    workbuddy-desktop.info 就不存在了，客户端会认为没有登录态。备份本身是有效
+    登录态，改回来即可恢复原状。
+
+    返回追加给用户看的说明（成功 / 失败都给出可执行的下一步），无备份可恢复时返回空串。
+    """
+    if not backup:
+        return ""
+    src = Path(backup)
+    if not src.exists():
+        return ""
+    try:
+        src.replace(DESKTOP_INFO)
+        return "；已回滚为原登录态"
+    except OSError:
+        return ("；回滚也失败，原登录态仍在备份 %s，可手工改名回 workbuddy-desktop.info"
+                % src.name)
+
+
 def switch_account(target_name):
     """把 wb_auth\\<target_name>.info 切换为桌面端正式登录态。
 
@@ -155,11 +179,17 @@ def switch_account(target_name):
     - 清理 workbuddy-desktop.info.logged-out 登出标记（若有）。
     返回 (ok, message)。
     """
-    src = AUTH_DIR / target_name
+    # 只接受文件名，与 remove/refresh 保持一致。此前直接拼 AUTH_DIR / target_name，
+    # 传 "../xxx.info" 会解析到账号库之外的文件（实测可命中 ..\..\自动签到\wb_auth\*.info），
+    # 等于允许把任意路径的 .info 写进桌面端登录态。
+    norm = (target_name or "").replace("\\", "/")
+    if not norm or os.path.basename(norm) != norm:
+        return False, "非法的账号文件名：%s" % (target_name or "")
+    if not norm.endswith(".info"):
+        return False, "仅支持 .info 格式的账号文件"
+    src = AUTH_DIR / norm
     if not src.is_file():
         return False, "目标账号文件不存在：%s" % target_name
-    if not src.name.endswith(".info"):
-        return False, "仅支持 .info 格式的账号文件"
 
     # 「备份 + 写入 + 清标记」必须串行，否则与续期/另一次切号交叉会写坏登录态
     with common.file_lock("wb-desktop", LOCK_DIR):
@@ -179,7 +209,8 @@ def switch_account(target_name):
         pid = os.getpid()
         marker = "%d" % now.microsecond
 
-        # 1. 现有正式文件轮换为备份
+        # 1. 现有正式文件轮换为备份（写入失败时用它回滚）
+        backup = None
         if DESKTOP_INFO.exists():
             backup = DESKTOP_DIR / ("workbuddy-desktop.%s.%d.%s.info" % (ts, pid, marker))
             try:
@@ -192,13 +223,18 @@ def switch_account(target_name):
         else:
             pruned = 0
 
-        # 2. 写入目标账号
+        # 2. 写入目标账号。这一步失败必须回滚：否则正式文件已被改名走，
+        #    桌面端会处于"没有登录态"的状态（此前只报失败、不回滚）。
         tmp = DESKTOP_INFO.with_suffix(".info.tmp")
         try:
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             tmp.replace(DESKTOP_INFO)
         except OSError as e:
-            return False, "写入新登录态失败：%s" % e
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return False, "写入新登录态失败：%s%s" % (e, _restore_backup(backup))
 
         # 3. 清理登出标记
         marker_path = DESKTOP_DIR / ("workbuddy-desktop.info" + LOGOUT_SUFFIX)
@@ -207,6 +243,18 @@ def switch_account(target_name):
                 marker_path.unlink()
             except OSError:
                 pass
+
+        # 4. 写后自校验（与 Trae 切换器一致）：确认桌面端文件里确实是目标账号。
+        #    客户端 watcher 未采纳或被其它进程覆盖时立刻暴露，而不是报成功却没生效。
+        after = _read_info(DESKTOP_INFO)
+        acc_after = wb.session_from_info_file(DESKTOP_INFO) if after is not None else None
+        if not acc_after or acc_after["uid"] != acc["uid"]:
+            raw_acct = (after or {}).get("account")
+            cur_nick = (raw_acct or {}).get("nickname") if isinstance(raw_acct, dict) else None
+            if acc_after:
+                cur_nick = acc_after["nickname"]
+            return False, ("写入后校验未通过：桌面端当前登录态仍为「%s」，切换可能未生效。"
+                           "请确认 WorkBuddy 客户端未占用该文件后重试" % (cur_nick or "未知"))
 
     msg = "已切换为 %s（%s），桌面端将自动采纳新会话" % (acc["nickname"], target_name)
     if pruned:
@@ -392,6 +440,215 @@ def refresh_all():
     return 0 if ok_n == len(results) else 1
 
 
+# ---------------------------------------------------------------------------
+# 积分明细（只读：查资源包，不消耗任何积分）
+# ---------------------------------------------------------------------------
+# 积分来自计费网关的资源包接口（客户端「积分明细」用同一份数据）：
+#   POST {endpoint}/v2/billing/meter/get-user-resource   ← 有 PackageName 与周期
+#   POST {endpoint}/billing/meter/get-user-resource-summary  ← 只有容量，无名称/周期
+# 按资源包性质归两类，与客户端展示一致：
+#   套餐基础积分：PackageName 如「CodeBuddy个人体验版」，周期按月滚动 → 下次刷新时间 = 周期结束 +1 秒
+#   平台奖励积分：PackageName 如「CodeBuddy个人版国内运营裂变包」（赠送包），一包一到期 → 取最近到期
+CREDITS_PATH = "/v2/billing/meter/get-user-resource"
+CREDITS_TTL = 600.0       # 缓存秒数：查一次要按账号数发请求，不能每次刷新都回源
+# 计费网关强制校验 User-Agent，缺省 urllib UA 会被 10085 拒绝（签到接口无此要求）
+BILLING_UA = "Mozilla/5.0 WorkBuddy/5.5.6"
+# 资源包名里出现这些词即视为「平台奖励积分」，其余归「套餐基础积分」
+_BONUS_HINTS = ("赠送", "裂变", "奖励", "bonus", "gift")
+
+_CREDITS_LOCK = threading.Lock()
+_CREDITS_CACHE = {"ts": 0.0, "payload": None}
+
+
+def _as_int(val):
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _num(val):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_dt(text):
+    """解析 "2026-09-30 23:59:59" 这类本地时间字符串（网关不带时区标记）。"""
+    s = str(text or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", ""))
+    except ValueError:
+        return None
+
+
+def _billing_post(url, headers, timeout=20, retries=2):
+    """调用计费网关并解析 JSON，返回 (http_status, dict)。
+
+    不能用 workbuddy_checkin.post_json：它会把 User-Agent 强制改写成脚本自己的
+    UA，而计费接口要求 UA 为 BILLING_UA，否则国内网关直接 403 / 业务码 10085。
+    """
+    import urllib.error
+    import urllib.request
+    last = ""
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, data=b"{}", method="POST")
+            for k, v in (headers or {}).items():
+                req.add_header(k, v)
+            req.add_header("User-Agent", BILLING_UA)
+            req.add_header("Accept-Language", "zh-CN")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")[:200]
+            if e.code >= 500 and attempt < retries:
+                last = "HTTP %d: %s" % (e.code, body)
+                time.sleep(1.5 * attempt)
+                continue
+            return e.code, {"_error": body}
+        except Exception as e:  # noqa: BLE001
+            last = repr(e)
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+                continue
+    return 0, {"_error": "网络请求失败：%s" % last}
+
+
+def query_credits(acc, cfg):
+    """查单个账号的积分明细。返回 dict，失败时 ok=False 并带 reason（不影响其它账号）。
+
+    返回形如：
+        {ok, total_remain, unit, items:[{key,label,time_label,total,used,remain,
+                                         used_percent,remain_percent,time,packages}]}
+    """
+    if not hasattr(wb, "build_headers"):
+        return {"ok": False, "reason": "上级模块缺少 build_headers，无法查询积分"}
+    headers = wb.build_headers(acc)
+    headers["Content-Type"] = "application/json"
+    code, body = _billing_post(cfg["endpoint"] + CREDITS_PATH, headers)
+    if code != 200:
+        return {"ok": False, "reason": "积分接口 HTTP %s" % code}
+    if not isinstance(body, dict) or body.get("code") not in (None, 0):
+        return {"ok": False, "reason": "积分接口业务错误（code=%s）"
+                % (body or {}).get("code")}
+    accounts = ((((body.get("data") or {}).get("Response") or {}).get("Data") or {})
+                .get("Accounts"))
+    if accounts is None:
+        accounts = []          # 账号名下还没有任何资源包（TotalCount=0），并非错误
+    if not isinstance(accounts, list):
+        return {"ok": False, "reason": "积分接口结构异常"}
+
+    groups = {}
+    for a in accounts:
+        if not isinstance(a, dict):
+            continue
+        # Status != 0 是已失效的资源包（ExpiredTime 有值，实测如 2026-08-18 批次的裂变包）。
+        # 不过滤会污染「最近到期时间」，与签到活动残留 end_time 是同一类坑。
+        if _as_int(a.get("Status")) != 0:
+            continue
+        text = "%s %s" % (a.get("PackageName") or "", a.get("SubProductName") or "")
+        key = "bonus" if any(h.lower() in text.lower() for h in _BONUS_HINTS) else "plan"
+        # 用 Precise 字段：实测 258.45999959 这种小数只在 Precise 里保留
+        size = _num(a.get("CycleCapacitySizePrecise") or a.get("CycleCapacitySize"))
+        used = _num(a.get("CycleCapacityUsedPrecise") or a.get("CycleCapacityUsed"))
+        remain = _num(a.get("CycleCapacityRemainPrecise") or a.get("CycleCapacityRemain"))
+        end = _parse_dt(a.get("CycleEndTime"))
+        g = groups.setdefault(key, {"size": 0.0, "used": 0.0, "remain": 0.0,
+                                    "end": None, "n": 0})
+        g["size"] += size
+        g["used"] += used
+        g["remain"] += remain
+        g["n"] += 1
+        if end and (g["end"] is None or end < g["end"]):
+            g["end"] = end
+
+    items = []
+    for key, label, time_label in (("plan", "套餐基础积分", "下次刷新时间"),
+                                   ("bonus", "平台奖励积分", "最近到期时间")):
+        g = groups.get(key)
+        if not g or g["size"] <= 0:
+            continue
+        # 套餐按周期滚动：界面上写的是"下一次刷新"的时刻，即本周期结束 +1 秒；
+        # 奖励包不可刷新，直接用它最近一次的到期时间
+        when = (g["end"] + datetime.timedelta(seconds=1) if key == "plan" and g["end"]
+                else g["end"])
+        items.append({
+            "key": key,
+            "label": label,
+            "time_label": time_label,
+            "total": round(g["size"], 2),
+            "used": round(g["used"], 2),
+            "remain": round(g["remain"], 2),
+            "used_percent": round(g["used"] / g["size"] * 100) if g["size"] else 0,
+            "remain_percent": round(g["remain"] / g["size"] * 100) if g["size"] else 0,
+            "time": when.strftime("%Y/%m/%d %H:%M:%S") if when else "",
+            "packages": g["n"],
+        })
+    return {"ok": True, "unit": "credits", "items": items,
+            "total_remain": round(sum(i["remain"] for i in items), 2)}
+
+
+def credits_snapshot(force=False):
+    """汇总 wb_auth 全部账号的积分明细（总剩余 + 套餐基础 / 平台奖励）。
+
+    结果在进程内缓存 CREDITS_TTL 秒（前端每次刷新页面都会拉一次，不缓存等于放大
+    N 倍请求）。force=True 强制回源（标题栏的「刷新积分」）。
+    """
+    now = time.time()
+    with _CREDITS_LOCK:
+        cached = _CREDITS_CACHE["payload"]
+        if not force and cached and now - _CREDITS_CACHE["ts"] < CREDITS_TTL:
+            return dict(cached, cached=True)
+
+    cfg = wb.load_config(SCRIPT_DIR / "config.json")
+    accounts = list_accounts()
+
+    def _one(a):
+        entry = {"file": a["file"], "nickname": a.get("nickname") or a["file"], "ok": False}
+        if not a.get("ok"):
+            entry["reason"] = a.get("reason") or "账号不可用"
+            return entry
+        acc = wb.session_from_info_file(AUTH_DIR / a["file"])
+        if not acc:
+            entry["reason"] = "登录态无法解析"
+            return entry
+        try:
+            entry.update(query_credits(acc, cfg))
+        except Exception as e:  # noqa: BLE001  单个账号失败不能拖垮整张表
+            entry["reason"] = "积分查询异常：%s" % common.scrub(e, 80)
+        return entry
+
+    # 并发查询：每账号一次外部请求，串行累加会让页面等好几秒，等待期间用户一刷新
+    # 就取消请求（服务端表现为连接中止）。并发后总耗时约等于最慢的单个账号。
+    workers = min(6, max(1, len(accounts)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        items = list(pool.map(_one, accounts))
+
+    ok_items = [i for i in items if i.get("ok")]
+    payload = {
+        "ok": True,
+        "total_remain": round(sum(_num(i.get("total_remain")) for i in ok_items), 2),
+        "accounts": items,
+        "queried": len(ok_items),
+        "total": len(items),
+        "ts": datetime.datetime.now().strftime("%H:%M:%S"),
+        "cached": False,
+    }
+    with _CREDITS_LOCK:
+        _CREDITS_CACHE["ts"] = time.time()
+        _CREDITS_CACHE["payload"] = payload
+    return payload
+
+
 class Handler(common.BaseHandler):
     """WorkBuddy 切换器的路由；HTTP 骨架与跨站校验见 switcher_common.BaseHandler。"""
 
@@ -410,6 +667,7 @@ class Handler(common.BaseHandler):
         "ADD_HINT": "点击展开，选择或粘贴该账号的 .info 登录态",
         "EMPTY_HINT": "请把 WorkBuddy 账号登录态文件（<code>workbuddy-*.info</code>）放进去。",
         "CMD": "workbuddy_switcher.cmd",
+        "CREDITS": "1",            # 账号卡上展示积分明细（Trae 侧无该接口，置空即隐藏）
     }
     WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add")
     SOURCE = "wb"
@@ -422,6 +680,9 @@ class Handler(common.BaseHandler):
             return 200, {"ok": True, "accounts": list_accounts()}
         if u.path == "/api/current":
             return 200, {"ok": True, "current": current_account()}
+        if u.path == "/api/credits":
+            # ?force=1 强制回源，否则走 CREDITS_TTL 秒的进程内缓存
+            return 200, credits_snapshot(force="force=1" in (u.query or ""))
         return 404, {"ok": False, "message": "404"}
 
     def api_post(self, u, p):

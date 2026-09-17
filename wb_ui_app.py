@@ -8,6 +8,9 @@
 
 打包态注意：PyInstaller 会把 __file__ 指向临时解包目录（_MEIPASS），因此这里在导入
 wb_ui_server 后显式把数据目录纠正为 exe 所在目录。
+
+界面上的「积分明细」由后端 wb_ui_server 的 /api/credits 提供（只读查询计费网关的资源包，
+不消耗积分，结果在进程内缓存 10 分钟），本文件只负责把窗口调到能容下它。
 """
 import sys
 import threading
@@ -79,8 +82,8 @@ def main():
             "WorkBuddy 账号切换器",
             url,
             width=1120,
-            height=780,
-            min_size=(900, 600),
+            height=920,          # 顶部多了一块「积分概览」，比原先的 780 高
+            min_size=(900, 720),
         )
         webview.start()
     except Exception as e:  # noqa: BLE001  # 无 WebView 运行库时退回默认浏览器

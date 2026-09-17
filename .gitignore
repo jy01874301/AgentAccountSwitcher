@@ -27,6 +27,8 @@ output/
 
 # 临时 / 调试残留
 .trash*/
+_pscheck.txt
+_taskcheck.txt
 _imp_err.txt
 _ref_err.txt
 _probe_result.txt
@@ -35,6 +37,10 @@ _probe_write.py
 
 # 其它
 .trae-html-share-packages/
+
+# 工具/助手的工作状态（本地记忆、缓存，不入库；注意：不要删除这两个目录本身）
+.workbuddy/
+.workbuddy-ai/
 
 # 日志
 logs/

@@ -2,10 +2,13 @@
 # -*- coding: utf-8 -*-
 """check_ttl.py —— WorkBuddy 登录态有效期体检（只读，不联网、不写文件）。
 
-服务端按登录通道（JWT 里的 token_source）签发不同有效期：
-    oneid_login        60 天 access / 90 天 refresh   ← 常规 OneID 登录
-    enterprise_switch   3 天 access /  7 天 refresh   ← 客户端切到企业空间的会话
+服务端按登录通道（JWT 里的 token_source）签发不同有效期。2026-09-17 实测
+（取自续期响应 data.expiresIn，与 JWT 的 exp 一致）：
+    oneid_login        55 天 access / 60 天 refresh   ← 常规 OneID 登录
+    enterprise_switch  30 天 access / 60 天 refresh   ← 客户端切到企业空间的会话
+    （无该字段，早期令牌）55 天 / 60 天
 续期只是沿用同一 token_source，所以短期会话续多少次都是短期。
+TTL 由服务端下发、可能随时调整，本脚本始终以文件里的实际时间戳为准。
 
 用法：
     python check_ttl.py                    # 扫描本目录 wb_auth 与 ../自动签到/wb_auth
@@ -19,11 +22,12 @@ from pathlib import Path
 
 # 已知通道 → 说明
 SOURCE_HINT = {
-    "oneid_login": "长期（常规 OneID 登录）",
-    "enterprise_switch": "短期（企业空间会话，需重新常规登录才能转长期）",
+    "oneid_login": "长期（常规 OneID 登录，access 约 55 天）",
+    "enterprise_switch": "短期（企业空间会话，access 约 30 天，需重新常规登录才能转长期）",
 }
 
 MIN_TOKEN_LEN = 200  # 正常 JWT 远大于此；小于则视为内容被截断
+LONG_REMAIN_DAYS = 40  # 无 token_source 时按剩余天数粗判：≥40 天视为长期通道
 
 
 def jwt_payload(token):
@@ -102,17 +106,17 @@ def main():
             flag = SOURCE_HINT["oneid_login"]
         elif r["source"] in SOURCE_HINT:
             flag = "短期通道：%s" % SOURCE_HINT[r["source"]]
-        elif (r["remain"] or 0) >= 30:
-            flag = "长期（旧版令牌，无 token_source 字段，按 60 天判定）"
+        elif (r["remain"] or 0) >= LONG_REMAIN_DAYS:
+            flag = "长期（旧版令牌，无 token_source 字段，按剩余天数判定）"
         else:
-            flag = "短期（通道未知，剩余不足 30 天）"
+            flag = "短期（通道未知，剩余不足 %d 天）" % LONG_REMAIN_DAYS
         print("  %-32s %-12s %-18s %6.1f %6.1f  %s"
               % (r["file"], r["nickname"][:12], r["source"],
                  r["remain"] if r["remain"] is not None else -1,
                  r["rremain"] if r["rremain"] is not None else -1,
                  flag))
-    print("\n说明：短期通道续期后仍是短期；要转 60 天需退出企业空间后用手机号验证码重新登录，"
-          "再整份复制 workbuddy-desktop.info 覆盖素材。")
+    print("\n说明：短期通道续期后仍是短期；要转长期（access 约 55 天）需退出企业空间后"
+          "用手机号验证码重新登录，再整份复制 workbuddy-desktop.info 覆盖素材。")
     return 0
 
 

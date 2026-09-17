@@ -19,6 +19,5 @@ python tw_ui_server.py --refresh-all
 set RC=%ERRORLEVEL%
 echo.
 if "%RC%"=="0" (echo All accounts refreshed.) else (echo Some accounts failed, see above.)
-echo.
-pause
+if /i not "%1"=="/nopause" pause
 exit /b %RC%
