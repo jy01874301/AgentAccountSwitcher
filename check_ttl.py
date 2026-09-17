@@ -23,7 +23,7 @@ from pathlib import Path
 # 已知通道 → 说明
 SOURCE_HINT = {
     "oneid_login": "长期（常规 OneID 登录，access 约 55 天）",
-    "enterprise_switch": "短期（企业空间会话，access 约 30 天，需重新常规登录才能转长期）",
+    "enterprise_switch": "短期（走「切换/绑定」换来的会话，access 约 30 天；重登也改不回来）",
 }
 
 MIN_TOKEN_LEN = 200  # 正常 JWT 远大于此；小于则视为内容被截断
@@ -115,8 +115,9 @@ def main():
                  r["remain"] if r["remain"] is not None else -1,
                  r["rremain"] if r["rremain"] is not None else -1,
                  flag))
-    print("\n说明：短期通道续期后仍是短期；要转长期（access 约 55 天）需退出企业空间后"
-          "用手机号验证码重新登录，再整份复制 workbuddy-desktop.info 覆盖素材。")
+    print("\n说明：续期只沿用同一通道，短期续多少次还是短期。现在的登录流程固定会走一次"
+          "\n      「切换/绑定」，新登账号一律是 enterprise_switch（30 天），退出重登也改不了"
+          "\n      （已实测）。所以关键是让自动续期跑起来：python wb_ui_server.py --refresh-all")
     return 0
 
 

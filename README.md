@@ -189,20 +189,84 @@ python wb_ui_server.py --prune [N]      # 清理桌面端切号备份，只留�
 
 | `token_source` | access | refresh | 产生方式 |
 |---|---|---|---|
-| `oneid_login` | 55 天（`expiresIn=4752000`） | 60 天 | 常规 OneID 手机号登录 |
-| `enterprise_switch` | 30 天（`expiresIn=2592000`） | 60 天 | 客户端切到企业空间的会话 |
+| `oneid_login` | 55 天（`expiresIn=4752000`） | 60 天 | **登录流程**直接签发的会话 |
+| `enterprise_switch` | 30 天（`expiresIn=2592000`） | 60 天 | **"切换/绑定账号"换来的会话** |
 | （无该字段，早期令牌） | 55 天 | 60 天 | 早期签发 |
 
 > 早期文档写的「`oneid_login` 60/90、`enterprise_switch` 3/7」已与现状不符：现在
 > 企业空间通道是 **30 天**（不是 3 天），两条通道的 refresh 都是 **60 天**。
 > TTL 由服务端下发、可能随时调整，**以 `check_ttl.py` 的实时输出为准**。
 
+### 为什么"同样用手机号验证码登录"，通道却不同
+
+**`token_source` 记录的是"这份会话由哪个接口签发"，不是"账号是什么身份"。**
+个人账号同样会被标成 `enterprise_switch` —— 实测用三个账号的 accessToken 调
+`GET https://copilot.tencent.com/console/account`，`type` 全是 `personal`，
+`isCurrentOneIdEnterprise` / `isCurrentOneIdPersonal` 全为 `false`，`sso.domain`、`idp` 全空。
+
+从桌面客户端 `app.asar` 的 `AuthenticationManager.switchAccount()` 可以直接读到两条路径：
+
+```js
+// 普通登录：POST /v2/plugin/auth/token      → 服务端标 token_source = oneid_login
+// 切换账号：AuthenticationManager.switchAccount(account) → provider.switchAccount()
+async switchAccount(account, authSession, ctx) {
+    const { type, enterpriseId } = account;
+    const path = type === Edition.Personal
+        ? `/v2${this.prefixPath}/login/enterprise`            // ← 个人账号也走这条
+        : `/v2${this.prefixPath}/login/enterprise/${enterpriseId}`;
+    const { data: { data: newAuthToken } } = await this.restOperations.post(path, {}, {
+        headers: {
+            ...this.enterpriseHeaders(currentSession.auth),
+            "X-Refresh-Token": currentSession.auth.refreshToken,
+            Authorization: `Bearer ${currentSession.auth.accessToken}`,
+            // 仅企业账号才补 X-Enterprise-Id / X-Tenant-Id
+        }
+    });
+}
+```
+
+网页登录页侧有对称的一步。`download.codebuddy.cn/web/login/.../index-*.js` 里，
+登录成功后的 `chooseAccount()` **无条件**执行：
+
+```js
+const l = g.startSpan("web.login.choose_account", {account_type: o.type, enterprise_id: o.enterpriseId || "", platform: a});
+try {
+    if (Le) { if (!(await Cs(o.enterpriseId))?.switched) throw new Error("switch enterprise account failed") }
+    else { const d = await Qe(); await Rs({enterpriseId: o.enterpriseId, state: h, domain: s, webtoken: d, ...}) }
+    ...
+    try { await kn(o.enterpriseId) } catch (d) { console.warn("[newLogin.chooseAccount] switchCurrentAccount failed", d) }
+    ...
+    await wt(o);   // bridge：把 token 交回客户端
+}
+```
+
+`kn(r)` = `POST /console/account/switch`，`body = r ? {target_enterprise_id: r} : {}`。
+**个人账号 `enterpriseId` 为空 → 传空 body，照样调。** 没有任何按账号类型跳过的分支。
+
+### ⚠️ 所以：退出重登改不了（已实测确认）
+
+**现在的登录流程固定会走一次"切换/绑定"，客户端最终拿到的就是 `enterprise_switch` 会话。**
+用户实测：退出登录 → 手机号验证码重新登录 → 仍然是 30 天。与代码一致。
+
+时间线也吻合：本机 14 份历史登录态快照里，`oneid_login` 的会话都建于 **08-20 ~ 09-02**，
+而 `enterprise_switch` 的两个建于 **09-14 00:46**（Maggie ya）和 **09-16 14:28**（jhan）。
+旧会话靠"续期不换通道"一直保持 55 天，新登的一律 30 天 —— 是**登录页改版**的结果，
+不是账号属性，也不是操作失误。
+
+**实践结论：30 天就是新常态，别再折腾重登。真正的风险是自动续期没跑起来 ——
+见下面「自动续期」章节，务必注册计划任务。**
+
+> ⚠️ 两处曾被误判、已作废：
+> ① "登录页有个人/企业身份选择" —— CN 版确实有「个人 / 企业」两个 tab，但默认就是「个人」
+> （`useState("personal")`），企业 tab 走企业域名 SSO，与手机号验证码无关。
+> ② "只有被手动切换过的账号才是 30 天" —— 实测重登一样是 30 天，与是否手动切换无关。
+
 - **改本地文件/配置没用**：`accessToken` 是 RS256（服务端私钥签名）、`refreshToken` 是 HS512，
   改任何字符都会验签失败；`.info` 里的 `expiresAt` / `expiresIn` 只是本地镜像，改了只骗自己。
 - **改续期请求头也没用**：实测 `X-Auth-Refresh-Source` 取 plugin / desktop / console /
   oneid_login / 不带该头，返回恒为同一 TTL，`sessionState` 也不变 —— TTL 绑在服务端会话上。
-- **唯一有效办法**：退出企业空间 → 退出登录 → 用手机号验证码重新登录 → 整份复制
-  `workbuddy-desktop.info` 覆盖素材。
+- **目前没有办法转回 55 天**：登录流程固定走"切换/绑定"，退出重登也无效（已实测）。
+  除非官方改回旧流程，否则新登账号一律 30 天。已有的 55 天老会话靠"续期不换通道"保持。
 - 短期账号不会因续期变长期（`token_source` 原样保留），但 **refresh 会把 refreshToken
   重置为新的 60 天**，所以只要在 access 到期前续一次就能一直不掉线。
 - **旧 refreshToken 不会立刻作废**：实测拿续期前的旧 RT 再请求，仍返回 200。因此
@@ -224,7 +288,9 @@ python check_ttl.py wb_auth      # 只扫指定目录
 
 ## 自动续期
 
-短期通道（`enterprise_switch`）的账号只有 30 天有效期，靠人工点续期不现实：
+**⚠️ 新登账号一律是 `enterprise_switch`（30 天），无法避免（见上一章节）。**
+所以自动续期不是可选项，是必需品 —— 没有它，账号每 30 天就会掉线一次。
+靠人工点续期不现实：
 
 ```bash
 python wb_ui_server.py --refresh-all      # 对 wb_auth 全部账号各续期一次

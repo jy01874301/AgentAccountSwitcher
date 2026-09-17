@@ -7,8 +7,10 @@
 #   powershell -ExecutionPolicy Bypass -File install_refresh_task.ps1 -Remove       # 移除任务
 #   powershell -ExecutionPolicy Bypass -File install_refresh_task.ps1 -Trae -Remove
 #
-# 为什么需要它：短期通道（enterprise_switch）的账号只有 3 天有效期，
-# 而 refresh 会滚动 refreshToken，定时跑 --refresh-all 就不会掉线。
+# 为什么需要它：现在登录流程固定走一次「切换/绑定」，新登账号一律是
+# enterprise_switch 通道（access 只有 30 天，退出重登也改不回来）。
+# 好在 refresh 会滚动 refreshToken（重置为新的 60 天），
+# 只要在 access 到期前定时跑 --refresh-all 就不会掉线。
 
 param(
     [switch]$Trae,
