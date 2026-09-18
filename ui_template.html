@@ -193,9 +193,24 @@
   .mig-mode { grid-column:1 / -1; display:flex; flex-direction:column; gap:6px; font-size:12.5px; color:var(--dim); margin-top:2px; }
   .mig-mode label { display:flex; align-items:center; gap:7px; cursor:pointer; }
   .mig-mode input { accent-color:var(--accent); }
+
+  /* ---- 重复页面提示条 ---- */
+  .dup-bar { position:sticky; top:0; z-index:60; display:flex; align-items:center; gap:14px;
+             justify-content:space-between; padding:10px 18px; margin:0 0 14px;
+             background:rgba(255,194,77,.12); border-bottom:1px solid rgba(255,194,77,.4);
+             color:var(--amber); font-size:13px; }
+  .dup-txt { display:flex; flex-direction:column; gap:2px; }
+  .dup-txt span { font-size:12px; color:var(--dim); }
 </style>
 </head>
 <body>
+<div class="dup-bar" id="dupBar" style="display:none;">
+  <div class="dup-txt">
+    <b>这个页面已经开着另一个标签页了</b>
+    <span>为保持只有一个页面实例，建议关掉这一个。数据两边是同一份，不会丢。</span>
+  </div>
+  <button class="btn ghost" onclick="closeThisTab()">关闭此页</button>
+</div>
 <div class="wrap">
   <header>
     <div class="logo">{{LOGO}}</div>
@@ -298,7 +313,47 @@ const UI = { authDir: "{{AUTH_DIR}}", cmd: "{{CMD}}", credits: "{{CREDITS}}", ch
 const API = { accounts:'/api/accounts', current:'/api/current', switch:'/api/switch', add:'/api/add',
               remove:'/api/remove', refresh:'/api/refresh', credits:'/api/credits',
               checkinStatus:'/api/checkin-status', checkin:'/api/checkin', refreshAll:'/api/refresh-all',
-              migratePreview:'/api/migrate-preview' };
+              migratePreview:'/api/migrate-preview', pageAlive:'/api/page-alive' };
+
+// ---- 页面心跳 + 重复页面识别 ---------------------------------------------
+// 心跳让服务端知道"还有页面开着"，这样重复运行启动脚本时不会再开一个标签页。
+// BroadcastChannel 负责认出"同一地址被开了第二个"（例如用户手动又开了一个），
+// 让后来者自己提示并给出关闭入口 —— 浏览器不允许脚本关掉非脚本打开的标签页，
+// 所以这里只能做到"可辨识 + 一键尝试关闭 + 失败给退路"。
+(function(){
+  function beat(){
+    try{ fetch(API.pageAlive,{cache:'no-store'}).catch(function(){}); }catch(e){}
+  }
+  beat();
+  setInterval(beat, 5000);
+  document.addEventListener('visibilitychange', function(){ if(!document.hidden) beat(); });
+
+  if(typeof BroadcastChannel === 'undefined') return;
+  var mine=Math.random().toString(36).slice(2), ch;
+  try{ ch=new BroadcastChannel('wb_switcher_page'); }catch(e){ return; }
+  ch.onmessage=function(e){
+    var d=e.data||{};
+    if(d.t==='hello' && d.id!==mine){ ch.postMessage({t:'taken', to:d.id, by:mine}); }
+    else if(d.t==='taken' && d.to===mine){ showDupBar(); }
+  };
+  ch.postMessage({t:'hello', id:mine});
+})();
+
+function showDupBar(){
+  var el=document.getElementById('dupBar');
+  if(el) el.style.display='flex';
+}
+
+function closeThisTab(){
+  window.close();
+  setTimeout(function(){
+    var el=document.getElementById('dupBar');
+    if(el && el.style.display!=='none'){
+      var s=el.querySelector('.dup-txt span');
+      if(s) s.textContent='浏览器不允许脚本关闭这个标签页，请手动关闭（Ctrl+W）。';
+    }
+  }, 400);
+}
 
 async function req(path){
   const r = await fetch(path);

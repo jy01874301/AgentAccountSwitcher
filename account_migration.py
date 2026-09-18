@@ -209,6 +209,25 @@ def _now_stamp():
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _replace(src, dst, tries=6, delay=0.15):
+    """改名/移动，带重试。
+
+    Windows 上**刚创建的目录/文件**可能被杀软或索引器短暂持有句柄，
+    此时 rename 会间歇性地抛 `WinError 5 拒绝访问` / `WinError 32 正在使用`。
+    实测：同一段迁移代码连跑两次，第二次偶发失败（第一次把文件建出来后杀软正在扫）。
+    这类失败等几十毫秒就过去了，直接重试比让整个迁移回滚划算得多。
+    """
+    last = None
+    for i in range(int(tries)):
+        try:
+            Path(src).replace(dst)
+            return
+        except OSError as e:
+            last = e
+            time.sleep(delay * (i + 1))
+    raise last
+
+
 # ---------------------------------------------------------------------------
 # connectors：userIdCheck 是纯 sha256(uid + salt) 前 16 字节的 base64
 # ---------------------------------------------------------------------------
@@ -256,7 +275,7 @@ def _fix_connector_states(path, new_uid):
     data["encryption"] = enc
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    _replace(tmp, path)
     return True, ""
 
 
@@ -600,7 +619,7 @@ def migrate(old_uid, new_uid, opts=None):
                     journal.add_step("账号记忆", True, "与新账号已有记忆合并")
                 else:
                     journal.renames.append((src, dst))
-                    src.replace(dst)
+                    _replace(src, dst)
                     journal.add_step("账号记忆", True, "已改名")
             else:
                 journal.add_step("账号记忆", True, "无（跳过）")
@@ -622,7 +641,7 @@ def migrate(old_uid, new_uid, opts=None):
                     common.safe_unlink_tree(d)
                 else:
                     journal.renames.append((d, dst))
-                    d.replace(dst)
+                    _replace(d, dst)
                     moved.append("%s → %s" % (d.name, new_name))
             journal.add_step("账号级设置", True, "；".join(moved) or "无（跳过）")
         except Exception as e:  # noqa: BLE001
@@ -645,7 +664,7 @@ def migrate(old_uid, new_uid, opts=None):
                             journal.add_step("连接器状态", False, why)
                             return _rollback(r, journal, result, "重算连接器校验值失败：%s" % why)
                     journal.renames.append((cdir, dst))
-                    cdir.replace(dst)
+                    _replace(cdir, dst)
                     journal.add_step("连接器状态", True, "已改名并重算 userIdCheck")
             else:
                 journal.add_step("连接器状态", True, "无（跳过）")
@@ -665,7 +684,7 @@ def migrate(old_uid, new_uid, opts=None):
                     j.setdefault("claw", {})["users"] = users
                     tmp = sp.with_suffix(".json.tmp")
                     tmp.write_text(json.dumps(j, ensure_ascii=False, indent=2), encoding="utf-8")
-                    tmp.replace(sp)
+                    _replace(tmp, sp)
                     journal.add_step("settings.json 账号键", True, "已改名到新 uid")
                 else:
                     journal.add_step("settings.json 账号键", True, "无（跳过）")
@@ -690,7 +709,7 @@ def migrate(old_uid, new_uid, opts=None):
                     j["primary"] = prim
                     tmp = sp.with_suffix(".json.tmp")
                     tmp.write_text(json.dumps(j, ensure_ascii=False, indent=2), encoding="utf-8")
-                    tmp.replace(sp)
+                    _replace(tmp, sp)
                     journal.add_step("账号快照", True, "uid 已更新")
                 else:
                     journal.add_step("账号快照", True, "不是旧账号（跳过）")
@@ -766,7 +785,7 @@ def _rollback(r, journal, result, message):
     for a, b in reversed(journal.renames):
         try:
             if Path(b).exists() and not Path(a).exists():
-                Path(b).replace(a)
+                _replace(b, a)
         except OSError as e:
             problems.append("还原 %s：%s" % (Path(b).name, common.scrub(e)))
     # 数据库整体还原

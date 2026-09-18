@@ -604,11 +604,9 @@ def serve(port=DEFAULT_PORT, open_browser=True, use_token=True):
     url = "http://127.0.0.1:%d/" % port
     print("本地服务已启动：%s  (Ctrl+C 停止)" % url, flush=True)
     if open_browser:
-        try:
-            import webbrowser
-            threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-        except Exception:
-            pass
+        # 用 open_page 而不是裸 webbrowser.open：只有"当前没有页面开着"才开，
+        # 否则每次运行都会多一个指向同一地址的标签页。
+        threading.Timer(0.6, lambda: common.open_page(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

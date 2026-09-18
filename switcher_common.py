@@ -524,6 +524,93 @@ def single_instance_guard(mutex_name, port, tries=PORT_TRIES, log=print, wait=5.
     return handle, "abort", None
 
 
+# ---------------------------------------------------------------------------
+# 页面存活状态：避免"每次运行都再开一个指向同一地址的标签页"
+# ---------------------------------------------------------------------------
+# 旧行为：复用分支无条件 webbrowser.open(url) —— 每双击一次 .cmd 就多一个标签页。
+# 但也不能干脆不开：用户可能已经把标签页关了，这时双击就该给他打开。
+# 所以要能回答"现在有没有页面开着"：
+#   - 首页被请求（_serve_index）→ 记一次"刚开过"
+#   - 页面每 5 秒打 /api/page-alive → 持续刷新"还开着"
+#   - 标签页被关掉 → 心跳停 → 超过 PAGE_TTL 就认为没有页面了
+_PAGE_STATE = {"seen": 0.0, "opened": 0.0}
+PAGE_TTL = 20.0          # 心跳多久没来就算页面已关闭
+PAGE_OPEN_GRACE = 30.0   # 刚调过浏览器后的宽限期（页面可能还没加载完、还没发心跳）
+
+
+def mark_page_opened():
+    _PAGE_STATE["opened"] = time.time()
+
+
+def mark_page_seen():
+    _PAGE_STATE["seen"] = time.time()
+
+
+def page_is_open():
+    """是否（很可能）已经有一个页面开着。
+
+    两个来源要**分开判**，不能取 max 后比 max(时限)：
+      - 心跳（seen）：页面还在，按 PAGE_TTL 算
+      - 刚调过浏览器（opened）：页面可能还没加载完、还没发第一次心跳，按更宽的
+        PAGE_OPEN_GRACE 算
+    早先写成 `(now - max(seen, opened)) < max(PAGE_TTL, PAGE_OPEN_GRACE)`，
+    等于让宽限期覆盖了心跳时限，标签页关掉后要多等 10 秒才认账（自检抓到）。
+    """
+    now = time.time()
+    if _PAGE_STATE["seen"] and (now - _PAGE_STATE["seen"]) < PAGE_TTL:
+        return True
+    if _PAGE_STATE["opened"] and (now - _PAGE_STATE["opened"]) < PAGE_OPEN_GRACE:
+        return True
+    return False
+
+
+def page_state():
+    """给 /api/page-alive 与调试用。"""
+    now = time.time()
+    return {
+        "open": page_is_open(),
+        "last_seen_ago": round(now - _PAGE_STATE["seen"], 1) if _PAGE_STATE["seen"] else None,
+        "last_opened_ago": round(now - _PAGE_STATE["opened"], 1) if _PAGE_STATE["opened"] else None,
+    }
+
+
+def open_page(url, log=print):
+    """只在**没有页面开着**时才打开浏览器。返回是否真的打开了。
+
+    这是"重复打开多个页面"的根治点：把开浏览器这件事从"每次运行都做"
+    改成"只在确实没有页面时才做"。
+    """
+    if page_is_open():
+        log("       已有页面在运行，不再新开标签页；若那个标签页已关闭，"
+            "请手动打开：%s" % url)
+        return False
+    mark_page_opened()
+    try:
+        import webbrowser
+        webbrowser.open(url)
+        log("       已打开页面：%s" % url)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def notify_user(title, message, log=print):
+    """给用户一个**可见**的提示。
+
+    窗口版（console=False）没有控制台，print 没有任何去处 —— 复用分支若只打印，
+    用户会以为"双击没反应"。这里优先弹一个原生消息框。
+    """
+    log("%s：%s" % (title, message))
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        # MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST
+        ctypes.windll.user32.MessageBoxW(None, message, title, 0x40 | 0x10000 | 0x40000)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def report_reuse(info, open_browser, app_version, default_port):
     """已有同款实例在跑：指向它，不再起第二个。返回退出码 0。"""
     url = "http://127.0.0.1:%d/" % info.get("port", default_port)
@@ -535,11 +622,13 @@ def report_reuse(info, open_browser, app_version, default_port):
         print("       建议先关掉它（在它的窗口按 Ctrl+C）再重新启动。", flush=True)
     print("       页面地址：%s" % url, flush=True)
     if open_browser:
-        try:
-            import webbrowser
-            webbrowser.open(url)
-        except Exception:  # noqa: BLE001
-            pass
+        # 关键：由**运行中的实例**告诉我们页面是否开着（本进程的 _PAGE_STATE 是空的，
+        # 问本地等于没问）。只有它说"没有页面"时才开，避免越点越多标签页。
+        if info.get("page_open"):
+            print("       已有页面在运行，不再新开标签页；若那个标签页已关闭，"
+                  "请手动打开：%s" % url, flush=True)
+        else:
+            open_page(url)
     return 0
 
 
@@ -663,7 +752,17 @@ class BaseHandler(BaseHTTPRequestHandler):
                     "ok": True, "app": self.APP_NAME, "source": self.SOURCE,
                     "pid": os.getpid(), "port": self.server.server_address[1],
                     "version": self.APP_VERSION, "started_at": self.STARTED_AT,
+                    # 页面是否开着必须由**运行中的实例**回答：判断这件事的进程是
+                    # 新起的那个，它自己的 _PAGE_STATE 是空的，问本地等于没问。
+                    "page_open": page_is_open(),
                 }, 200)
+                return
+            if u.path == "/api/page-alive":
+                # 页面心跳：前端每 5 秒打一次。服务端据此知道"还有页面开着"，
+                # 从而在下次运行时**不再重复打开标签页**。同样放在 _guard() 之前。
+                mark_page_seen()
+                st = page_state()
+                self._send_json({"ok": True, "page_open": st["open"]}, 200)
                 return
             if not self._guard():
                 return
@@ -718,6 +817,8 @@ class BaseHandler(BaseHTTPRequestHandler):
         if not idx or not idx.is_file():
             self._send(b"index not found", 404, "text/plain; charset=utf-8")
             return
+        # 首页被请求 = 刚刚有页面打开（可能是我们开的，也可能是用户手动开的）
+        mark_page_seen()
         body = idx.read_bytes()
         if self.UI_CONTEXT:
             body = render_template(body, self.UI_CONTEXT)

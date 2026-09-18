@@ -117,7 +117,11 @@ def main():
         if headless:
             print("       页面地址：%s" % url)
             return 0
-        _show_window(url)
+        # ⚠️ 不再开新窗口 —— 那正是"每次双击多一个同地址页面"的来源
+        common.notify_user("Trae 账号切换器",
+                           "已有实例在运行（pid %s，端口 %s），未再打开新窗口。\n\n"
+                           "请切换到已打开的那个窗口（任务栏）。\n\n地址：%s"
+                           % (info.get("pid"), info.get("port"), url), log=print)
         return 0
     if action == "abort":
         msg = "已有切换器实例在运行，但在 %d 起的 %d 个端口上都探测不到它。" % (requested, common.PORT_TRIES)

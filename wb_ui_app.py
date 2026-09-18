@@ -127,13 +127,21 @@ def main():
         url = "http://127.0.0.1:%d/" % info.get("port", requested)
         print("[提示] 已有实例在运行（pid %s，端口 %s），直接指向它，不再启动第二个。"
               % (info.get("pid"), info.get("port")))
-        if info.get("version") and info["version"] != srv.Handler.APP_VERSION:
+        stale = bool(info.get("version")) and info["version"] != srv.Handler.APP_VERSION
+        if stale:
             print("[警告] 那个实例的版本是 %r，当前是 %r —— 它可能在跑旧代码。"
                   % (info.get("version"), srv.Handler.APP_VERSION))
         if headless:
             print("       页面地址：%s" % url)
             return 0
-        _show_window(url)
+        # ⚠️ 这里**不再开新窗口** —— 那正是"每次双击多一个同地址页面"的来源。
+        # 窗口版没有控制台，print 无处可去，所以弹一个原生提示框。
+        msg = ("已有实例在运行（pid %s，端口 %s），未再打开新窗口。\n\n"
+               "请切换到已打开的那个窗口（任务栏）。\n\n地址：%s" % (info.get("pid"), info.get("port"), url))
+        if stale:
+            msg += "\n\n注意：那个实例的版本是 %s，当前是 %s，可能在跑旧代码。" % (
+                info.get("version"), srv.Handler.APP_VERSION)
+        common.notify_user("WorkBuddy 账号切换器", msg, log=print)
         return 0
     if action == "abort":
         msg = "已有切换器实例在运行，但在 %d 起的 %d 个端口上都探测不到它。" % (requested, common.PORT_TRIES)

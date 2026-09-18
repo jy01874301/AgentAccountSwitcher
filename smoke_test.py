@@ -720,6 +720,12 @@ def main():
 
     print("\n== 14. 账号数据迁移（全程在临时目录，不碰真实数据）==")
     mig = wb.migration
+    # 迁移的前置检查里有"不得有另一个切换器实例在跑"（拒绝路径由 §15e 专门覆盖）。
+    # 但自检是在用户的真实环境里跑的，8765 上很可能正跑着切换器 —— 那会把本段
+    # 全部用例挡掉。所以这里把探测端口指到一个不监听任何服务的端口，
+    # 让本段专注验证迁移本身。§15e 结束时会把 INSTANCE_PORT 还原。
+    _saved_inst_port = mig.INSTANCE_PORT
+    mig.INSTANCE_PORT = 8999          # 该端口上没有任何服务
     OLD = "aaaaaaaa-1111-2222-3333-444444444444"
     NEW = "bbbbbbbb-5555-6666-7777-888888888888"
     SID1 = "11111111-aaaa-bbbb-cccc-000000000001"
@@ -1077,6 +1083,94 @@ def main():
               all(ord(c) < 128 for c in txt), "")
         check("%s 用 CRLF 换行" % f,
               (BIN / f).read_bytes().count(b"\r\n") > 5, "")
+
+    print("\n== 16. 不重复打开同一地址的页面 ==")
+    # 旧行为：复用分支无条件 webbrowser.open(url) —— 每双击一次 .cmd 就多一个标签页。
+    # 现在由"运行中的实例"通过 /api/ping 的 page_open 回答"有没有页面开着"，
+    # 只有它说没有时才开。
+    import webbrowser as _wb
+    opened = []
+    _real_open = _wb.open
+    _wb.open = lambda u, *a, **k: (opened.append(u), True)[1]
+    try:
+        def _reset():
+            common._PAGE_STATE.update(seen=0.0, opened=0.0)
+
+        # --- 16a. open_page 的三种情形 ---
+        _reset()
+        check("无页面时 open_page 会打开", common.open_page("http://x/") is True and len(opened) == 1,
+              opened)
+        check("刚开过（宽限期内）不再开", common.open_page("http://x/") is False and len(opened) == 1,
+              opened)
+        common._PAGE_STATE["opened"] = time.time() - (common.PAGE_OPEN_GRACE + 1)
+        check("宽限期过后仍未加载出页面 → 允许再开",
+              common.open_page("http://x/") is True and len(opened) == 2, opened)
+
+        # --- 16b. 心跳与打开宽限必须分开判（早先用 max 把两者混在一起，自检抓到） ---
+        _reset()
+        common.mark_page_seen()
+        check("有心跳 → 认为页面开着", common.page_is_open() is True, common.page_state())
+        common._PAGE_STATE["seen"] = time.time() - (common.PAGE_TTL + 1)
+        check("心跳过期(%ds) → 认为页面已关闭" % common.PAGE_TTL,
+              common.page_is_open() is False, common.page_state())
+        _reset()
+        common._PAGE_STATE["opened"] = time.time() - (common.PAGE_OPEN_GRACE + 1)
+        check("打开宽限过期(%ds) → 认为页面已关闭" % common.PAGE_OPEN_GRACE,
+              common.page_is_open() is False, common.page_state())
+
+        # --- 16c. report_reuse 依运行中实例的 page_open 决定 ---
+        opened.clear()
+        common.report_reuse({"pid": 1, "port": 9999, "page_open": True}, True, "v", 9999)
+        check("复用分支：对方说页面开着 → 不再开标签页", opened == [], opened)
+        common.report_reuse({"pid": 1, "port": 9999, "page_open": False}, True, "v", 9999)
+        check("复用分支：对方说没有页面 → 才打开", opened == ["http://127.0.0.1:9999/"], opened)
+    finally:
+        _wb.open = _real_open
+        common._PAGE_STATE.update(seen=0.0, opened=0.0)
+
+    # --- 16d. /api/page-alive 与 /api/ping 的 page_open ---
+    srv4, port4 = common.bind_server(wb.Handler, 8995)
+    threading.Thread(target=srv4.serve_forever, daemon=True).start()
+    try:
+        time.sleep(0.25)
+        st, raw = call(port4, "/api/ping")
+        check("/api/ping 带 page_open 字段", "page_open" in json.loads(raw), sorted(json.loads(raw)))
+        check("尚未请求首页时 page_open=False", json.loads(raw).get("page_open") is False, "")
+        st, _ = call(port4, "/")
+        check("GET / 会记一次页面存活", st == 200, st)
+        st, raw = call(port4, "/api/ping")
+        check("请求过首页后 page_open=True（跨进程可见）",
+              json.loads(raw).get("page_open") is True, raw[:90])
+        wb.Handler.TOKEN = "secret"
+        try:
+            st, raw = call(port4, "/api/page-alive")
+            check("/api/page-alive 免令牌可访问",
+                  st == 200 and json.loads(raw).get("page_open") is True, st)
+        finally:
+            wb.Handler.TOKEN = None
+    finally:
+        srv4.shutdown()
+        srv4.server_close()
+
+    # --- 16e. 前端与启动器 ---
+    tpl16 = (BIN / "ui_template.html").read_text(encoding="utf-8")
+    for k in ("id=\"dupBar\"", "BroadcastChannel", "/api/page-alive", "closeThisTab",
+              "setInterval(beat, 5000)"):
+        check("模板含 %s" % k, k in tpl16, "")
+    check("模板占位符未受影响（MIGRATE 仍在）", "{{MIGRATE}}" in tpl16, "")
+    for f in ("wb_ui_app.py", "tw_ui_app.py"):
+        s = (BIN / f).read_text(encoding="utf-8")
+        # 只看复用分支：正常启动路径当然还是要开窗口的
+        i = s.find('if action == "reuse":')
+        j = s.find('if action == "abort":', i + 1)
+        blk = s[i:j] if (i >= 0 and j > i) else ""
+        check("%s 复用分支改为弹提示、不再开新窗口" % f,
+              bool(blk) and "notify_user" in blk and "_show_window" not in blk, blk[:70])
+        check("%s 正常启动路径仍会开窗口" % f, "_show_window(url)" in s, "")
+    for f in ("wb_ui_server.py", "tw_ui_server.py"):
+        s = (BIN / f).read_text(encoding="utf-8")
+        check("%s 启动时用 open_page（不是裸 webbrowser.open）" % f,
+              "common.open_page(url)" in s and "webbrowser.open(url)" not in s, "")
 
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0
