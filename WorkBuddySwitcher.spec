@@ -29,7 +29,9 @@ a = Analysis(
     pathex=[SIBLING, HERE],
     binaries=[],
     datas=[('ui_template.html', '.'), ('README.md', '.'), ('check_ttl.py', '.')],
-    hiddenimports=['webview', 'switcher_common', 'workbuddy_checkin'],
+    # account_migration 是顶层 import，静态分析扫得到；显式列出是为了防止
+    # 将来被改成条件导入后悄悄漏掉（漏了会表现为"切号正常但没有迁移功能"）。
+    hiddenimports=['webview', 'switcher_common', 'workbuddy_checkin', 'account_migration'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -23,6 +23,7 @@ import re
 import sys
 import threading
 import time
+from urllib.parse import parse_qs
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -39,6 +40,7 @@ PROJECT_ROOT = project_root_candidate
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(_BIN_DIR))
 import switcher_common as common  # 两个切换器共用的 HTTP 骨架 / 文件锁 / 备份裁剪
+import account_migration as migration  # 切号时把本地数据改归属到新账号（见 DESIGN_account_migration.md）
 
 # 复用上级项目的解析/续期逻辑：先声明需要的成员，缺失时给出可读提示而不是裸 Traceback
 wb = common.require_module(
@@ -192,14 +194,52 @@ def _restore_backup(backup):
                 % src.name)
 
 
-def switch_account(target_name):
+def current_uid():
+    """当前桌面端账号的 uid（取不到返回空串）。"""
+    try:
+        entries = current_account()
+    except Exception:  # noqa: BLE001
+        return ""
+    for e in entries:
+        if e.get("current") and e.get("uid"):
+            return e["uid"]
+    return ""
+
+
+def migrate_preview(target_name):
+    """扫描「切到 target_name 后需要迁移多少数据」，供前端弹框展示。"""
+    norm = os.path.basename((target_name or "").replace("\\", "/"))
+    src = AUTH_DIR / norm
+    if not norm.endswith(".info") or not src.is_file():
+        return {"ok": False, "message": "目标账号文件不存在：%s" % (target_name or "")}
+    new_uid = ""
+    try:
+        acc = wb.session_from_info_file(src)
+        new_uid = (acc or {}).get("uid") or ""
+    except Exception:  # noqa: BLE001
+        pass
+    if not new_uid:
+        return {"ok": False, "message": "目标账号文件解析不出 uid，无法迁移"}
+    old_uid = current_uid()
+    data = migration.preview(old_uid, new_uid)
+    data["target_file"] = norm
+    data["target_nickname"] = (wb.session_from_info_file(src) or {}).get("nickname") or norm
+    data["needed"] = bool(old_uid and old_uid != new_uid
+                          and (data.get("items") or data.get("conflicts")))
+    return data
+
+
+def switch_account(target_name, migrate=None):
     """把 wb_auth\\<target_name>.info 切换为桌面端正式登录态。
 
     - 校验目标文件存在且可解析；
     - 桌面目录不存在则创建；
     - 现有正式文件改名为带时间戳的备份（与客户端 clean() 一致），保留其可用登录态；
     - 复制目标文件内容为 workbuddy-desktop.info；
-    - 清理 workbuddy-desktop.info.logged-out 登出标记（若有）。
+    - 清理 workbuddy-desktop.info.logged-out 登出标记（若有）；
+    - 若给了 migrate 选项，**切换成功后**再把旧账号名下的本地数据改归属到新账号。
+      顺序是「先切后迁」：迁移失败时用户至少已经在新账号上，不会出现
+      "数据已归新账号、人却还登着旧账号"的更糟状态。
     返回 (ok, message)。
     """
     # 只接受文件名，与 remove/refresh 保持一致。此前直接拼 AUTH_DIR / target_name，
@@ -207,24 +247,32 @@ def switch_account(target_name):
     # 等于允许把任意路径的 .info 写进桌面端登录态。
     norm = (target_name or "").replace("\\", "/")
     if not norm or os.path.basename(norm) != norm:
-        return False, "非法的账号文件名：%s" % (target_name or "")
+        return False, "非法的账号文件名：%s" % (target_name or ""), None
     if not norm.endswith(".info"):
-        return False, "仅支持 .info 格式的账号文件"
+        return False, "仅支持 .info 格式的账号文件", None
     src = AUTH_DIR / norm
     if not src.is_file():
-        return False, "目标账号文件不存在：%s" % target_name
+        return False, "目标账号文件不存在：%s" % target_name, None
 
-    # 「备份 + 写入 + 清标记」必须串行，否则与续期/另一次切号交叉会写坏登录态
-    with common.file_lock("wb-desktop", LOCK_DIR):
+    # 切换前的 uid 必须**在轮换之前**取：一旦旧文件被改名走，current_account()
+    # 看到的就是备份，语义会变。
+    old_uid = current_uid()
+    mig_result = None
+
+    # 「备份 + 写入 + 清标记」必须串行，否则与续期/另一次切号交叉会写坏登录态。
+    # 带迁移时放宽锁超时：迁移要做 db 快照（本机 WAL 有 4 MB），15s 可能不够，
+    # 而超时会让并发的续期任务直接失败。
+    lock_timeout = 120.0 if migrate else 15.0
+    with common.file_lock("wb-desktop", LOCK_DIR, timeout=lock_timeout):
         acc = wb.session_from_info_file(src)
         if not acc:
-            return False, "目标账号文件无法解析（内容可能不全或被加密）：%s" % target_name
+            return False, "目标账号文件无法解析（内容可能不全或被加密）：%s" % target_name, None
         data = _read_info(src)
         if data is None:
-            return False, "目标账号文件不是合法 JSON：%s" % target_name
+            return False, "目标账号文件不是合法 JSON：%s" % target_name, None
         if not common.token_looks_complete((data.get("auth") or {}).get("accessToken")):
             return False, ("目标账号的 accessToken 不完整（疑似粘贴时被截断），切换后必然 401：%s。"
-                           "请重新从客户端导出完整的 workbuddy-desktop.info" % target_name)
+                           "请重新从客户端导出完整的 workbuddy-desktop.info" % target_name), None
 
         DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -239,7 +287,7 @@ def switch_account(target_name):
             try:
                 DESKTOP_INFO.replace(backup)
             except OSError as e:
-                return False, "轮换旧登录态失败：%s" % common.scrub(e)
+                return False, "轮换旧登录态失败：%s" % common.scrub(e), None
 
         # 2. 写入目标账号。这一步失败必须回滚：否则正式文件已被改名走，
         #    桌面端会处于"没有登录态"的状态（此前只报失败、不回滚）。
@@ -253,7 +301,7 @@ def switch_account(target_name):
             except OSError:
                 pass
             # OSError 文本会带出本机绝对路径（如桌面端 auth 目录），先脱敏再回给前端
-            return False, "写入新登录态失败：%s%s" % (common.scrub(e), _restore_backup(backup))
+            return False, "写入新登录态失败：%s%s" % (common.scrub(e), _restore_backup(backup)), None
 
         # 3. 清理登出标记
         marker_path = DESKTOP_DIR / ("workbuddy-desktop.info" + LOGOUT_SUFFIX)
@@ -273,7 +321,7 @@ def switch_account(target_name):
             if acc_after:
                 cur_nick = acc_after["nickname"]
             return False, ("写入后校验未通过：桌面端当前登录态仍为「%s」，切换可能未生效。"
-                           "请确认 WorkBuddy 客户端未占用该文件后重试" % (cur_nick or "未知"))
+                           "请确认 WorkBuddy 客户端未占用该文件后重试" % (cur_nick or "未知")), None
 
         # 5. 裁剪旧备份：纯善后，必须放在**新登录态写好且校验通过之后**。
         #    此前它夹在「旧文件已改名走」和「新文件还没写」之间 —— 一旦这里抛异常
@@ -287,10 +335,32 @@ def switch_account(target_name):
         except BaseException:  # noqa: BLE001
             pruned = 0
 
+        # 6. 迁移旧账号名下的本地数据（可选）。
+        #    放在**切换成功且写后校验通过之后**：迁移失败时用户至少已经在新账号上，
+        #    不会出现"数据已归新账号、人却还登着旧账号"这种更糟的状态。
+        #    迁移失败**不回滚切号** —— 否则用户会同时失去登录态和迁移结果。
+        if migrate and migrate.get("enabled", True):
+            from_uid = str(migrate.get("from_uid") or old_uid or "")
+            if not from_uid or from_uid == acc["uid"]:
+                mig_result = {"ok": True, "message": "无需迁移（新旧账号相同或取不到原 uid）",
+                              "steps": [], "warnings": []}
+            else:
+                mig_result = migration.migrate(from_uid, acc["uid"], migrate)
+                common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "migrate",
+                             "%s -> %s" % (from_uid[:8], acc["uid"][:8]),
+                             bool(mig_result.get("ok")), mig_result.get("message"))
+
     msg = "已切换为 %s（%s），桌面端将自动采纳新会话" % (acc["nickname"], target_name)
     if pruned:
         msg += "；已清理 %d 份旧备份（保留最近 %d 份）" % (pruned, DESKTOP_BACKUP_KEEP)
-    return True, msg
+    if mig_result is not None:
+        if mig_result.get("ok"):
+            moved = mig_result.get("moved_sessions")
+            extra = "（%d 个会话）" % moved if moved else ""
+            msg += "；数据迁移完成%s" % extra
+        else:
+            msg += "；⚠️ 但数据迁移失败：%s" % mig_result.get("message", "")
+    return True, msg, mig_result
 
 
 def safe_info_name(name):
@@ -874,6 +944,7 @@ class Handler(common.BaseHandler):
         "CMD": "workbuddy_switcher.cmd",
         "CREDITS": "1",            # 展示积分明细 + 「刷新积分」按钮（Trae 侧无该接口，置空即隐藏）
         "CHECKIN": "1",            # 展示签到状态 + 「一键签到」按钮（Trae 侧无该接口，置空即隐藏）
+        "MIGRATE": "1",            # 切号时弹「是否迁移任务与项目」确认框（Trae 侧无此能力，置空即隐藏）
     }
     WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add",
                        "/api/checkin", "/api/refresh-all")
@@ -895,11 +966,18 @@ class Handler(common.BaseHandler):
             # 只读查签到状态。必须与 POST /api/checkin 分开：
             # BaseHandler 对 WRITE_ENDPOINTS 里的路径一律拒绝 GET（405）。
             return 200, checkin_snapshot(force="force=1" in (u.query or ""))
+        if u.path == "/api/migrate-preview":
+            # 只读扫描：切到这个账号需要迁移多少数据（供弹框展示）
+            return 200, migrate_preview(dict(parse_qs(u.query or "")).get("name", [""])[0])
         return 404, {"ok": False, "message": "404"}
 
     def api_post(self, u, p):
         if u.path == "/api/switch":
-            ok, msg = switch_account(str(p.get("name") or ""))
+            mig = p.get("migrate")
+            if not isinstance(mig, dict):
+                mig = None            # 不传 = 仅切换（保持旧行为）
+            ok, msg, mig_result = switch_account(str(p.get("name") or ""), mig)
+            return 200, {"ok": ok, "message": msg, "migration": mig_result}
         elif u.path == "/api/remove":
             ok, msg = remove_account(str(p.get("file") or ""))
         elif u.path == "/api/refresh":
@@ -942,6 +1020,12 @@ def main():
     ap.add_argument("--list", action="store_true", help="列出 wb_auth 可用账号")
     ap.add_argument("--current", action="store_true", help="查看桌面端当前账号")
     ap.add_argument("--switch", metavar="NAME", help="切换为 wb_auth\\NAME.info")
+    ap.add_argument("--migrate", action="store_true",
+                    help="配合 --switch：切换后把旧账号的本地数据改归属到新账号")
+    ap.add_argument("--migrate-mode", choices=("move", "share"), default="move",
+                    help="move=改归属到新账号（默认）；share=置空 user_id，两边都能看到")
+    ap.add_argument("--migrate-preview", metavar="NAME",
+                    help="只读扫描：切到 wb_auth\\NAME.info 需要迁移多少数据（JSON）")
     ap.add_argument("--serve", action="store_true", help="启动本地 HTTP 服务")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help="HTTP 服务端口（默认 %d，被占用时自动顺延）" % DEFAULT_PORT)
@@ -974,10 +1058,15 @@ def main():
         print(json.dumps({"current": current_account()}, ensure_ascii=False, indent=2))
         return 0
     if args.switch:
-        ok, msg = switch_account(args.switch)
+        mig = {"enabled": True, "mode": args.migrate_mode} if args.migrate else None
+        ok, msg, mig_result = switch_account(args.switch, mig)
         common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "switch", args.switch, ok, msg)
-        print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False, indent=2))
+        print(json.dumps({"ok": ok, "message": msg, "migration": mig_result},
+                         ensure_ascii=False, indent=2))
         return 0 if ok else 1
+    if args.migrate_preview:
+        print(json.dumps(migrate_preview(args.migrate_preview), ensure_ascii=False, indent=2))
+        return 0
     serve(port=args.port, use_token=not args.no_auth)
     return 0
 

@@ -174,6 +174,25 @@
   .ci-bar { height:5px; border-radius:3px; background:var(--card-2); overflow:hidden; margin-top:1px; }
   .ci-bar i { display:block; height:100%; border-radius:3px; background:#2bbfa8; }
   .credits-pending { font-size:12px; color:var(--dim); }
+
+  /* ---- 迁移确认弹框 ---- */
+  .modal-box.wide { width:min(560px,94vw); }
+  .mig-sub { font-size:12.5px; color:var(--dim); margin-bottom:10px; }
+  .mig-list { list-style:none; display:flex; flex-direction:column; gap:6px; margin:0 0 12px; }
+  .mig-list li { display:flex; align-items:baseline; gap:10px; font-size:13px; color:var(--text); }
+  .mig-list li span.k { flex:0 0 108px; color:var(--dim); font-size:12.5px; }
+  .mig-list li span.n { color:var(--amber); font-size:12px; }
+  .mig-note { background:var(--bg); border:1px solid var(--border); border-left:3px solid var(--accent);
+              border-radius:8px; padding:9px 12px; font-size:12px; color:var(--dim); line-height:1.6; margin-bottom:10px; }
+  .mig-warn, .mig-conflict { border-radius:8px; padding:9px 12px; font-size:12px; line-height:1.6; margin-bottom:10px; }
+  .mig-warn { background:rgba(255,92,92,.08); border:1px solid rgba(255,92,92,.35); color:var(--red); }
+  .mig-conflict { background:rgba(255,194,77,.08); border:1px solid rgba(255,194,77,.3); color:var(--amber); }
+  .mig-opts { display:grid; grid-template-columns:1fr 1fr; gap:8px 14px; margin-bottom:12px; }
+  .mig-chk { display:flex; align-items:center; gap:7px; font-size:13px; color:var(--text); cursor:pointer; }
+  .mig-chk input { accent-color:var(--accent); }
+  .mig-mode { grid-column:1 / -1; display:flex; flex-direction:column; gap:6px; font-size:12.5px; color:var(--dim); margin-top:2px; }
+  .mig-mode label { display:flex; align-items:center; gap:7px; cursor:pointer; }
+  .mig-mode input { accent-color:var(--accent); }
 </style>
 </head>
 <body>
@@ -245,11 +264,41 @@
   </div>
 </div>
 
+<div class="modal" id="migModal" style="display:none;">
+  <div class="modal-box wide">
+    <div class="modal-title">切换到 <span id="migNick"></span></div>
+    <div class="modal-body">
+      <div class="mig-sub" id="migSub"></div>
+      <ul class="mig-list" id="migList"></ul>
+      <div class="mig-note" id="migNote"></div>
+      <div class="mig-warn" id="migWarn" style="display:none;"></div>
+      <div class="mig-conflict" id="migConflict" style="display:none;"></div>
+      <div class="mig-opts">
+        <label class="mig-chk"><input type="checkbox" id="migSessions" checked> 会话与任务</label>
+        <label class="mig-chk"><input type="checkbox" id="migMemory" checked> 账号记忆</label>
+        <label class="mig-chk"><input type="checkbox" id="migStorage" checked> 账号级设置</label>
+        <label class="mig-chk"><input type="checkbox" id="migConnectors" checked> 连接器状态</label>
+        <div class="mig-mode">
+          <div>迁移方式</div>
+          <label><input type="radio" name="migMode" value="move" checked> 移动 —— 改归属到新账号，旧账号不再看到</label>
+          <label><input type="radio" name="migMode" value="share"> 共享 —— 置空归属，两个账号都能看到并继续</label>
+        </div>
+      </div>
+    </div>
+    <div class="add-actions">
+      <button class="btn ghost" onclick="closeMig()">取消</button>
+      <button class="btn ghost" onclick="migConfirm(false)">仅切换</button>
+      <button class="btn" id="migGo" onclick="migConfirm(true)">切换并迁移</button>
+    </div>
+  </div>
+</div>
+
 <script>
-const UI = { authDir: "{{AUTH_DIR}}", cmd: "{{CMD}}", credits: "{{CREDITS}}", checkin: "{{CHECKIN}}" };
+const UI = { authDir: "{{AUTH_DIR}}", cmd: "{{CMD}}", credits: "{{CREDITS}}", checkin: "{{CHECKIN}}", migrate: "{{MIGRATE}}" };
 const API = { accounts:'/api/accounts', current:'/api/current', switch:'/api/switch', add:'/api/add',
               remove:'/api/remove', refresh:'/api/refresh', credits:'/api/credits',
-              checkinStatus:'/api/checkin-status', checkin:'/api/checkin', refreshAll:'/api/refresh-all' };
+              checkinStatus:'/api/checkin-status', checkin:'/api/checkin', refreshAll:'/api/refresh-all',
+              migratePreview:'/api/migrate-preview' };
 
 async function req(path){
   const r = await fetch(path);
@@ -603,27 +652,107 @@ document.getElementById('acctList').addEventListener('click', async (e)=>{
     confirmDelete(btn.dataset.file, btn.dataset.nick||btn.dataset.file);
     return;
   }
-  const file=btn.dataset.file;
-  const nick=btn.dataset.nick||'';
-  btn.disabled=true; btn.textContent='切换中…';
+  await startSwitch(btn.dataset.file, btn.dataset.nick||'', btn);
+});
+
+// ---- 切号（含可选的本地数据迁移）-----------------------------------------
+// 迁移只改「归属键」，对话正文按项目目录存放、与账号无关，不搬（见 DESIGN_account_migration.md）。
+let migCtx = null;
+
+async function startSwitch(file, nick, btn){
+  // 后端不支持迁移（Trae 侧）时，直接走原来的纯切换
+  if(UI.migrate!=='1'){ return doSwitch(file, nick, btn, null); }
+  if(btn){ btn.disabled=true; btn.textContent='检查中…'; }
+  let pv=null;
+  try{ pv=await req(API.migratePreview+'?name='+encodeURIComponent(file)); }
+  catch(e){ /* 预览失败不该阻断切换 */ }
+  if(btn){ btn.disabled=false; btn.textContent='切换到该账号'; }
+  if(!pv || pv.ok===false || !pv.needed){
+    if(pv && pv.ok===false) toast('迁移预览不可用，将只切换账号：'+esc(pv.message||''),'err');
+    return doSwitch(file, nick, btn, null);
+  }
+  migCtx={file:file, nick:nick, preview:pv};
+  renderMigModal(pv, nick);
+}
+
+function renderMigModal(pv, nick){
+  document.getElementById('migNick').textContent = nick;
+  const cur = (lastCurrent && lastCurrent[0]) ? (lastCurrent[0].nickname||'当前账号') : '当前账号';
+  document.getElementById('migSub').textContent =
+    '当前账号 ' + cur + ' 名下的本地数据：';
+  const ul=document.getElementById('migList');
+  ul.innerHTML=(pv.items||[]).map(function(it){
+    return '<li><span class="k">'+esc(it.label)+'</span><span>'+esc(it.value)+'</span>'
+         + (it.note?('<span class="n">'+esc(it.note)+'</span>'):'') + '</li>';
+  }).join('') || '<li><span class="k">无可迁移数据</span></li>';
+  document.getElementById('migNote').textContent = pv.projects_note || '';
+  const w=document.getElementById('migWarn');
+  const ws=(pv.warnings||[]);
+  w.style.display = ws.length?'block':'none';
+  w.innerHTML = ws.map(esc).join('<br>');
+  const cf=document.getElementById('migConflict');
+  const cs=(pv.conflicts||[]);
+  cf.style.display = cs.length?'block':'none';
+  cf.innerHTML = cs.length ? ('<b>冲突提示</b><br>'+cs.map(esc).join('<br>')) : '';
+  // 客户端在跑时迁移会被后端拒绝，直接禁用「切换并迁移」
+  const blocked = ws.some(function(s){ return s.indexOf('仍在运行')>=0; });
+  const go = document.getElementById('migGo');
+  go.disabled = blocked;
+  go.title = blocked ? '请先完全退出 WorkBuddy 客户端再迁移（改数据库与本地存储需要客户端不在运行）' : '';
+  document.getElementById('migModal').style.display='flex';
+}
+
+function closeMig(){
+  document.getElementById('migModal').style.display='none';
+  migCtx=null;
+}
+
+async function migConfirm(withMigrate){
+  const ctx=migCtx;
+  if(!ctx) return;
+  let mig=null;
+  if(withMigrate){
+    mig={
+      enabled:true,
+      sessions: document.getElementById('migSessions').checked,
+      memory:   document.getElementById('migMemory').checked,
+      storage:  document.getElementById('migStorage').checked,
+      connectors: document.getElementById('migConnectors').checked,
+      settings: true, snapshot: true,
+      mode: (document.querySelector('input[name="migMode"]:checked')||{}).value || 'move'
+    };
+  }
+  closeMig();
+  await doSwitch(ctx.file, ctx.nick, null, mig);
+}
+
+async function doSwitch(file, nick, btn, mig){
+  if(btn){ btn.disabled=true; btn.textContent='切换中…'; }
   try{
-    const data=await post(API.switch,{name:file});
+    const body = mig ? {name:file, migrate:mig} : {name:file};
+    const data=await post(API.switch, body);
     toast(data.message, data.ok?'ok':'err');
+    // 迁移的逐项结果与警告单独提示，别混在主消息里被忽略
+    const m=data.migration;
+    if(m){
+      (m.steps||[]).filter(function(s){return !s.ok;}).forEach(function(s){
+        toast('迁移·'+s.name+' 失败：'+s.detail,'err'); });
+      (m.warnings||[]).forEach(function(x){ toast(x,'err'); });
+    }
     if(data.ok){
-      btn.disabled=false; btn.textContent='当前账号';
+      if(btn){ btn.disabled=false; btn.textContent='当前账号'; }
       // 续期只动本地账号库文件，不必等客户端采纳，切完立即发
       try{
         const sd=await post(API.refresh,{file:file});
         toast(sd.message, sd.ok?'ok':'err');
       }catch(e){}
       await settleAfterSwitch(nick);
-    }
-    else { btn.disabled=false; btn.textContent='切换到该账号'; }
+    } else if(btn){ btn.disabled=false; btn.textContent='切换到该账号'; }
   }catch(err){
     toast('请求失败：'+err.message,'err');
-    btn.disabled=false; btn.textContent='切换到该账号';
+    if(btn){ btn.disabled=false; btn.textContent='切换到该账号'; }
   }
-});
+}
 
 function currentMatches(nick){
   const c = lastCurrent && lastCurrent[0];

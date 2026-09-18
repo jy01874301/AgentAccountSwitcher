@@ -20,6 +20,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -303,6 +304,22 @@ def safe_unlink(path):
     except KeyboardInterrupt:
         raise
     except BaseException:  # noqa: BLE001
+        return False
+
+
+def safe_rmtree(path):
+    """尽力递归删除一个目录，绝不抛出。语义同 safe_unlink。"""
+    p = Path(path)
+    if not p.exists():
+        return True
+    try:
+        shutil.rmtree(p)
+        return True
+    except FileNotFoundError:
+        return True
+    except KeyboardInterrupt:
+        raise
+    except BaseException:  # noqa: BLE001  含安全删除 shim 的 SystemExit
         return False
 
 

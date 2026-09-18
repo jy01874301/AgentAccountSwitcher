@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -298,7 +299,7 @@ def main():
                 info = desk / "workbuddy-desktop.info"
                 info.write_text(original, encoding="utf-8")
                 wb.DESKTOP_DIR, wb.DESKTOP_INFO = desk, info
-                ok, msg = wb.switch_account(target_name)
+                ok, msg, _mig = wb.switch_account(target_name)
                 acc_now = wb.wb.session_from_info_file(info) if info.is_file() else None
                 backups = [p for p in desk.glob("*.info") if p.name != "workbuddy-desktop.info"]
                 check("切号成功（临时目录）", ok is True, msg[:80])
@@ -315,7 +316,7 @@ def main():
                 info.write_text(original, encoding="utf-8")
                 info.with_suffix(".info.tmp").mkdir()      # 让 tmp.write_text 必失败
                 wb.DESKTOP_DIR, wb.DESKTOP_INFO = desk, info
-                ok, msg = wb.switch_account(target_name)
+                ok, msg, _mig = wb.switch_account(target_name)
                 check("写入失败时返回失败", ok is False, msg[:80])
                 check("失败信息含回滚说明", "已回滚为原登录态" in msg, msg[:110])
                 check("正式文件已恢复原内容",
@@ -690,7 +691,7 @@ def main():
                 wb.DESKTOP_DIR, wb.DESKTOP_INFO = desk, info
                 common.prune_backups = _boom_prune
                 try:
-                    ok, msg = wb.switch_account(Path(usable2[0]["path"]).name)
+                    ok, msg, _mig = wb.switch_account(Path(usable2[0]["path"]).name)
                 finally:
                     common.prune_backups = real_prune
                 check("裁剪备份抛 SystemExit 时切号仍然成功", ok is True, msg[:80])
@@ -716,6 +717,214 @@ def main():
                   names == ["workbuddy-desktop.info"], names)
     finally:
         wb.DESKTOP_DIR, wb.DESKTOP_INFO = orig_dir, orig_info
+
+    print("\n== 14. 账号数据迁移（全程在临时目录，不碰真实数据）==")
+    mig = wb.migration
+    OLD = "aaaaaaaa-1111-2222-3333-444444444444"
+    NEW = "bbbbbbbb-5555-6666-7777-888888888888"
+    SID1 = "11111111-aaaa-bbbb-cccc-000000000001"
+    SID2 = "22222222-aaaa-bbbb-cccc-000000000002"
+    SIDW = "33333333-aaaa-bbbb-cccc-000000000003"
+
+    # --- 14a. connectors 校验值算法：必须能复现真实文件里的 userIdCheck ---
+    # computeCheck = base64(sha256(uid + salt)[:16])，无密钥。实测 4/4 复现一致。
+    import base64 as _b64
+    import hashlib as _hash
+    _salt = bytes(range(16))
+    _expect = _b64.b64encode(_hash.sha256(b"u1" + _salt).digest()[:16]).decode()
+    check("computeCheck 与客户端算法一致（sha256(uid+salt)[:16]）",
+          mig.compute_check(b"u1", _salt) == _expect, _expect)
+    real_conn = mig.find_data_root(wb.current_uid()) / "connectors"
+    hit = miss_ = 0
+    if real_conn.is_dir():
+        for d in real_conn.iterdir():
+            f = d / "connector-states.json"
+            if not f.is_file():
+                continue
+            try:
+                j = json.loads(f.read_text(encoding="utf-8"))
+                enc = j.get("encryption") or {}
+                salt = _b64.b64decode(enc["salt"])
+                # 三段式：<uid>|<企业简称>|<类型>，取第一段才是 uid
+                uid = (j.get("accountIdentityKey") or "").split("|")[0]
+                n = len(_b64.b64decode(enc["userIdCheck"])) or 16
+                if mig.compute_check(uid.encode(), salt, n) == enc["userIdCheck"]:
+                    hit += 1
+                else:
+                    miss_ += 1
+            except Exception:  # noqa: BLE001
+                miss_ += 1
+    check("真实 connectors 的 userIdCheck 全部可复现（读只）",
+          miss_ == 0, "命中 %d / 不一致 %d" % (hit, miss_))
+
+    # --- 14b. 数据目录判定：本机有两个结构相同的客户端目录，必须挑对 ---
+    real_root = mig.find_data_root(wb.current_uid())
+    check("find_data_root 按 uid 选中正确目录（不是靠环境变量猜）",
+          real_root.is_dir() and (real_root / "workbuddy.db").is_file(), str(real_root))
+    ai_root = mig.find_data_root("7aac45de-1d55-436c-b779-0317b093c580")
+    check("不同 uid 解析到不同数据目录",
+          str(ai_root) != str(real_root) or not (ai_root / "workbuddy.db").is_file(),
+          "%s vs %s" % (real_root, ai_root))
+
+    # --- 14c. 进程检测不能静默失效 ---
+    procs = mig.running_clients()
+    check("running_clients 不抛异常且返回 None 或列表",
+          procs is None or isinstance(procs, list), procs)
+    check("running_clients 精确匹配（本机有客户端时应检出）",
+          procs is None or (len(procs) > 0) == (os.name == "nt"), procs)
+
+    # --- 14d. 造一个临时数据目录，跑完整迁移 + 校验 + 回滚 ---
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        mig.ROOT_OVERRIDE = tmp
+        try:
+            con = sqlite3.connect(str(tmp / "workbuddy.db"))
+            con.executescript("""
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT NOT NULL, user_id TEXT NOT NULL,
+                  title TEXT, status TEXT NOT NULL DEFAULT 'Pending', created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL, deleted_at INTEGER);
+                CREATE TABLE automations (id TEXT PRIMARY KEY, name TEXT, owner_user_id TEXT,
+                  owner_status TEXT NOT NULL DEFAULT 'legacy_unassigned', deleted_at INTEGER);
+                CREATE TABLE automation_delivery_outbox (id TEXT PRIMARY KEY, owner_user_id TEXT);
+                CREATE TABLE session_usage (session_id TEXT PRIMARY KEY, used INTEGER, size INTEGER);
+            """)
+            con.executemany("INSERT INTO sessions (id,cwd,user_id,title,status,created_at,updated_at) "
+                            "VALUES (?,?,?,?,?,1,1)",
+                            [(SID1, r"D:\proj", OLD, "A", "completed"),
+                             (SID2, r"D:\proj", OLD, "B", "completed"),
+                             (SIDW, r"D:\proj", OLD, "运行中", "working")])
+            con.execute("INSERT INTO automations (id,name,owner_user_id) VALUES ('a1','任务',?)", (OLD,))
+            con.commit()
+            con.close()
+            (tmp / "projects/d-proj").mkdir(parents=True)
+            for s in (SID1, SID2, SIDW):
+                (tmp / "projects/d-proj" / (s + ".jsonl")).write_text('{"t":1}\n', encoding="utf-8")
+            (tmp / "memory").mkdir()
+            (tmp / "memory" / (OLD + "_memory.md")).write_text("# 1\n旧记忆\n", encoding="utf-8")
+            sd = tmp / "storage" / ("user-%s-personal" % OLD) / "scoped" / "x"
+            sd.mkdir(parents=True)
+            (sd / "kv.json").write_text('{"pinned":[]}', encoding="utf-8")
+            (tmp / "storage/skeleton").mkdir(parents=True)
+            (tmp / "storage/skeleton/account-snapshot.json").write_text(
+                json.dumps({"primary": {"uid": OLD, "nickname": "旧", "savedAt": 1}}), encoding="utf-8")
+            cdir = tmp / "connectors" / OLD
+            cdir.mkdir(parents=True)
+            (cdir / "connector-states.json").write_text(json.dumps({
+                "encryption": {"salt": _b64.b64encode(_salt).decode(),
+                               "userIdCheck": mig.compute_check(OLD.encode(), _salt),
+                               "keyCheck": "AAAAAAAAAAAAAAAAAAAAAA=="},
+                "connectors": {"k": "cipher"},
+                "accountIdentityKey": OLD + "||enterprise"}, ensure_ascii=False), encoding="utf-8")
+            (tmp / "settings.json").write_text(
+                json.dumps({"claw": {"users": {OLD: {"channels": {}}}}}), encoding="utf-8")
+
+            # 扫描
+            pv = mig.preview(OLD, NEW)
+            keys = [i["key"] for i in pv["items"]]
+            check("预览列出会话/记忆/设置/连接器/渠道/快照",
+                  set(keys) >= {"sessions", "memory", "storage", "connectors", "settings", "snapshot"},
+                  keys)
+            check("预览标出运行中的会话会跳过",
+                  any("正在运行" in (i.get("note") or "") for i in pv["items"]), pv["items"])
+            check("预览说明正文不用搬", "无需搬运" in (pv.get("projects_note") or ""), "")
+
+            # 迁移
+            res = mig.migrate(OLD, NEW, {"mode": "move", "allow_client_running": True})
+            check("迁移成功", res["ok"] is True, res["message"][:110])
+            check("迁移后未回滚", res["rolled_back"] is False)
+            con = sqlite3.connect("file:%s?mode=ro" % (tmp / "workbuddy.db").as_posix(), uri=True)
+
+            def cnt(sql, *a):
+                return con.execute(sql, a).fetchone()[0]
+
+            check("会话归属已改到新账号（2 个）", cnt("SELECT COUNT(*) FROM sessions WHERE user_id=?", NEW) == 2)
+            check("运行中的会话仍留在旧账号（不迁）",
+                  cnt("SELECT COUNT(*) FROM sessions WHERE user_id=? AND status='working'", OLD) == 1)
+            check("定时任务归属已改", cnt("SELECT COUNT(*) FROM automations WHERE owner_user_id=?", NEW) == 1)
+            con.close()
+            check("记忆已改名到新账号",
+                  (tmp / "memory" / (NEW + "_memory.md")).is_file()
+                  and not (tmp / "memory" / (OLD + "_memory.md")).is_file())
+            check("账号级设置目录已改名", (tmp / "storage" / ("user-%s-personal" % NEW)).is_dir())
+            cj = json.loads((tmp / "connectors" / NEW / "connector-states.json").read_text(encoding="utf-8"))
+            check("连接器 userIdCheck 已按新 uid 重算（漏做会触发删配置）",
+                  cj["encryption"]["userIdCheck"] == mig.compute_check(NEW.encode(), _salt),
+                  cj["encryption"]["userIdCheck"])
+            check("连接器 keyCheck 未被动（与 uid 无关）",
+                  cj["encryption"]["keyCheck"] == "AAAAAAAAAAAAAAAAAAAAAA==")
+            check("连接器加密内容原样保留", cj["connectors"] == {"k": "cipher"})
+            check("settings.json 账号键已改名",
+                  NEW in json.loads((tmp / "settings.json").read_text(encoding="utf-8"))["claw"]["users"])
+            check("账号快照 uid 已更新",
+                  json.loads((tmp / "storage/skeleton/account-snapshot.json").read_text(
+                      encoding="utf-8"))["primary"]["uid"] == NEW)
+            check("对话正文仍在原地（不搬）",
+                  (tmp / "projects/d-proj" / (SID1 + ".jsonl")).is_file())
+            check("迁移前做了 db 快照",
+                  (Path(res["backup_dir"]) / "workbuddy.db").is_file())
+
+            # 回滚：注入写 settings 失败
+            real_wt = Path.write_text
+
+            def _boom(self, *a, **k):
+                if self.name == "settings.json.tmp":
+                    raise OSError("注入的写盘失败")
+                return real_wt(self, *a, **k)
+
+            Path.write_text = _boom
+            try:
+                res2 = mig.migrate(NEW, OLD, {"mode": "move", "allow_client_running": True})
+            finally:
+                Path.write_text = real_wt
+            check("中途失败时如实报错且标记已回滚",
+                  res2["ok"] is False and res2["rolled_back"] is True, res2["message"][:110])
+            con = sqlite3.connect("file:%s?mode=ro" % (tmp / "workbuddy.db").as_posix(), uri=True)
+            check("回滚后数据库归属完整还原",
+                  con.execute("SELECT COUNT(*) FROM sessions WHERE user_id=?", (NEW,)).fetchone()[0] == 2
+                  and con.execute("SELECT COUNT(*) FROM sessions WHERE user_id=?", (OLD,)).fetchone()[0] == 1)
+            con.close()
+            # 回滚的目标是「第 2 次迁移之前」的状态：那时连接器在 NEW 名下（第 1 次迁移搬过去的），
+            # 所以回滚后应该是 NEW 在、OLD 不在。
+            check("回滚后连接器目录退回原处",
+                  (tmp / "connectors" / NEW).is_dir() and not (tmp / "connectors" / OLD).is_dir(),
+                  sorted(p.name for p in (tmp / "connectors").iterdir()))
+
+            # 客户端在跑时应拒绝迁移
+            real_rc = mig.running_clients
+            mig.running_clients = lambda: ["workbuddyai.exe"]
+            try:
+                res3 = mig.migrate(NEW, OLD, {"mode": "move"})
+            finally:
+                mig.running_clients = real_rc
+            check("检测到客户端在跑时拒绝迁移", res3["ok"] is False and "退出" in res3["message"],
+                  res3["message"][:90])
+        finally:
+            mig.ROOT_OVERRIDE = None
+
+    # --- 14e. 接口与模板 ---
+    srv3, port3 = common.bind_server(wb.Handler, 8951)
+    threading.Thread(target=srv3.serve_forever, daemon=True).start()
+    try:
+        time.sleep(0.25)
+        st, raw = call(port3, "/api/migrate-preview?name=nope.info")
+        check("[wb] GET /api/migrate-preview 可用", st == 200 and json.loads(raw).get("ok") is False, st)
+        st, raw = call(port3, "/")
+        html = raw.decode("utf-8", "replace")
+        check("[wb] 迁移弹框已注入", 'id="migModal"' in html and 'migrate: "1"' in html, st)
+        check("[wb] 迁移预览接口已接上", "/api/migrate-preview" in html, "")
+        check("[wb] 「仅切换」出口保留", "migConfirm(false)" in html, "")
+        check("[wb] 客户端在跑时禁用「切换并迁移」按钮",
+              "migGo').disabled = blocked" in html or "migGo').disabled=blocked" in html, "")
+    finally:
+        srv3.shutdown()
+        srv3.server_close()
+    tpl = (BIN / "ui_template.html").read_text(encoding="utf-8")
+    for label, ctx in (("[wb]", wb.Handler.UI_CONTEXT), ("[tw]", tw.Handler.UI_CONTEXT)):
+        rendered = common.render_template(tpl, ctx).decode("utf-8")
+        left = sorted(set(re.findall(r"\{\{[A-Za-z0-9_]+\}\}", rendered)))
+        check("%s MIGRATE 占位符已配（无残留）" % label, not left, left)
+    check("[tw] 迁移能力关闭时隐藏弹框",
+          'migrate: ""' in common.render_template(tpl, tw.Handler.UI_CONTEXT).decode("utf-8"), "")
 
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0

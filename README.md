@@ -75,6 +75,58 @@ WorkBuddy 桌面端的本地登录态保存在：
 > 那边一写文件就会把"当前账号"顶掉，页面显示成别人的账号、切换按钮也永远变不成
 > "当前账号"，看起来像切换失败。
 
+### 切号时迁移「任务与项目」（可选）
+
+点「切换到该账号」时，如果当前账号名下**有可迁移的本地数据**，会先弹一个确认框，
+让用户决定是否把数据一并带到新账号。完整设计见 `DESIGN_account_migration.md`。
+
+**核心事实：不需要搬对话正文。** 正文按「工作目录 + 会话ID」存在
+`<数据目录>/projects/<项目>/<会话ID>.jsonl`，与账号无关；真正账号级的只有几处归属键。
+所以迁移 = **改归属**，一条 `UPDATE` 加几处目录改名，毫秒级。
+
+**必须先完全退出 WorkBuddy 客户端**（硬前提）。检测到客户端进程时后端会直接拒绝，
+弹框上的「切换并迁移」也会置灰 —— 因为客户端在跑时数据库与本地存储会被内存态写回。
+
+弹框里的选项与默认值：
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| 会话与任务 | 开 | 改 `sessions.user_id`；`status='working'` 的会话**跳过**（正在写，改了会撕裂） |
+| 账号记忆 | 开 | `memory/<uid>_memory.md`；新账号已有则按日期分节**合并** |
+| 账号级设置 | 开 | `storage/user-<uid>-<企业简称或个人>-personal/`；按键粒度合并，目标侧优先 |
+| 连接器状态 | 开 | `connectors/<uid>/`；**必须重算 `userIdCheck`**，否则客户端会判定"文件不属于当前账号"并**删掉它** |
+| 渠道配置 / 账号快照 | 固定开 | `settings.json` 的 `claw.users.<uid>`、`storage/skeleton/account-snapshot.json` |
+| 迁移方式 | **移动** | 改归属到新账号；另有「共享」= 置空 `user_id`，两个账号都能看到并继续（见下） |
+
+**「移动」vs「共享」**：`sessions` 的可见性谓词是 `(user_id = ? OR user_id = '')`，
+所以**置空 `user_id` 会让所有账号都看得到同一个会话**，且写的是同一份 jsonl —— 不会分叉。
+这适合"两个账号都要继续同一个任务"的场景。注意这个语义**只对 `sessions` 成立**；
+`automations` 的空归属是 fail-closed 隐藏，语义相反。
+
+**安全设计**：
+
+- 动手前用 **SQLite Backup API** 做一致性快照（有 WAL 时裸 copy 会得到损坏的快照，
+  回滚就无从谈起），另有文件快照；
+- 每一步记进 `.migration-backup/<时间戳>/manifest.json`，失败按它**反向回滚**；
+- 回滚也失败就**保留现场**并在错误里给出路径，不静默吞掉；
+- 迁移**先切号后迁移**：迁移失败时用户至少已经在新账号上，不会出现
+  "数据已归新账号、人却还登着旧账号"的更糟状态；
+- 成功后只保留最近 3 份备份（里面含完整对话库快照）。
+
+> ⚠️ 本机存在**两个结构完全相同的客户端数据目录**：
+> `~/.workbuddy/`（= `workbuddy-desktop.info`，切换器管的）与
+> `~/.workbuddy-ai/`（= `workbuddy-desktop-ai.info`，AI 端）。
+> 迁移**按数据自身的归属标识**选目录（`account-snapshot.json` 的 uid → 库里有没有该 uid 的会话），
+> **不信任 `WORKBUDDY_CONFIG_DIR`** —— 照抄它会迁移错目录，那是最坏的一类 bug。
+
+命令行等价入口：
+
+```bash
+python wb_ui_server.py --migrate-preview workbuddy-jhan.info   # 只读扫描，看要迁多少
+python wb_ui_server.py --switch workbuddy-jhan.info --migrate  # 切号并迁移（默认 move）
+python wb_ui_server.py --switch x.info --migrate --migrate-mode share
+```
+
 ### ⚠️ 安全删除被拒会让请求"凭空消失"（已修）
 
 这台机器的 Python 被注入了 WorkBuddy CLI 的**安全删除 shim**（`sitecustomize`）：任何删除

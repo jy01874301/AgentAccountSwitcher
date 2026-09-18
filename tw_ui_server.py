@@ -549,6 +549,7 @@ class Handler(common.BaseHandler):
         "CMD": "trae_switcher.cmd",
         "CREDITS": "",             # Trae 侧无 /api/credits，置空隐藏积分明细与「刷新积分」
         "CHECKIN": "",             # Trae 侧无 /api/checkin，置空隐藏签到状态与「一键签到」
+        "MIGRATE": "",             # Trae 侧无账号数据迁移能力，置空隐藏迁移确认框
     }
     WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add",
                        "/api/refresh-all")
