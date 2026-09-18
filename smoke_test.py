@@ -913,8 +913,12 @@ def main():
         check("[wb] 迁移弹框已注入", 'id="migModal"' in html and 'migrate: "1"' in html, st)
         check("[wb] 迁移预览接口已接上", "/api/migrate-preview" in html, "")
         check("[wb] 「仅切换」出口保留", "migConfirm(false)" in html, "")
+        # 用语义片段而不是写死的整行：之前断言写死了 "migGo').disabled = blocked"，
+        # 后来把代码改成先取变量再赋值，断言就假失败了。
         check("[wb] 客户端在跑时禁用「切换并迁移」按钮",
-              "migGo').disabled = blocked" in html or "migGo').disabled=blocked" in html, "")
+              "go.disabled = blocked" in html and "const go = document.getElementById('migGo')" in html, "")
+        check("[wb] 置灰时给出可操作的原因",
+              "请先完全退出 WorkBuddy 客户端再迁移" in html, "")
     finally:
         srv3.shutdown()
         srv3.server_close()
