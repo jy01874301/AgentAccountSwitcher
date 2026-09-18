@@ -127,6 +127,53 @@ python wb_ui_server.py --switch workbuddy-jhan.info --migrate  # 切号并迁移
 python wb_ui_server.py --switch x.info --migrate --migrate-mode share
 ```
 
+### 客户端在运行时的行为与排查
+
+**先明确一点：切号本身在客户端运行时是正常的。** 实测（客户端 12 个进程在跑）连续
+切 4 次全部 `HTTP 200`、0.01–0.03s，且客户端**不会回写** `workbuddy-desktop.info`
+（观察 5 秒 mtime 无变化）。
+
+**被挡住的是「迁移」，不是切号** —— 这是设计使然：
+
+| 环节 | 客户端在跑时 | 为什么 |
+|---|---|---|
+| 切号 | ✅ 正常 | 只替换一个文件；客户端有 watcher，会 reconcile |
+| 续期 | ✅ 正常 | 只动本地账号库文件 |
+| **迁移** | ❌ **拒绝** | 见下 |
+
+迁移被拒的四个理由：
+
+1. 客户端持有数据库连接与**内存态**，改完会被写回；
+2. `app/session/Local Storage/leveldb/` 被 Chromium **文件锁**占用，改不了；
+3. `sessions/<pid>.json` 是**进程租约**，会被覆盖；
+4. `status='working'` 的会话正在追加写 `.jsonl`，改了会撕裂。
+
+守卫在**任何写操作之前**中止（实测：连 `.migration-backup/` 目录都不会创建）。
+
+#### 切号真的失败时，按这个顺序排查
+
+| # | 可能原因 | 症状 | 怎么确认 | 怎么解决 |
+|---|---|---|---|---|
+| 1 | **文件被占用**（杀软 / 索引器 / 客户端持有句柄） | 提示"轮换旧登录态失败"/"写入新登录态失败"，带 `WinError 5/32` | `logs/switcher.log` 的 FAIL 行（异常现在也会写审计） | 退出客户端后重试；把 auth 目录加入杀软白名单 |
+| 2 | **写后自校验竞争**：客户端 reconcile 时回写，我们读到旧账号 | 提示"写入后校验未通过：桌面端当前登录态仍为「X」" | 连续切两次看是否复现；看 `workbuddy-desktop.info` 的 mtime 是否被外部改动 | 重试一次；若稳定复现，退出客户端再切 |
+| 3 | **accessToken 不完整**（粘贴时被截断） | 提示"accessToken 不完整…切换后必然 401" | 列表里该账号标为"不可用" | 重新从客户端导出完整的 `.info` |
+| 4 | **一次性令牌不匹配** | 红 toast「请求失败：HTTP 401」 | 页面是从**另一个实例**加载的（见下） | 关掉多余实例，刷新页面 |
+| 5 | **跑着旧代码的实例** | 功能缺失或行为不符预期 | `curl "http://127.0.0.1:8765/api/migrate-preview?name=x"` —— 返回 404 就是旧代码 | 关掉它重新启动 |
+| 6 | **端口被别的程序占用**，服务顺延到 8766 | 打开的页面和预期不符 | `netstat -ano \| findstr 876` | 见 `DESIGN_single_instance.md` |
+
+#### 一次快速体检
+
+```bash
+curl -s "http://127.0.0.1:8765/api/current"          # 当前账号对不对
+curl -s "http://127.0.0.1:8765/api/migrate-preview?name=x"  # 404 = 旧代码
+tail -20 logs/switcher.log                            # 失败原因
+ls -la "%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth" | grep workbuddy-desktop
+```
+
+> ⚠️ **同一时刻只应有一个实例**。当前**没有**单实例保护，双击两次会静默起第二个
+> （实测 8765 + 8766 并存），第二个可能跑着不同版本的代码。
+> 设计与验证清单见 `DESIGN_single_instance.md`。
+
 ### ⚠️ 安全删除被拒会让请求"凭空消失"（已修）
 
 这台机器的 Python 被注入了 WorkBuddy CLI 的**安全删除 shim**（`sitecustomize`）：任何删除
