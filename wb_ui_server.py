@@ -131,6 +131,22 @@ def list_accounts():
     return out
 
 
+def _mtime_with_retry(path, tries=3, delay=0.05):
+    """取文件 mtime，被杀软/索引器短暂占用时重试几次。
+
+    Windows 上刚写完的文件可能被以独占方式持有句柄，此时 `stat()` 抛
+    `PermissionError [WinError 5]`。这与 account_migration._replace 是同一类坑
+    —— 那边靠重试解决，这边也一样。全部失败返回 None，由调用方决定怎么办。
+    """
+    for i in range(int(tries)):
+        try:
+            return Path(path).stat().st_mtime
+        except OSError:
+            if i + 1 < int(tries):
+                time.sleep(delay * (i + 1))
+    return None
+
+
 def current_account():
     """识别 WorkBuddy 桌面端当前账号。
 
@@ -141,6 +157,10 @@ def current_account():
     """
     entries = []
     for f in DESKTOP_DIR.glob("*.info"):
+      # 整个条目包在 try 里：一个文件读不到（被杀软/索引器/客户端 watcher 占用）
+      # 不该让整张表、乃至整个切号流程 500。以前 f.stat() 是裸的，
+      # 实测因此偶发 PermissionError [WinError 5]（2 天 11 次，见 AUDIT_2026-09-19.md）。
+      try:
         root_id, is_backup = wb.split_info_name(f.name)
         if not root_id:
             continue
@@ -156,6 +176,15 @@ def current_account():
         acc = wb.session_from_info_file(f)
         # token_source 让「当前账号」也能显示通道标签，和账号列表里的一致
         raw_at = ((_read_info(f) or {}).get("auth") or {}).get("accessToken")
+        mtime = _mtime_with_retry(f)
+        if mtime is None:
+            # 一直被占用。**不能直接丢掉**：正式文件正常情况下就是最新的那个，
+            # 丢掉它会让一个旧备份顶上来当"当前账号"，页面上就显示成别人的账号了。
+            # 所以给正式文件一个"现在"的兜底 mtime（必然大于所有已有文件）让它保持第一，
+            # 备份则给 0 排到最后。
+            # 注意不能用 float("inf")：mtime 会进 JSON，Infinity 不是合法 JSON，
+            # 浏览器 JSON.parse 会直接抛错。
+            mtime = time.time() if f.name == DESKTOP_ROOT_ID + ".info" else 0.0
         entries.append({
             "file": f.name,
             "ok": bool(acc),
@@ -164,8 +193,11 @@ def current_account():
             "expires_at": acc["expires_at"].isoformat() if acc and acc["expires_at"] else None,
             "token_source": common.token_source(raw_at) if acc else "",
             "is_backup": bool(is_backup),
-            "mtime": f.stat().st_mtime,
+            "mtime": mtime,
         })
+      except OSError:
+        # 任何一步的文件层失败都只跳过这一个条目，绝不冒到 HTTP 层
+        continue
     # 最新修改的会话视为当前（正式写在备份之后，通常就是最新）
     entries.sort(key=lambda x: x["mtime"], reverse=True)
     for i, e in enumerate(entries):
@@ -188,7 +220,7 @@ def _restore_backup(backup):
     if not src.exists():
         return ""
     try:
-        src.replace(DESKTOP_INFO)
+        common.replace_with_retry(src, DESKTOP_INFO)
         return "；已回滚为原登录态"
     except OSError:
         return ("；回滚也失败，原登录态仍在备份 %s，可手工改名回 workbuddy-desktop.info"
@@ -225,8 +257,8 @@ def migrate_preview(target_name):
     data = migration.preview(old_uid, new_uid)
     data["target_file"] = norm
     data["target_nickname"] = (wb.session_from_info_file(src) or {}).get("nickname") or norm
-    data["needed"] = bool(old_uid and old_uid != new_uid
-                          and (data.get("items") or data.get("conflicts")))
+    # needed 由 migration.preview() 给出（见那边的注释），这里不再重算 ——
+    # 同一个值算两遍，将来改了一处忘了另一处就会不一致。
     return data
 
 
@@ -452,7 +484,7 @@ def switch_account(target_name, migrate=None):
         if DESKTOP_INFO.exists():
             backup = DESKTOP_DIR / ("workbuddy-desktop.%s.%d.%s.info" % (ts, pid, marker))
             try:
-                DESKTOP_INFO.replace(backup)
+                common.replace_with_retry(DESKTOP_INFO, backup)
             except OSError as e:
                 return False, "轮换旧登录态失败：%s" % common.scrub(e), None
 
@@ -461,7 +493,7 @@ def switch_account(target_name, migrate=None):
         tmp = DESKTOP_INFO.with_suffix(".info.tmp")
         try:
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(DESKTOP_INFO)
+            common.replace_with_retry(tmp, DESKTOP_INFO)
         except OSError as e:
             try:
                 tmp.unlink()
@@ -821,7 +853,11 @@ def checkin_snapshot(force=False):
     payload = {
         "ok": True,
         "accounts": items,
+        # checked = 今日**已签到**数；queried = **成功查询**数。
+        # 两者语义不同，都要有。补 queried 是为了与 credits_snapshot 对齐
+        # —— 那个接口一直有 queried，checkin 缺了它（见 AUDIT_2026-09-19.md 建议 3）。
         "checked": sum(1 for i in items if i.get("checked_in")),
+        "queried": sum(1 for i in items if i.get("ok")),
         "total": len(items),
         "ts": datetime.datetime.now().strftime("%H:%M:%S"),
         "cached": False,
@@ -1113,7 +1149,8 @@ class Handler(common.BaseHandler):
         "ACCEPT": ".info,application/json",
         "FILE_LABEL": "账号配置文件（.info）",
         "ADD_HINT": "点击展开，选择文件或粘贴该账号的 .info 登录态",
-        "EMPTY_HINT": "请把 WorkBuddy 账号登录态文件（<code>workbuddy-*.info</code>）放进去。",
+        "EMPTY_HINT": ("请把 WorkBuddy 账号登录态文件（<code>workbuddy-*.info</code>）放进去。"
+                       "直接运行 exe 时，账号目录要放在 exe 同级（用 .cmd 启动就是本目录）。"),
         "CMD": "workbuddy_switcher.cmd",
         "CREDITS": "1",            # 展示积分明细 + 「刷新积分」按钮（Trae 侧无该接口，置空即隐藏）
         "CHECKIN": "1",            # 展示签到状态 + 「一键签到」按钮（Trae 侧无该接口，置空即隐藏）

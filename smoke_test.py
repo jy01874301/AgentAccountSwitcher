@@ -1369,6 +1369,90 @@ def main():
         finally:
             mig.ROOT_OVERRIDE = None
 
+    print("\n== 19. 审计修复回归（AUDIT_2026-09-19.md）==")
+    src_wb19 = (BIN / "wb_ui_server.py").read_text(encoding="utf-8")
+    src_cm19 = (BIN / "switcher_common.py").read_text(encoding="utf-8")
+
+    # --- BUG A：current_account 的 stat 必须有保护 ---
+    check("BUG A：_mtime_with_retry 存在", "def _mtime_with_retry(" in src_wb19, "")
+    check("BUG A：current_account 的循环包了 try/except OSError",
+          "mtime = _mtime_with_retry(f)" in src_wb19 and "except OSError:" in src_wb19, "")
+    # 只看**代码行**：注释里正好写了"不能用 float('inf')"来说明原因，
+    # 直接全串匹配会命中注释（这个断言第一版就是这么假失败的）
+    _ca19 = [l for l in src_wb19.split("def current_account")[1].split("def ")[0].splitlines()
+             if not l.strip().startswith("#")]
+    check("BUG A：兜底 mtime 不用 inf（Infinity 不是合法 JSON）",
+          not any('float("inf")' in l for l in _ca19), "")
+    _real_stat19 = Path.stat
+
+    def _flaky_stat(fail_times):
+        st19 = {"n": 0}
+
+        def _f(self, *a, **k):
+            if self.name == "workbuddy-desktop.info":
+                st19["n"] += 1
+                if st19["n"] <= fail_times:
+                    raise PermissionError(5, "拒绝访问")
+            return _real_stat19(self, *a, **k)
+        return _f, st19
+    try:
+        Path.stat, _st19 = _flaky_stat(999)
+        _base19 = wb.current_account()
+        check("BUG A：stat 一直失败时 current_account 不抛异常", True, "%d 个条目" % len(_base19))
+        check("BUG A：正式文件仍在列表里（不会被旧备份顶掉）",
+              any(e["file"] == "workbuddy-desktop.info" for e in _base19), "")
+        check("BUG A：current 仍是正式文件",
+              [e for e in _base19 if e.get("current")][0]["file"] == "workbuddy-desktop.info", "")
+        _json19 = json.dumps(_base19)
+        check("BUG A：结果仍是合法 JSON（无 Infinity/NaN）",
+              "Infinity" not in _json19 and "NaN" not in _json19, "")
+        Path.stat, _st19 = _flaky_stat(2)
+        _r19 = wb.current_account()
+        check("BUG A：重试生效（前 2 次失败后仍拿到真实 mtime）", _st19["n"] == 3, "尝试 %d 次" % _st19["n"])
+    finally:
+        Path.stat = _real_stat19
+
+    # --- BUG B：审计动作名走映射 ---
+    check("BUG B：令牌校验失败的审计用映射后的动作名",
+          "self.AUDIT_ACTIONS.get(u.path, u.path), \"\", False, \"令牌校验失败\"" in src_cm19, "")
+
+    # --- 建议 3：两个快照字段对齐 ---
+    _ck19 = wb.checkin_snapshot(False)
+    _cr19 = wb.credits_snapshot(False)
+    check("建议3：checkin 也有 queried（与 credits 对齐）",
+          "queried" in _ck19 and "queried" in _cr19, sorted(set(_ck19) & set(_cr19)))
+    check("建议3：checkin.queried = 成功查询数",
+          _ck19["queried"] == sum(1 for a in _ck19["accounts"] if a.get("ok")), _ck19["queried"])
+    check("建议3：checked（已签到数）语义独立保留",
+          "checked" in _ck19 and _ck19["checked"] == sum(1 for a in _ck19["accounts"] if a.get("checked_in")),
+          _ck19["checked"])
+
+    # --- 建议 4：改名重试统一到 common ---
+    check("建议4：common.replace_with_retry 存在",
+          "def replace_with_retry(" in src_cm19, "")
+    check("建议4：account_migration._replace 委托给它",
+          "return common.replace_with_retry(src, dst" in (BIN / "account_migration.py").read_text(encoding="utf-8"), "")
+    _sw19 = src_wb19.split("def switch_account")[1].split("def ")[0]
+    check("建议4：switch_account 的 3 处改名都用带重试版本",
+          _sw19.count("common.replace_with_retry(") == 2 and "_restore_backup" in src_wb19, "")
+    with tempfile.TemporaryDirectory() as _td19:
+        _t19 = Path(_td19)
+        (_t19 / "a.txt").write_text("x")
+        common.replace_with_retry(_t19 / "a.txt", _t19 / "b.txt")
+        check("建议4：正常改名可用", (_t19 / "b.txt").is_file(), "")
+
+    # --- 建议 5：空态文案含 exe 部署约定 ---
+    check("建议5：wb 空态文案提示 exe 同级",
+          "账号目录要放在 exe 同级" in wb.Handler.UI_CONTEXT["EMPTY_HINT"], "")
+    check("建议5：tw 空态文案提示 exe 同级",
+          "账号目录要放在 exe 同级" in tw.Handler.UI_CONTEXT["EMPTY_HINT"], "")
+
+    # --- 建议 6：needed 只有一个计算点 ---
+    check("建议6：preview() 自己带 needed",
+          's["needed"] = bool(' in (BIN / "account_migration.py").read_text(encoding="utf-8"), "")
+    check("建议6：migrate_preview 不再重算 needed",
+          'data["needed"] = bool(' not in src_wb19, "")
+
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0
 

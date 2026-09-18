@@ -186,22 +186,9 @@ def _now_stamp():
 
 
 def _replace(src, dst, tries=6, delay=0.15):
-    """改名/移动，带重试。
-
-    Windows 上**刚创建的目录/文件**可能被杀软或索引器短暂持有句柄，
-    此时 rename 会间歇性地抛 `WinError 5 拒绝访问` / `WinError 32 正在使用`。
-    实测：同一段迁移代码连跑两次，第二次偶发失败（第一次把文件建出来后杀软正在扫）。
-    这类失败等几十毫秒就过去了，直接重试比让整个迁移回滚划算得多。
-    """
-    last = None
-    for i in range(int(tries)):
-        try:
-            Path(src).replace(dst)
-            return
-        except OSError as e:
-            last = e
-            time.sleep(delay * (i + 1))
-    raise last
+    """改名/移动带重试。实现已提到 `common.replace_with_retry`
+    共用（切号那边也需要），这里保留名字避免改动 7 处调用点。"""
+    return common.replace_with_retry(src, dst, tries=tries, delay=delay)
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +823,11 @@ def preview(old_uid, new_uid):
     s["items"] = items
     s["projects_note"] = ("对话正文按项目目录存放，与账号无关，无需搬运 —— "
                           "本次只调整它在数据库里的归属")
+    # needed 在**这里**算，不留在服务层：否则 preview() 与 migrate_preview()
+    # 同名近名、返回结构却不同，调用方很容易调错那个拿不到 needed 的
+    # （我自己做验证时就先调错了一次，见 AUDIT_2026-09-19.md 建议 6）。
+    s["needed"] = bool(old_uid and new_uid and old_uid != new_uid
+                       and (items or s.get("conflicts")))
     return s
 
 

@@ -362,7 +362,7 @@ def switch_account(file_name):
             tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=4), encoding="utf-8")
             # 优先原子替换；若 Trae 运行时拒绝 rename，退化为原位覆盖写原路径
             try:
-                tmp.replace(sp)
+                common.replace_with_retry(tmp, sp)
             except OSError:
                 sp.write_bytes(tmp.read_bytes())
                 tmp.unlink(missing_ok=True)
@@ -546,7 +546,8 @@ class Handler(common.BaseHandler):
         "ACCEPT": ".json,application/json",
         "FILE_LABEL": "账号的 storage.json（含该账号加密登录态）",
         "ADD_HINT": "点击展开，选择文件或粘贴该账号的 storage.json 内容",
-        "EMPTY_HINT": "请放入该账号的 <code>storage.json</code>。",
+        "EMPTY_HINT": ("请放入该账号的 <code>storage.json</code>。"
+                       "直接运行 exe 时，账号目录要放在 exe 同级（用 .cmd 启动就是本目录）。"),
         "CMD": "trae_switcher.cmd",
         "CREDITS": "",             # Trae 侧无 /api/credits，置空隐藏积分明细与「刷新积分」
         "CHECKIN": "",             # Trae 侧无 /api/checkin，置空隐藏签到状态与「一键签到」

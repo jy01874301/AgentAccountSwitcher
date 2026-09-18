@@ -64,6 +64,28 @@ def audit(log_dir, source, action, target="", ok=True, detail=""):
         pass
 
 
+def replace_with_retry(src, dst, tries=6, delay=0.15):
+    """改名/移动，带重试。返回 None，失败抛最后一个 OSError。
+
+    Windows 上**刚创建/刚写入的文件与目录**可能被杀软或索引器短暂持有句柄，
+    此时 rename 会间歇性地抛 `WinError 5 拒绝访问` / `WinError 32 正在使用`。
+    实测踩过两次：迁移连跑两次第二次偶发失败；切号的写后自校验也偶发 500
+    （见 AUDIT_2026-09-19.md）。这类失败等几十毫秒就过去了，
+    重试比让整个流程回滚划算得多。
+
+    原先只在 account_migration 里有一份，切号那边没有 —— 现在提到这里共用。
+    """
+    last = None
+    for i in range(int(tries)):
+        try:
+            Path(src).replace(dst)
+            return
+        except OSError as e:
+            last = e
+            time.sleep(delay * (i + 1))
+    raise last
+
+
 def new_token():
     """生成一次性访问令牌（仅本次进程有效，不落盘）。"""
     return secrets.token_urlsafe(24)
@@ -1015,7 +1037,10 @@ class BaseHandler(BaseHTTPRequestHandler):
                 return
             if self.TOKEN and self.headers.get("X-Switcher-Token") != self.TOKEN:
                 self._send_json({"ok": False, "message": "缺少或错误的一次性访问令牌"}, 401)
-                audit(self.AUDIT_DIR, self.SOURCE, u.path, "", False, "令牌校验失败")
+                # 用映射后的动作名，别直接写 u.path —— 否则日志里出现的是
+                # [wb] /api/switch 而不是 [wb] switch，按动作统计会分成两组
+                audit(self.AUDIT_DIR, self.SOURCE,
+                      self.AUDIT_ACTIONS.get(u.path, u.path), "", False, "令牌校验失败")
                 return
             code, payload = self.api_post(u, p)
             if self.AUDIT_DIR:
