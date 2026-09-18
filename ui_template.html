@@ -17,6 +17,7 @@
     --green: #3ddc97;
     --amber: #ffc24d;
     --red: #ff5c5c;
+    --red-deep: #c62828;   /* 白字红底的底色：对比度 5.65:1 */
     --radius: 14px;
   }
   * { margin:0; padding:0; box-sizing:border-box; }
@@ -110,8 +111,11 @@
   .btn.active:hover { background:#2fc88a; }
   .btn.ghost { background:transparent; border:1px solid var(--border); color:var(--dim); }
   .btn.ghost:hover { background:var(--card-2); color:var(--text); }
-  .btn.danger { border-color:rgba(255,92,92,.45); color:var(--red); }
-  .btn.danger:hover { background:rgba(255,92,92,.12); border-color:var(--red); color:var(--red); }
+  /* 白字 + 红底。底色用更深的 --red-deep（#c62828）而不是 --red（#ff5c5c）：
+     后者太亮，白字对比度只有 2.99:1，低于 WCAG AA 的 4.5:1；
+     #c62828 是 5.65:1，白字清晰可读。*/
+  .btn.danger { background:var(--red-deep); border-color:var(--red-deep); color:#fff; }
+  .btn.danger:hover { background:#b71c1c; border-color:#b71c1c; color:#fff; }
 
   .toast-wrap { position:fixed; top:22px; left:50%; transform:translateX(-50%); z-index:99; display:flex; flex-direction:column; gap:10px; align-items:center; }
   .toast {
@@ -196,6 +200,7 @@
   .mig-note { background:var(--bg); border:1px solid var(--border); border-left:3px solid var(--accent);
               border-radius:8px; padding:9px 12px; font-size:12px; color:var(--dim); line-height:1.6; margin-bottom:10px; }
   .mig-warn, .mig-conflict { border-radius:8px; padding:9px 12px; font-size:12px; line-height:1.6; margin-bottom:10px; }
+  .mig-info { border-left-color:var(--amber); color:var(--amber); }
   .mig-warn { background:rgba(255,92,92,.08); border:1px solid rgba(255,92,92,.35); color:var(--red); }
   .mig-conflict { background:rgba(255,194,77,.08); border:1px solid rgba(255,194,77,.3); color:var(--amber); }
   .mig-opts { display:grid; grid-template-columns:1fr 1fr; gap:8px 14px; margin-bottom:12px; }
@@ -321,6 +326,7 @@
       <div class="mig-sub" id="migSub"></div>
       <ul class="mig-list" id="migList"></ul>
       <div class="mig-note" id="migNote"></div>
+      <div class="mig-note mig-info" id="migClientNote" style="display:none;"></div>
       <div class="mig-warn" id="migWarn" style="display:none;"></div>
       <div class="mig-conflict" id="migConflict" style="display:none;"></div>
       <div class="mig-opts">
@@ -846,11 +852,16 @@ function renderMigModal(pv, nick){
   const cs=(pv.conflicts||[]);
   cf.style.display = cs.length?'block':'none';
   cf.innerHTML = cs.length ? ('<b>冲突提示</b><br>'+cs.map(esc).join('<br>')) : '';
-  // 客户端在跑时迁移会被后端拒绝，直接禁用「切换并迁移」
-  const blocked = ws.some(function(s){ return s.indexOf('仍在运行')>=0; });
+  // 客户端在跑**不再**禁用按钮：后端会在迁移前自动关掉它、完成后重新打开。
+  // 这里只把这件事说清楚，让用户知道他的客户端会被关一下。
+  const note = document.getElementById('migClientNote');
+  if(note){
+    note.textContent = pv.client_note || '';
+    note.style.display = pv.client_note ? 'block' : 'none';
+  }
   const go = document.getElementById('migGo');
-  go.disabled = blocked;
-  go.title = blocked ? '请先完全退出 WorkBuddy 客户端再迁移（改数据库与本地存储需要客户端不在运行）' : '';
+  go.disabled = false;
+  go.title = '';
   document.getElementById('migModal').style.display='flex';
 }
 

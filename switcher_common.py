@@ -548,6 +548,67 @@ def focus_windows_of(pids, sw_restore=9):
         return False
 
 
+def close_windows_of(pids, wm_close=0x0010):
+    """给指定 pid 的可见窗口发 WM_CLOSE（礼貌关闭），返回发出的条数。
+
+    优先用它而不是直接强杀：客户端能走正常退出流程，不会丢未落盘的状态。
+    """
+    if os.name != "nt" or not pids:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u32.IsWindowVisible.argtypes = [wintypes.HWND]
+        u32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                     wintypes.WPARAM, wintypes.LPARAM]
+        want = set(int(p) for p in pids)
+        sent = []
+        proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in want and u32.IsWindowVisible(hwnd):
+                u32.PostMessageW(hwnd, wm_close, 0, 0)
+                sent.append(hwnd)
+            return True
+
+        u32.EnumWindows(proc(_cb), 0)
+        return len(sent)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def terminate_processes(pids):
+    """强杀指定 pid（礼貌关闭超时后的兜底）。返回成功数。"""
+    if os.name != "nt" or not pids:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        PROCESS_TERMINATE = 0x0001
+        n = 0
+        for pid in pids:
+            h = k32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+            if not h:
+                continue
+            try:
+                if k32.TerminateProcess(h, 1):
+                    n += 1
+            finally:
+                k32.CloseHandle(h)
+        return n
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def probe_instance(port, timeout=0.6, host="127.0.0.1"):
     """探测某个端口上是不是我们自己的实例。
 

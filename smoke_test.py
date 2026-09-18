@@ -919,12 +919,12 @@ def main():
         check("[wb] 迁移弹框已注入", 'id="migModal"' in html and 'migrate: "1"' in html, st)
         check("[wb] 迁移预览接口已接上", "/api/migrate-preview" in html, "")
         check("[wb] 「仅切换」出口保留", "migConfirm(false)" in html, "")
-        # 用语义片段而不是写死的整行：之前断言写死了 "migGo').disabled = blocked"，
-        # 后来把代码改成先取变量再赋值，断言就假失败了。
-        check("[wb] 客户端在跑时禁用「切换并迁移」按钮",
-              "go.disabled = blocked" in html and "const go = document.getElementById('migGo')" in html, "")
-        check("[wb] 置灰时给出可操作的原因",
-              "请先完全退出 WorkBuddy 客户端再迁移" in html, "")
+        # 行为变了：客户端在跑**不再**禁用按钮 —— 后端会在迁移前自动关掉它。
+        # 弹框改为显示一条说明（migClientNote），按钮始终可点。
+        check("[wb] 客户端在跑时不再禁用「切换并迁移」",
+              "go.disabled = false" in html and "go.disabled = blocked" not in html, "")
+        check("[wb] 弹框有「会自动关闭客户端」的说明块",
+              'id="migClientNote"' in html and "pv.client_note" in html, "")
     finally:
         srv3.shutdown()
         srv3.server_close()
@@ -1217,10 +1217,21 @@ def main():
     # --- 17b. 删除按钮红色，但尺寸/形状沿用 ghost（风格一致）---
     check("删除按钮用 danger 类", 'class="btn ghost danger"' in tpl17, "")
     check("删除按钮判定同步改成 danger", "contains('danger')" in tpl17 and "del-btn" not in tpl17, "")
-    check("danger 只改配色、不改尺寸（沿用 .btn.ghost 的 padding/圆角）",
-          ".btn.danger { border-color:rgba(255,92,92,.45); color:var(--red); }" in tpl17, "")
-    check("danger 用主题里的 --red 变量（不是硬编码色值）",
-          ".btn.danger:hover { background:rgba(255,92,92,.12); border-color:var(--red); color:var(--red); }" in tpl17, "")
+    # 白字 + 红底。底色必须是**深红**：--red(#ff5c5c) 上放白字对比度只有 2.99:1，
+    # 低于 WCAG AA 的 4.5:1，用户会看不清。
+    check("danger 是白字红底",
+          ".btn.danger { background:var(--red-deep); border-color:var(--red-deep); color:#fff; }" in tpl17, "")
+    check("danger 的底色用主题变量 --red-deep（不是硬编码）",
+          "--red-deep:" in tpl17 and ".btn.danger:hover { background:#b71c1c;" in tpl17, "")
+    def _lum(hexs):
+        hexs = hexs.lstrip("#")
+        ch = [int(hexs[i:i+2], 16) / 255 for i in (0, 2, 4)]
+        ch = [(c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4) for c in ch]
+        return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+    _c = 1.05 / (_lum("#c62828") + 0.05)
+    check("白字在红底上的对比度达到 WCAG AA（>=4.5:1）", _c >= 4.5, "%.2f:1" % _c)
+    check("对比度：旧底色 --red 反而不达标（说明为什么换深红）",
+          1.05 / (_lum("#ff5c5c") + 0.05) < 4.5, "%.2f:1" % (1.05 / (_lum("#ff5c5c") + 0.05)))
 
     # --- 17c. 列表更窄更矮 ---
     for needle, why in ((".wrap { max-width: 860px;", "整体更窄且贴合行内容"),
@@ -1288,6 +1299,75 @@ def main():
     finally:
         srv5.shutdown()
         srv5.server_close()
+
+    print("\n== 18. 迁移前自动关闭客户端 ==")
+    # ⚠️ 全程用 mock：真实环境下 WorkBuddyAI.exe 就是托管本会话的客户端，
+    # 真去关它会直接把会话干掉。所以这里只替换 common 的进程接口来验证逻辑。
+    src_wb = (BIN / "wb_ui_server.py").read_text(encoding="utf-8")
+    check("switch_account 有「迁移前先关客户端」这一步",
+          "close_client()" in src_wb and "client_was_running" in src_wb, "")
+    check("关闭失败时整体中止（连切号也不做）",
+          'return False, "迁移前无法关闭 WorkBuddy 客户端' in src_wb, "")
+    check("流程结束后按原状恢复客户端（无论迁移成败）",
+          'if client_was_running and migrate and migrate.get("reopen_client", True):' in src_wb, "")
+
+    real_lp = common.list_processes
+    real_cw = common.close_windows_of
+    real_tp = common.terminate_processes
+    try:
+        # 1) 本来就没在跑
+        common.list_processes = lambda: {"explorer.exe": [1]}
+        ok, msg, was = wb.close_client(graceful_wait=0.2, total_wait=0.5)
+        check("close_client：客户端没在跑 → 成功且 was_running=False",
+              ok is True and was is False, msg)
+
+        # 2) 枚举不出来 ≠ 已经关掉了
+        common.list_processes = lambda: None
+        ok, msg, was = wb.close_client(graceful_wait=0.2, total_wait=0.5)
+        check("close_client：枚举失败时如实报错（不当成已关闭）",
+              ok is False and was is False, msg[:70])
+
+        # 3) 一直关不掉 → 先礼后兵，最后如实报失败并给出进程号
+        calls = []
+        common.list_processes = lambda: {wb.CLIENT_PROCESS: [12345]}
+        common.close_windows_of = lambda pids: (calls.append(("close", list(pids))), 1)[1]
+        common.terminate_processes = lambda pids: (calls.append(("kill", list(pids))), len(pids))[1]
+        ok, msg, was = wb.close_client(graceful_wait=0.4, total_wait=0.9)
+        check("close_client：关不掉时如实报失败（含进程号）",
+              ok is False and was is True and "12345" in msg, msg[:80])
+        check("close_client：先发 WM_CLOSE 再强杀（先礼后兵）",
+              [c[0] for c in calls] == ["close", "kill"], calls)
+
+        # 4) 关得掉 → 成功
+        state = {"n": 0}
+
+        def _vanish():
+            state["n"] += 1
+            return {wb.CLIENT_PROCESS: [999]} if state["n"] <= 1 else {}
+
+        common.list_processes = _vanish
+        common.close_windows_of = lambda pids: 1
+        common.terminate_processes = lambda pids: 0
+        ok, msg, was = wb.close_client(graceful_wait=1.2, total_wait=2.0)
+        check("close_client：进程消失后返回成功", ok is True and was is True, msg)
+    finally:
+        common.list_processes = real_lp
+        common.close_windows_of = real_cw
+        common.terminate_processes = real_tp
+
+    # 5) 预览把「会自动关闭」作为说明而不是拦阻
+    with tempfile.TemporaryDirectory() as td:
+        mig.ROOT_OVERRIDE = Path(td)
+        try:
+            pv = mig.scan("aaaaaaaa-0000-0000-0000-000000000001",
+                          "bbbbbbbb-0000-0000-0000-000000000002")
+            check("scan 返回 client_note 字段（供弹框说明用）", "client_note" in pv, sorted(pv)[:8])
+            check("客户端在跑时给出「会自动关闭」的说明，而不是塞进 warnings",
+                  (pv["client_note"] and "自动关闭" in pv["client_note"])
+                  or pv["client_running"] is None,
+                  (pv.get("client_note") or "")[:70])
+        finally:
+            mig.ROOT_OVERRIDE = None
 
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0

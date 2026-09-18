@@ -268,7 +268,7 @@ def scan(old_uid, new_uid):
         "has_memory": False, "storage_dirs": [], "has_connectors": False,
         "snapshot_is_old": False, "settings_key": False,
         "projects": 0, "client_running": running_clients(),
-        "conflicts": [], "warnings": [],
+        "conflicts": [], "warnings": [], "client_note": "",
     }
     if not old_uid or not new_uid:
         out["ok"] = False
@@ -343,8 +343,11 @@ def scan(old_uid, new_uid):
     if out["client_running"] is None:
         out["warnings"].append("无法检测客户端进程，迁移前请自行确认已退出 WorkBuddy")
     elif out["client_running"]:
-        out["warnings"].append("检测到客户端仍在运行（%s），迁移会被拒绝"
-                               % "、".join(out["client_running"]))
+        # 不再当成"警告"：迁移前会自动关掉它（见 switch_account 的第 0 步），
+        # 所以这是**说明**而不是拦阻。前端据此显示提示、不再禁用按钮。
+        out["client_note"] = ("检测到 WorkBuddy 客户端正在运行（%s）。"
+                              "迁移前会自动关闭它，完成后重新打开。"
+                              % "、".join(out["client_running"]))
     return out
 
 

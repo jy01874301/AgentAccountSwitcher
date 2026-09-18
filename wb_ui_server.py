@@ -344,6 +344,46 @@ def open_client():
     return True, "已启动 WorkBuddy 客户端：%s" % exe
 
 
+def close_client(graceful_wait=8.0, total_wait=25.0, log=None):
+    """关闭 WorkBuddy 客户端。**先礼后兵**：先发 WM_CLOSE 让它正常退出，
+    超时再强杀。返回 (ok, message, was_running)。
+
+    - `was_running` 供调用方在流程结束后**恢复原状**（原来在跑就重新打开）。
+    - 检测不出进程时返回 ok=False —— 不能把"不知道"当成"已经关掉了"。
+    """
+    log = log or (lambda *a: None)
+    procs = common.list_processes()
+    if procs is None:
+        return False, "无法枚举进程（tasklist 不可用），请手动退出客户端", False
+    pids = list(procs.get(CLIENT_PROCESS, []))
+    if not pids:
+        return True, "客户端本来就没在运行", False
+
+    log("       客户端在运行（%d 个进程），先请它正常退出…" % len(pids))
+    common.close_windows_of(pids)
+    deadline = time.time() + graceful_wait
+    while time.time() < deadline:
+        time.sleep(0.4)
+        now = common.list_processes() or {}
+        if not now.get(CLIENT_PROCESS):
+            return True, "客户端已正常退出", True
+
+    left = (common.list_processes() or {}).get(CLIENT_PROCESS) or []
+    log("       正常退出超时，强制结束 %d 个进程…" % len(left))
+    common.terminate_processes(left)
+    deadline = time.time() + max(0.0, total_wait - graceful_wait)
+    while time.time() < deadline:
+        time.sleep(0.4)
+        if not (common.list_processes() or {}).get(CLIENT_PROCESS):
+            return True, "客户端已强制关闭", True
+
+    still = (common.list_processes() or {}).get(CLIENT_PROCESS) or []
+    return (False,
+            "无法关闭客户端（仍有 %d 个进程：%s）。可能被其它用户会话占用或权限不足，"
+            "请手动退出后重试" % (len(still), ", ".join(str(p) for p in still[:3])),
+            True)
+
+
 def switch_account(target_name, migrate=None):
     """把 wb_auth\\<target_name>.info 切换为桌面端正式登录态。
 
@@ -388,6 +428,18 @@ def switch_account(target_name, migrate=None):
         if not common.token_looks_complete((data.get("auth") or {}).get("accessToken")):
             return False, ("目标账号的 accessToken 不完整（疑似粘贴时被截断），切换后必然 401：%s。"
                            "请重新从客户端导出完整的 workbuddy-desktop.info" % target_name), None
+
+        # 0. 要迁移就先关掉客户端。
+        #    放在校验之后、轮换之前：校验失败时不必白关一次；
+        #    关不掉就**整体中止**（连切号也不做）—— 用户点的是"切换并迁移"，
+        #    只切一半会让人以为迁移成功了。
+        client_was_running = False
+        if migrate and migrate.get("enabled", True) and migrate.get("close_client", True):
+            ok_c, msg_c, client_was_running = close_client()
+            if not ok_c:
+                return False, "迁移前无法关闭 WorkBuddy 客户端：%s" % msg_c, None
+            if client_was_running:
+                print("[提示] %s" % msg_c, flush=True)
 
         DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -475,6 +527,12 @@ def switch_account(target_name, migrate=None):
             msg += "；数据迁移完成%s" % extra
         else:
             msg += "；⚠️ 但数据迁移失败：%s" % mig_result.get("message", "")
+
+    # 恢复客户端原状：原来在跑就重新打开（迁移成功时它会直接读新账号的登录态）。
+    # 无论迁移成败都恢复 —— 是我们把它关掉的，就该由我们把它放回去。
+    if client_was_running and migrate and migrate.get("reopen_client", True):
+        ok_o, msg_o = open_client()
+        msg += "；%s" % msg_o
     return True, msg, mig_result
 
 
