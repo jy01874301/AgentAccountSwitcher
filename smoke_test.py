@@ -930,6 +930,154 @@ def main():
     check("[tw] 迁移能力关闭时隐藏弹框",
           'migrate: ""' in common.render_template(tpl, tw.Handler.UI_CONTEXT).decode("utf-8"), "")
 
+    print("\n== 15. 单实例保护（见 DESIGN_single_instance.md）==")
+    # --- 15a. 互斥体语义 ---
+    check("wb 与 tw 的互斥体名不同（否则两个工具会互相挤掉）",
+          common.MUTEX_NAME_WB != common.MUTEX_NAME_TW,
+          (common.MUTEX_NAME_WB, common.MUTEX_NAME_TW))
+    mname = "Local\\WorkBuddySwitcher-smoketest"
+    h1, already1 = common.acquire_single_instance(mname)
+    h2, already2 = common.acquire_single_instance(mname)
+    check("首次获取互斥体 → 可启动", already1 is False, already1)
+    check("同进程再次获取 → 判定已有实例", already2 is True, already2)
+    check("互斥体句柄被模块级持有（防止被 GC 提前回收）",
+          h1 in common._MUTEX_HANDLES and h2 in common._MUTEX_HANDLES, len(common._MUTEX_HANDLES))
+
+    # --- 15b. 身份探测：三种端口状态要能区分 ---
+    # 别人的服务放在前面，我们的紧挨其后 —— 这样"跳过别人的端口找到自己"才可测
+    class _Foreign(common.BaseHandler):
+        APP_NAME = "not_us"          # 也有 /api/ping，但不是我们
+
+        def api_get(self, u):
+            return 404, {"ok": False}
+
+    srv_other, port_other = common.bind_server(_Foreign, 8971)
+    threading.Thread(target=srv_other.serve_forever, daemon=True).start()
+    srv_ours, port_ours = common.bind_server(wb.Handler, 8972)
+    threading.Thread(target=srv_ours.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+    try:
+        info = common.probe_instance(port_ours)
+        check("probe_instance 认出我们的服务", bool(info) and info.get("app") == "wb_switcher",
+              info and {k: info[k] for k in ("app", "source", "pid", "port")})
+        check("/api/ping 带 source / pid / port / version",
+              all(k in (info or {}) for k in ("source", "pid", "port", "version", "started_at")),
+              sorted((info or {}).keys()))
+        check("probe_instance 对空闲端口返回 None", common.probe_instance(8999) is None, "")
+        check("probe_instance 不把别人的服务当成自己",
+              common.probe_instance(port_other) is None, "")
+        got = common.probe_instance_range(port_other, tries=3)
+        check("probe_instance_range 会跳过非我们的端口找到自己",
+              bool(got) and got.get("port") == port_ours, got and got.get("port"))
+        check("OUR_APPS 白名单挡住了别人的 /api/ping",
+              common.probe_instance(port_other) is None
+              and "not_us" not in common.OUR_APPS, common.OUR_APPS)
+
+        # --- 15c. /api/ping 不需要一次性令牌 ---
+        wb.Handler.TOKEN = "secret-token"
+        try:
+            st, raw = call(port_ours, "/api/ping")
+            check("/api/ping 免令牌可访问（探测方拿不到令牌）",
+                  st == 200 and json.loads(raw).get("app") == "wb_switcher", st)
+            st, raw = call(port_ours, "/api/accounts")
+            check("其它 GET 仍受令牌约束之外的正常处理", st == 200, st)
+        finally:
+            wb.Handler.TOKEN = None
+
+        # --- 15d. guard 的三种结果 ---
+        # 同进程起的服务**不该**被当成"另一个实例"（pid 相同），否则自己就把自己挡住
+        act0 = common.single_instance_guard("Local\\WorkBuddySwitcher-probe0-" + str(os.getpid()),
+                                            port_ours, tries=2, wait=0.2,
+                                            default_port=port_ours)[1]
+        check("本进程自己的服务不算另一个实例 → action=start", act0 == "start", act0)
+        act2 = common.single_instance_guard("Local\\WorkBuddySwitcher-probe2-" + str(os.getpid()),
+                                            8990, tries=2, wait=0.2, default_port=8990)[1]
+        check("端口全空闲且无实例 → action=start", act2 == "start", act2)
+        # reuse 必须在**另一个进程**里才能验：pid 不同的服务才会被认作"已有实例"
+        sub_port = 8981
+        sub_code = (
+            "import sys, threading, time\n"
+            "sys.path.insert(0, r'%s'); sys.path.insert(0, r'%s')\n"
+            "import switcher_common as c, wb_ui_server as wb\n"
+            "s, p = c.bind_server(wb.Handler, %d)\n"
+            "threading.Thread(target=s.serve_forever, daemon=True).start()\n"
+            "print('up', p, flush=True)\n"
+            "time.sleep(90)\n"
+        ) % (str(BIN), str(BIN.parent / "自动签到"), sub_port)
+        sub = subprocess.Popen([sys.executable, "-c", sub_code],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, encoding="utf-8", errors="replace")
+        try:
+            for _ in range(40):
+                if common.probe_instance(sub_port):
+                    break
+                time.sleep(0.25)
+            live = common.probe_instance(sub_port)
+            check("另一个进程里起了我们的服务（前置条件）",
+                  bool(live) and str(live.get("pid")) != str(os.getpid()),
+                  live and live.get("pid"))
+            act1 = common.single_instance_guard("Local\\WorkBuddySwitcher-probe1-" + str(os.getpid()),
+                                                sub_port, tries=2, wait=0.2,
+                                                default_port=sub_port)[1]
+            check("另一个进程已有我们的实例 → action=reuse", act1 == "reuse", act1)
+        finally:
+            try:
+                sub.terminate()
+                sub.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # --- 15e. 迁移：不得与另一个实例同时进行 ---
+        check("迁移选项里有 allow_other_instance（仅自检/演练用）",
+              "allow_other_instance" in mig.DEFAULT_OPTS, sorted(mig.DEFAULT_OPTS))
+        old_port = mig.INSTANCE_PORT
+        try:
+            # 指向本进程自己的服务 → 不应被当成"另一个实例"
+            mig.INSTANCE_PORT = port_ours
+            check("other_instance 排除掉自己（pid 相同不算）", mig.other_instance() is None,
+                  mig.other_instance())
+            # 指向"别人的服务" → 也不算我们的实例
+            mig.INSTANCE_PORT = port_other
+            check("other_instance 不认别人的服务", mig.other_instance() is None, "")
+            # 伪造一个真·另一个实例
+            real_oi = mig.other_instance
+            mig.other_instance = lambda: {"pid": 999999, "port": 8765, "app": "wb_switcher"}
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    mig.ROOT_OVERRIDE = Path(td)
+                    try:
+                        # allow_client_running=True 是为了走到"另一个实例"那道检查 ——
+                        # 客户端那道在它之前，不放行就短路了，测不到本用例。
+                        r = mig.migrate("aaaaaaaa-0000-0000-0000-000000000009",
+                                        "bbbbbbbb-0000-0000-0000-00000000000a",
+                                        {"mode": "move", "allow_client_running": True})
+                    finally:
+                        mig.ROOT_OVERRIDE = None
+                    check("检测到另一个实例时拒绝迁移",
+                          r["ok"] is False and "另一个切换器实例" in r["message"], r["message"][:90])
+                    check("被拒时不做任何写入（连备份目录都没建）",
+                          not (Path(td) / ".migration-backup").exists(), "")
+            finally:
+                mig.other_instance = real_oi
+        finally:
+            mig.INSTANCE_PORT = old_port
+    finally:
+        for s in (srv_ours, srv_other):
+            s.shutdown()
+            s.server_close()
+
+    # --- 15f. 启动脚本 ---
+    for f, svc in (("workbuddy_switcher.cmd", "wb_ui_server.py"),
+                   ("trae_switcher.cmd", "tw_ui_server.py")):
+        txt = (BIN / f).read_text(encoding="utf-8", errors="replace")
+        check("%s 不再只用 where python 判断（会命中 Store 占位符）" % f,
+              "where python" not in txt and "sys.version_info" in txt, "")
+        check("%s 调用的服务脚本正确" % f, svc in txt, "")
+        check("%s 是纯 ASCII（避免 OEM 代码页乱码）" % f,
+              all(ord(c) < 128 for c in txt), "")
+        check("%s 用 CRLF 换行" % f,
+              (BIN / f).read_bytes().count(b"\r\n") > 5, "")
+
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0
 

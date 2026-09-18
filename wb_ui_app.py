@@ -83,19 +83,71 @@ def _parse_args(argv):
     return headless, port
 
 
+def _show_window(url):
+    """开原生窗口指向 url；没有 WebView 运行库时退回默认浏览器。"""
+    try:
+        import webview
+        webview.create_window(
+            "WorkBuddy 账号切换器",
+            url,
+            width=1180,          # 账号改成列表行（身份 / 积分 / 操作 三段）后需要更宽
+            height=1040,         # 当前账号行 + 积分明细 + 签到，比原先的 780 高不少
+            min_size=(900, 700),
+        )
+        webview.start()
+        return True
+    except Exception as e:  # noqa: BLE001
+        msg = "WebView 启动失败，退回浏览器打开：%s (%s)" % (url, e)
+        print(msg)
+        _log_startup(msg)
+        import webbrowser
+        webbrowser.open(url)
+        return False
+
+
+def _log_startup(msg):
+    """窗口版没有控制台，print 没有去处 —— 落一份日志便于事后排查。"""
+    try:
+        log_dir = BASE_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / "desktop-start.log", "a", encoding="utf-8") as fh:
+            fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
 def main():
     headless, requested = _parse_args(sys.argv[1:])
+
+    # 单实例保护：拿到互斥体才允许起服务。见 DESIGN_single_instance.md。
+    handle, action, info = common.single_instance_guard(
+        common.MUTEX_NAME_WB, requested, tries=common.PORT_TRIES, log=print,
+        default_port=PORT)
+    if action == "reuse":
+        url = "http://127.0.0.1:%d/" % info.get("port", requested)
+        print("[提示] 已有实例在运行（pid %s，端口 %s），直接指向它，不再启动第二个。"
+              % (info.get("pid"), info.get("port")))
+        if info.get("version") and info["version"] != srv.Handler.APP_VERSION:
+            print("[警告] 那个实例的版本是 %r，当前是 %r —— 它可能在跑旧代码。"
+                  % (info.get("version"), srv.Handler.APP_VERSION))
+        if headless:
+            print("       页面地址：%s" % url)
+            return 0
+        _show_window(url)
+        return 0
+    if action == "abort":
+        msg = "已有切换器实例在运行，但在 %d 起的 %d 个端口上都探测不到它。" % (requested, common.PORT_TRIES)
+        print("[错误] " + msg)
+        _log_startup(msg)
+        return 1
+
     server = None
     port = requested
-    # 若端口已被占用（如旧服务仍在运行），直接复用现有服务；否则自动避让到空闲端口
-    if _port_alive(port):
-        pass
-    else:
-        server, port = common.bind_server(srv.Handler, port)
-        # 与"请求的端口"比，而不是与默认端口常量比 —— 否则显式传 --port 时会误报
-        if port != requested:
-            print("[提示] 端口 %d 被占用，已改用 %d" % (requested, port))
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+    server, port = common.bind_server(srv.Handler, port)
+    # 与"请求的端口"比，而不是与默认端口常量比 —— 否则显式传 --port 时会误报
+    if port != requested:
+        print("[提示] 端口 %d 被其它程序占用，已改用 %d（本实例唯一）" % (requested, port))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
     url = "http://127.0.0.1:%d/" % port
 
@@ -113,30 +165,8 @@ def main():
         return 0
 
     try:
-        import webview
-        webview.create_window(
-            "WorkBuddy 账号切换器",
-            url,
-            width=1180,          # 账号改成列表行（身份 / 积分 / 操作 三段）后需要更宽
-            height=1040,         # 当前账号行 + 积分明细 + 签到，比原先的 780 高不少
-            min_size=(900, 700),
-        )
-        webview.start()
-    except Exception as e:  # noqa: BLE001  # 无 WebView 运行库时退回默认浏览器
-        # 桌面版是 windowed 构建，print 没有任何去处 —— 同时落一份日志，
-        # 否则用户只会看到"浏览器突然弹出来"，完全无从判断为什么没开窗口。
-        msg = "WebView 启动失败，退回浏览器打开：%s (%s)" % (url, e)
-        print(msg)
-        try:
-            log_dir = BASE_DIR / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            with open(log_dir / "desktop-start.log", "a", encoding="utf-8") as fh:
-                fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
-        except OSError:
-            pass
-        import webbrowser
-        webbrowser.open(url)
-        if server:
+        if not _show_window(url) and server:
+            # 退回浏览器后仍要保活服务，否则窗口/标签页会立刻打不开
             try:
                 while True:
                     time.sleep(3600)

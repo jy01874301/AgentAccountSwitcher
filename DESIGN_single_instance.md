@@ -226,6 +226,54 @@ python wb_ui_server.py --serve
 
 ---
 
+## 3b. 实现状态（2026-09-18，已完成）
+
+| 交付物 | 说明 |
+|---|---|
+| `common.acquire_single_instance(name)` | ctypes + `CreateMutexW`；句柄存模块级 `_MUTEX_HANDLES` 防止被 GC 回收 |
+| `common.probe_instance(port)` | 打 `/api/ping`，**按 `OUR_APPS` 白名单校验** app |
+| `common.probe_instance_range(port, tries)` | 端口区间内找我们的实例 |
+| `common.single_instance_guard(...)` | 统一入口，返回 `(handle, action, existing)`，action ∈ `start/reuse/abort` |
+| `common.report_reuse` / `report_abort` | 两种结局的提示文案（都带 `flush=True`） |
+| `GET /api/ping` | 在 `_guard()` **之前**处理，免令牌（探测方拿不到令牌） |
+| 启动流程接入 | `wb_ui_server.serve` / `tw_ui_server.serve` / `wb_ui_app.main` / `tw_ui_app.main` |
+| 迁移前置检查 | `account_migration.other_instance()`；被拒时**不创建任何备份目录** |
+| 两个 `.cmd` | 改成实跑 `python -c "import sys;assert ..."` 做版本校验；保留 ASCII + CRLF |
+| 回归自检 | 第 15 段 29 条断言；**总计 189 项全 PASS** |
+
+### 实测结果（13 条场景里已验的）
+
+| 场景 | 结果 |
+|---|---|
+| 双击两次（同一端口） | 第二个 `[提示] 已有实例在运行（pid …），直接复用`，**只有一个端口 LISTEN** ✓ |
+| 另一个进程的我们的实例 | `action=reuse` ✓ |
+| 本进程自己的服务 | 不算"另一个实例"（按 pid 排除）→ `action=start` ✓ |
+| 互斥体被占但探测不到 | `[错误] …请先结束已有的切换器进程`，**退出码 1** ✓ |
+| 端口被别人的程序占用 | 顺延并打印 `[提示] 默认端口 %d 被其它程序占用，已改用 %d（本实例唯一）` ✓ |
+| wb 与 tw 同时跑 | 8803 + 8805 并存，`/api/ping` 各报各的 `source` ✓ |
+| 互斥体随进程结束释放 | 被 `kill -9` 后下一个进程 `errno=0` ✓ |
+| exe 与 .cmd 交叉 | 共用 `Local\WorkBuddySwitcher-wb` ✓ |
+| exe 的版本戳 | `wb-20260918-140650`（打包态回退到 `sys.executable` 的 mtime）✓ |
+
+### 实现期修正的三个设计疏漏
+
+1. **只靠互斥体会漏掉过渡期**。升级前启动的旧实例**不持有互斥体**，新版本照样能拿到
+   → 又变成两个实例。所以顺序必须是**先探端口、再拿互斥体**：探端口覆盖过渡期，
+   互斥体挡"同时启动"的竞态。
+2. **只探"请求的端口区间"不够**。互斥体是**按工具全局**的、与端口无关；
+   若已有实例在默认端口、而这次显式传了别的 `--port`，就会探不到并误报 `abort`
+   （实测踩到）。已改成**同时探请求区间与默认区间**。
+3. **`probe_instance` 只看"有没有 `app` 键"会把别人家的 `/api/ping` 当成自己**
+   （自检抓到）。已加 `OUR_APPS` 白名单。
+
+### 尚未覆盖的场景
+
+- 场景 11（双 RDP 会话）—— `Local\` 语义上应各自可跑，未实测
+- 场景 12（无权限创建互斥体）—— 代码里是"创建失败即降级放行"，未在受限账户实测
+- 场景 13（迁移进行中启动第二实例）—— 迁移耗时很短，难以稳定构造
+
+---
+
 ## 4. 与迁移的关系
 
 单实例保护不是锦上添花 —— **它是迁移正确性的前提之一**：

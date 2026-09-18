@@ -123,6 +123,25 @@ def _db_path(r):
 CLIENT_PROCESS_NAMES = ("workbuddyai.exe", "codebuddy.exe", "workbuddy.exe")
 
 
+INSTANCE_PORT = 8765      # 切换器默认端口；迁移前用它确认没有第二个实例
+
+
+def other_instance():
+    """返回**另一个**切换器实例的 /api/ping 信息；没有则 None。
+
+    为什么迁移要管这个：两个实例的内存态各自独立。A 在迁移时，B 的"当前账号"
+    缓存会在迁移后失效，B 继续切号/续期就可能把它的内存态写回，覆盖迁移结果。
+    文件锁能串行化单次操作，但锁不住"B 拿着过期状态继续干活"。
+    """
+    try:
+        info = common.probe_instance_range(INSTANCE_PORT, tries=common.PORT_TRIES, timeout=0.4)
+    except Exception:  # noqa: BLE001
+        return None
+    if info and str(info.get("pid")) != str(os.getpid()):
+        return info
+    return None
+
+
 def running_clients():
     """返回正在运行的客户端进程名列表。
 
@@ -346,6 +365,7 @@ DEFAULT_OPTS = {
     "snapshot": True,      # account-snapshot.json
     "mode": "move",        # move=改归属到新账号；share=置空 user_id 让两边都能看到
     "allow_client_running": False,
+    "allow_other_instance": False,   # 仅供自检/演练使用，正式路径不要打开
 }
 
 
@@ -493,7 +513,16 @@ def migrate(old_uid, new_uid, opts=None):
         result["message"] = ("检测到 WorkBuddy 仍在运行（%s）。迁移会改数据库与本地存储，"
                              "请先完全退出客户端再重试。" % "、".join(procs))
         return result
-    journal.add_step("前置检查", True, "客户端进程：%s" % (procs if procs is not None else "未知"))
+    other = other_instance()
+    if other and not o.get("allow_other_instance"):
+        result["message"] = ("检测到另一个切换器实例正在运行（pid %s，端口 %s）。"
+                             "迁移会改数据库与本地存储，两个实例同时操作会让状态错乱 —— "
+                             "请先关掉它（在它的窗口按 Ctrl+C）再重试。"
+                             % (other.get("pid"), other.get("port")))
+        return result
+    journal.add_step("前置检查", True, "客户端进程：%s；其它切换器实例：%s"
+                     % (procs if procs is not None else "未知",
+                        other.get("pid") if other else "无"))
 
     # ---- 1. 快照 ----
     try:

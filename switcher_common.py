@@ -369,6 +369,189 @@ def bind_server(handler_cls, port, host="127.0.0.1", tries=10):
     raise OSError("端口 %s 起连续 %d 个端口都不可用：%s" % (port, tries, last))
 
 
+# ---------------------------------------------------------------------------
+# 单实例保护
+# ---------------------------------------------------------------------------
+# 为什么用 Windows 命名互斥体而不是 PID 锁文件（已实测）：
+#   - 第一个实例正常退出 → 内核自动释放
+#   - 第一个实例**被强杀 / 崩溃** → 内核同样自动释放（实测 kill -9 后下一个进程
+#     拿到 errno=0），不会留下假锁，也不会被 PID 复用误判
+#   - 不需要任何清理逻辑
+# 命名空间用 Local\：每个登录会话独立，允许多用户 / 多 RDP 会话各跑一份，互不干扰。
+# 互斥体名必须带 source（wb / tw），否则两个切换器会互相把对方挤掉。
+_MUTEX_HANDLES = []          # 句柄必须活到进程结束，放模块级防止被 GC 回收
+ERROR_ALREADY_EXISTS = 183
+PORT_TRIES = 10              # 端口顺延范围，与 bind_server 默认一致
+
+# 互斥体名**必须带 source**：wb 与 tw 是两个不同工具（默认端口 8765 / 8766），
+# 共用同一个名字会让后启动的那个被误判成"已有实例"而被拒。
+MUTEX_NAME_WB = "Local\\WorkBuddySwitcher-wb"
+MUTEX_NAME_TW = "Local\\TraeSwitcher-tw"
+
+# /api/ping 里合法的 app 标识。探测方必须按这个白名单校验，不能只看"有没有 app 键"。
+OUR_APPS = ("wb_switcher", "tw_switcher")
+
+
+def source_version(path, tag):
+    """用源文件 mtime 生成构建戳。
+
+    用途只有一个：让第二个实例能看出"那个在跑的实例是不是旧代码"
+    —— 本会话踩过：8765 上跑着 02:16 启动的旧实例，一直用旧模板服务，
+    让人以为"改版没生效"。git 在打包态未必可用，mtime 最稳。
+
+    打包态下 `__file__` 指向 PyInstaller 的临时解包目录（每次启动路径都不同、
+    且不保证能 stat），所以再回退到 `sys.executable`（= exe 本身）——
+    否则 exe 的版本戳会退化成裸 tag，就失去了比对意义。
+    """
+    import sys as _sys
+    import time as _t
+    for cand in (path, getattr(_sys, "executable", None)):
+        if not cand:
+            continue
+        try:
+            st = Path(cand).stat()
+        except OSError:
+            continue
+        return "%s-%s" % (tag, _t.strftime("%Y%m%d-%H%M%S", _t.localtime(st.st_mtime)))
+    return tag
+
+
+def acquire_single_instance(name):
+    """尝试成为唯一实例。
+
+    返回 (handle, already_running)：
+      - already_running=False → 拿到所有权，正常启动
+      - already_running=True  → 已有实例，调用方应复用或退出
+      - handle 为 None 表示平台不支持或创建失败 → **降级放行**，不阻断启动
+    """
+    if os.name != "nt":
+        return None, False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        h = k32.CreateMutexW(None, False, name)
+        err = ctypes.get_last_error()
+        if not h:
+            return None, False          # 权限等导致创建失败 → 降级
+        _MUTEX_HANDLES.append(h)
+        return h, (err == ERROR_ALREADY_EXISTS)
+    except Exception:  # noqa: BLE001
+        return None, False
+
+
+def probe_instance(port, timeout=0.6, host="127.0.0.1"):
+    """探测某个端口上是不是我们自己的实例。
+
+    返回 /api/ping 的 JSON（dict）；端口没服务、或响应不是**我们的**工具，返回 None。
+    用来把三种情况区分开：我们的实例 / 别人的程序 / 空闲。
+
+    ⚠️ 必须校验 app 在 OUR_APPS 里，不能只看"有没有 app 键" —— 别的程序也可能有
+    /api/ping，只认键会把它们误判成我们的实例（自检抓到过）。
+    """
+    import urllib.request
+    url = "http://%s:%d/api/ping" % (host, int(port))
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            if r.status != 200:
+                return None
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        if not isinstance(data, dict) or data.get("app") not in OUR_APPS:
+            return None
+        return data
+    except Exception:  # noqa: BLE001  连不上/不是 JSON/不是我们的 → 一律 None
+        return None
+
+
+def probe_instance_range(port, tries=10, timeout=0.4, host="127.0.0.1"):
+    """在 [port, port+tries) 里找我们的实例（第一个实例可能因端口占用顺延过）。"""
+    for p in range(int(port), int(port) + int(tries)):
+        info = probe_instance(p, timeout=timeout, host=host)
+        if info:
+            return info
+    return None
+
+
+def single_instance_guard(mutex_name, port, tries=PORT_TRIES, log=print, wait=5.0,
+                          default_port=None):
+    """启动前的统一入口。返回 (handle, action, existing)。
+
+    action:
+      "start" —— 可以正常启动
+      "reuse" —— 已有同款实例在跑，调用方应打开浏览器指向它然后退出
+      "abort" —— 有实例占着互斥体，但端口上找不到它（异常情况），应报错退出
+
+    **顺序很重要：先探端口，再拿互斥体。** 只靠互斥体会漏掉一个真实场景 ——
+    升级前启动的旧实例**不持有互斥体**，新版本照样能拿到，于是又变成两个实例
+    （本会话实测过：8765 上跑着 02:16 的旧实例，新起的会顺延到 8766）。
+    反过来只探端口也不够：两个实例同时启动时都还没 bind，会双双通过。
+    两步合起来才既覆盖过渡期、又挡住竞态。
+    """
+    def _probe_all(timeout=0.4):
+        """在"请求的端口区间"和"默认端口区间"里找我们的实例。
+
+        两个区间都要探：互斥体是**按工具全局**的，与端口无关。若只探请求区间，
+        那么"已有实例在默认端口、而这次显式传了别的 --port"就会探不到，
+        误报成 abort（实测踩过）。
+        """
+        for start in ({int(port), int(default_port)} if default_port else {int(port)}):
+            info = probe_instance_range(start, tries=tries, timeout=timeout)
+            if info and str(info.get("pid")) != str(os.getpid()):
+                return info
+        return None
+
+    # 1) 端口上已经有我们的实例？（含不持互斥体的旧版本）
+    info = _probe_all()
+    if info:
+        return None, "reuse", info
+
+    # 2) 拿互斥体，挡住"同时启动"的竞态
+    handle, already = acquire_single_instance(mutex_name)
+    if not already:
+        return handle, "start", None
+
+    # 拿到句柄但对象已存在：对方可能刚启动、还没 bind。给它一点时间出现。
+    deadline = time.time() + max(0.0, float(wait))
+    while True:
+        info = _probe_all(timeout=0.3)
+        if info:
+            return handle, "reuse", info
+        if time.time() >= deadline:
+            break
+        time.sleep(0.25)
+    return handle, "abort", None
+
+
+def report_reuse(info, open_browser, app_version, default_port):
+    """已有同款实例在跑：指向它，不再起第二个。返回退出码 0。"""
+    url = "http://127.0.0.1:%d/" % info.get("port", default_port)
+    print("[提示] 已有实例在运行（pid %s，端口 %s），直接复用，不再启动第二个。"
+          % (info.get("pid"), info.get("port")), flush=True)
+    if info.get("version") and info["version"] != app_version:
+        print("[警告] 那个实例的版本是 %r，当前是 %r —— 它可能在跑旧代码。"
+              % (info.get("version"), app_version), flush=True)
+        print("       建议先关掉它（在它的窗口按 Ctrl+C）再重新启动。", flush=True)
+    print("       页面地址：%s" % url, flush=True)
+    if open_browser:
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            pass
+    return 0
+
+
+def report_abort(port, tries=PORT_TRIES):
+    """有实例占着互斥体，却在其端口区间探测不到它 —— 异常状态，明确报错。返回 1。"""
+    print("[错误] 已有切换器实例在运行，但在 %d~%d 端口上都探测不到它。"
+          % (port, int(port) + int(tries) - 1), flush=True)
+    print("       可能原因：它启动后卡死；或它的端口被别的程序抢走了。", flush=True)
+    print("       请先结束已有的切换器进程（任务管理器里找 python.exe / WorkBuddySwitcher.exe）再重试。", flush=True)
+    return 1
+
+
 class BaseHandler(BaseHTTPRequestHandler):
     """HTTP 骨架。子类只需提供 INDEX_FILE / WRITE_ENDPOINTS 与 api_get / api_post。"""
 
@@ -382,6 +565,9 @@ class BaseHandler(BaseHTTPRequestHandler):
     AUDIT_DIR = None         # 审计日志目录；非空则记录写操作
     SOURCE = "app"           # 审计里的来源标记（wb / tw）
     AUDIT_ACTIONS = {}       # 路径 → 审计动作名
+    APP_NAME = "switcher"    # /api/ping 里的身份标识，用于区分"是不是我们"
+    APP_VERSION = ""         # 构建戳，用于识别"跑着旧代码的实例"
+    STARTED_AT = 0           # 进程启动时间戳
 
     # --- 基础收发 -------------------------------------------------------
     def log_message(self, fmt, *args):
@@ -469,6 +655,15 @@ class BaseHandler(BaseHTTPRequestHandler):
             u = urlparse(self.path)
             if u.path == "/":
                 self._serve_index()
+                return
+            if u.path == "/api/ping":
+                # 身份端点：让第二个实例能判断"这个端口上是不是我们自己"。
+                # 放在 _guard() 之前 —— 探测方只带 Host，不需要令牌，也不该被同源策略挡。
+                self._send_json({
+                    "ok": True, "app": self.APP_NAME, "source": self.SOURCE,
+                    "pid": os.getpid(), "port": self.server.server_address[1],
+                    "version": self.APP_VERSION, "started_at": self.STARTED_AT,
+                }, 200)
                 return
             if not self._guard():
                 return

@@ -39,6 +39,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 
 # 复用自动签到项目脚本的解析/常量
@@ -558,6 +559,9 @@ class Handler(common.BaseHandler):
     AUDIT_ACTIONS = {"/api/switch": "switch", "/api/remove": "remove",
                      "/api/refresh": "refresh", "/api/add": "add",
                      "/api/refresh-all": "refresh-all"}
+    APP_NAME = "tw_switcher"
+    APP_VERSION = common.source_version(__file__, "tw")
+    STARTED_AT = int(time.time())
 
     def api_get(self, u):
         if u.path == "/api/accounts":
@@ -583,13 +587,22 @@ class Handler(common.BaseHandler):
 
 
 def serve(port=DEFAULT_PORT, open_browser=True, use_token=True):
+    # 单实例保护：互斥体名带 tw，不会与 WorkBuddy 侧互相挤掉。见 DESIGN_single_instance.md。
+    handle, action, info = common.single_instance_guard(
+        common.MUTEX_NAME_TW, port, tries=common.PORT_TRIES, log=print,
+        default_port=DEFAULT_PORT)
+    if action == "reuse":
+        return common.report_reuse(info, open_browser, Handler.APP_VERSION, DEFAULT_PORT)
+    if action == "abort":
+        return common.report_abort(port)
+
     # 一次性令牌：只存在于本次进程，随首页注入给前端，写操作必须回传
     Handler.TOKEN = common.new_token() if use_token else None
     server, port = common.bind_server(Handler, port)
     if port != DEFAULT_PORT:
-        print("[提示] 默认端口 %d 被占用，已改用 %d" % (DEFAULT_PORT, port))
+        print("[提示] 默认端口 %d 被其它程序占用，已改用 %d（本实例唯一）" % (DEFAULT_PORT, port), flush=True)
     url = "http://127.0.0.1:%d/" % port
-    print("本地服务已启动：%s  (Ctrl+C 停止)" % url)
+    print("本地服务已启动：%s  (Ctrl+C 停止)" % url, flush=True)
     if open_browser:
         try:
             import webbrowser
@@ -600,6 +613,7 @@ def serve(port=DEFAULT_PORT, open_browser=True, use_token=True):
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    return 0
 
 
 def main():
@@ -640,8 +654,7 @@ def main():
         common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "switch", args.switch, ok, msg)
         print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False, indent=2))
         return 0 if ok else 1
-    serve(port=args.port, use_token=not args.no_auth)
-    return 0
+    return serve(port=args.port, use_token=not args.no_auth) or 0
 
 
 if __name__ == "__main__":
