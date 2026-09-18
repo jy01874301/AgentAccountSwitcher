@@ -598,8 +598,9 @@ def serve(port=DEFAULT_PORT, open_browser=True, use_token=True):
 
     # 一次性令牌：只存在于本次进程，随首页注入给前端，写操作必须回传
     Handler.TOKEN = common.new_token() if use_token else None
+    requested = port          # 记下"请求的端口"，下面要拿它比，不能用默认端口常量
     server, port = common.bind_server(Handler, port)
-    if port != DEFAULT_PORT:
+    if port != requested:
         print("[提示] 默认端口 %d 被其它程序占用，已改用 %d（本实例唯一）" % (DEFAULT_PORT, port), flush=True)
     url = "http://127.0.0.1:%d/" % port
     print("本地服务已启动：%s  (Ctrl+C 停止)" % url, flush=True)
@@ -624,6 +625,8 @@ def main():
                     help="HTTP 服务端口（默认 %d，被占用时自动顺延）" % DEFAULT_PORT)
     ap.add_argument("--prune", metavar="N", type=int, nargs="?", const=TW_BACKUP_KEEP,
                     help="清理 tw_backups 备份，只保留最近 N 份（默认 %d）" % TW_BACKUP_KEEP)
+    ap.add_argument("--no-open", action="store_true",
+                    help="只跑服务，不打开浏览器（脚本/测试用；正常双击启动脚本不需要）")
     ap.add_argument("--no-auth", action="store_true",
                     help="关闭一次性访问令牌（写操作将只依赖回环 + 同源校验）")
     ap.add_argument("--refresh-all", action="store_true",
@@ -652,7 +655,8 @@ def main():
         common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "switch", args.switch, ok, msg)
         print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False, indent=2))
         return 0 if ok else 1
-    return serve(port=args.port, use_token=not args.no_auth) or 0
+    return serve(port=args.port, use_token=not args.no_auth,
+                 open_browser=not args.no_open) or 0
 
 
 if __name__ == "__main__":

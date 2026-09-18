@@ -1172,6 +1172,33 @@ def main():
         check("%s 启动时用 open_page（不是裸 webbrowser.open）" % f,
               "common.open_page(url)" in s and "webbrowser.open(url)" not in s, "")
 
+    # --- 16f. 探测耗时：串行探 10 个空端口要 4 秒、两个区间 8 秒，.cmd 会像卡死 ---
+    t0 = time.time()
+    common.probe_instance_range(9001, tries=10, timeout=0.3)
+    dt = time.time() - t0
+    check("probe_instance_range 是并发的（10 个空端口 < 2s，串行要 4s+）",
+          dt < 2.0, "%.2fs" % dt)
+    t0 = time.time()
+    common.single_instance_guard("Local\\WorkBuddySwitcher-timing-%d" % os.getpid(),
+                                 9001, tries=common.PORT_TRIES, default_port=9011,
+                                 log=lambda *a: None)
+    dt2 = time.time() - t0
+    check("冷启动守卫总耗时 < 2.5s（曾因串行探测达到 8.3s）", dt2 < 2.5, "%.2fs" % dt2)
+
+    # --- 16g. --no-open：脚本/测试用的"别开浏览器"开关 ---
+    for f in ("wb_ui_server.py", "tw_ui_server.py"):
+        r = subprocess.run([sys.executable, str(BIN / f), "--help"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=30)
+        check("%s 提供 --no-open（否则脚本/测试会意外弹页面）" % f,
+              "--no-open" in (r.stdout or ""), "")
+        s = (BIN / f).read_text(encoding="utf-8")
+        check("%s 的 --no-open 真的接到了 open_browser" % f,
+              "open_browser=not args.no_open" in s, "")
+        # 端口提示必须与"请求的端口"比：显式传 --port 时曾误报"默认端口被占用"
+        check("%s 端口提示不再拿默认端口常量比" % f,
+              "requested = port" in s and "if port != requested:" in s, "")
+
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0
 

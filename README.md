@@ -127,6 +127,18 @@ python wb_ui_server.py --switch workbuddy-jhan.info --migrate  # 切号并迁移
 python wb_ui_server.py --switch x.info --migrate --migrate-mode share
 ```
 
+### `--serve` 的开关
+
+```bash
+python wb_ui_server.py --serve                    # 起服务并打开页面（.cmd 用的就是这个）
+python wb_ui_server.py --serve --no-open          # 只起服务，不开浏览器（脚本/测试用）
+python wb_ui_server.py --serve --no-auth          # 关闭一次性令牌
+python wb_ui_server.py --serve --port 8998        # 指定端口
+```
+
+> `--no-open` 是给脚本和测试用的。**不加它就会开浏览器** —— 之前用 `--serve` 做端到端
+> 测试时，测试实例自己弹了一个 `http://127.0.0.1:8996/` 的页面出来。
+
 ### 客户端在运行时的行为与排查
 
 **先明确一点：切号本身在客户端运行时是正常的。** 实测（客户端 12 个进程在跑）连续

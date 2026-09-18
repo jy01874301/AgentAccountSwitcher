@@ -465,13 +465,39 @@ def probe_instance(port, timeout=0.6, host="127.0.0.1"):
         return None
 
 
-def probe_instance_range(port, tries=10, timeout=0.4, host="127.0.0.1"):
-    """在 [port, port+tries) 里找我们的实例（第一个实例可能因端口占用顺延过）。"""
-    for p in range(int(port), int(port) + int(tries)):
-        info = probe_instance(p, timeout=timeout, host=host)
-        if info:
-            return info
-    return None
+def probe_instance_range(port, tries=10, timeout=0.3, host="127.0.0.1"):
+    """在 [port, port+tries) 里找我们的实例（第一个实例可能因端口占用顺延过）。
+
+    ⚠️ **必须并发探**。串行探 10 个空端口时，每个都要等满超时（实测本机 0.42s/个 ——
+    那些端口上没人应答，连接一直挂着而不是立刻 RST），单区间 4.1s，
+    两个区间加起来启动要 **8.3 秒**，`.cmd` 会像卡死。
+    并发之后总耗时 ≈ 单次超时。
+    """
+    ports = list(range(int(port), int(port) + int(tries)))
+    if not ports:
+        return None
+    if len(ports) == 1:
+        return probe_instance(ports[0], timeout=timeout, host=host)
+    found = {}
+    try:
+        import concurrent.futures as cf
+        with cf.ThreadPoolExecutor(max_workers=len(ports)) as ex:
+            futs = {ex.submit(probe_instance, p, timeout, host): p for p in ports}
+            for fut in cf.as_completed(futs):
+                try:
+                    info = fut.result()
+                except Exception:  # noqa: BLE001
+                    info = None
+                if info:
+                    found[futs[fut]] = info
+    except Exception:  # noqa: BLE001  并发不可用时退回串行，别因此起不来
+        for p in ports:
+            info = probe_instance(p, timeout=timeout, host=host)
+            if info:
+                found[p] = info
+    if not found:
+        return None
+    return found[min(found)]          # 端口最小者优先，保证结果确定
 
 
 def single_instance_guard(mutex_name, port, tries=PORT_TRIES, log=print, wait=5.0,
