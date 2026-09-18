@@ -27,7 +27,8 @@
     min-height: 100vh;
     padding: 32px 20px 60px;
   }
-  .wrap { max-width: 960px; margin: 0 auto; }
+  .wrap { max-width: 860px; margin: 0 auto; }   /* 行宽贴合内容：960 时
+     身份列+积分块+操作列只占约 800px，右侧会空出一大块（用户截图反馈）*/
   header { display:flex; align-items:center; gap:16px; margin-bottom:24px; }
   .logo {
     width:46px; height:46px; border-radius:12px; flex-shrink:0;
@@ -159,7 +160,7 @@
   .mini-btn:disabled { opacity:.5; cursor:not-allowed; }
 
   /* ---- 积分明细 ---- */
-  .credits { display:flex; flex-direction:column; gap:6px; align-items:flex-start; }
+  .credits { display:flex; flex-direction:column; gap:6px; }
   .credits-total { font-size:12px; color:var(--dim); display:flex; align-items:baseline; gap:8px; }
   .credits-total b { color:var(--text); font-size:14px; font-weight:700; }
   .credits-title { font-size:11.5px; color:var(--dim); letter-spacing:.3px; }
@@ -169,8 +170,9 @@
      恰好等于上方「档位名 + 时间」那一行 —— 两排左右对齐，
      填充比例才能直接读出来（此前条子 240px、文字行 447px，
      80% 的填充只占整行的 43%，看起来和「剩余20%」对不上）。*/
-  .ci { display:flex; flex-direction:column; gap:4px; width:fit-content;
-        min-width:300px; max-width:100%; }
+  /* 必须**填满** .body 那一列：用 fit-content 会让积分块只占 300px、
+     而 .body 仍占满剩余宽度，中间空出一大块（用户截图反馈）。*/
+  .ci { display:flex; flex-direction:column; gap:4px; width:100%; }
   /* 时间与已使用量同一行、两端对齐。两块都 nowrap：实在放不下时整块换到下一行，
      绝不会出现"一侧折行、另一侧单行"那种基线错位 */
   .ci-info { display:flex; justify-content:space-between; align-items:baseline; gap:8px; flex-wrap:wrap; }

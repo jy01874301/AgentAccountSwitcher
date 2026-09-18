@@ -1223,7 +1223,7 @@ def main():
           ".btn.danger:hover { background:rgba(255,92,92,.12); border-color:var(--red); color:var(--red); }" in tpl17, "")
 
     # --- 17c. 列表更窄更矮 ---
-    for needle, why in ((".wrap { max-width: 960px;", "整体更窄"),
+    for needle, why in ((".wrap { max-width: 860px;", "整体更窄且贴合行内容"),
                         (".list { display:flex; flex-direction:column; gap:7px; }", "行间距更小"),
                         # 254 = 能容下「登录态剩余 · 日期」一行（实测该行 204px，
                         # 加头像 32 + 间距 9）。窄于这个值它就会折成两行。
@@ -1243,8 +1243,10 @@ def main():
     # 否则填充比例读不出来：条子 240px、文字行 447px 时，80% 的填充只占整行的 43%。
     check("进度条与数字同排（.ci-line 包裹 bar + used）",
           '<div class="ci-line">' in tpl17 and ">已使用 '" in tpl17.replace('"', "'"), "")
-    check("进度条按内容宽度收缩并与上方文字行对齐",
-          "width:fit-content" in tpl17 and "min-width:300px; max-width:100%" in tpl17, "")
+    # 积分块必须**填满** .body：用 fit-content 会让它只占 300px、而 .body 仍占满
+    # 剩余宽度，中间空出一大块（用户截图反馈"红框区域太大"）。
+    check("积分块填满 .body（不留死区）",
+          ".ci { display:flex; flex-direction:column; gap:4px; width:100%; }" in tpl17, "")
     check("进度条自适应剩余宽度（不再写死 max-width）",
           "max-width:240px" not in tpl17 and ".ci-line { display:flex; align-items:center; gap:10px;" in tpl17, "")
     check("积分块把「档位名/时间/用量」压到同一行（省两行高度）",
