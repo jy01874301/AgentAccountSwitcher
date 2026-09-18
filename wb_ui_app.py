@@ -156,6 +156,7 @@ def main():
     if port != requested:
         print("[提示] 端口 %d 被其它程序占用，已改用 %d（本实例唯一）" % (requested, port))
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    srv.warmup_async()      # 抢在窗口出现前把积分/签到缓存跑热
 
     url = "http://127.0.0.1:%d/" % port
 

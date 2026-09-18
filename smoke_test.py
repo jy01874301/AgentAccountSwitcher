@@ -1199,6 +1199,76 @@ def main():
         check("%s 端口提示不再拿默认端口常量比" % f,
               "requested = port" in s and "if port != requested:" in s, "")
 
+    print("\n== 17. 导航栏 / 紧凑化 / 打开客户端 ==")
+    tpl17 = (BIN / "ui_template.html").read_text(encoding="utf-8")
+
+    # --- 17a. 导航栏：位置（sticky 顶部）、入口（3 锚点 + 2 动作）、交互（滚动高亮）---
+    check("导航栏存在且 sticky 常驻顶部", '.nav {' in tpl17 and 'position:sticky' in tpl17, "")
+    for tgt in ("secCurrent", "secAccounts", "secAdd"):
+        check("导航入口指向 %s" % tgt,
+              ('data-target="%s"' % tgt) in tpl17 and ('id="%s"' % tgt) in tpl17, "")
+    check("导航含「刷新」与「打开客户端」两个动作",
+          'onclick="load();loadCredits(true);loadCheckin(true)"' in tpl17
+          and 'id="openClientBtn"' in tpl17, "")
+    check("导航交互：点击平滑滚动 + 滚动高亮",
+          "scrollIntoView" in tpl17 and "IntersectionObserver" in tpl17, "")
+    check("导航栏含服务连接状态", 'id="srvDot"' in tpl17 and 'id="srvText"' in tpl17, "")
+
+    # --- 17b. 删除按钮红色，但尺寸/形状沿用 ghost（风格一致）---
+    check("删除按钮用 danger 类", 'class="btn ghost danger"' in tpl17, "")
+    check("删除按钮判定同步改成 danger", "contains('danger')" in tpl17 and "del-btn" not in tpl17, "")
+    check("danger 只改配色、不改尺寸（沿用 .btn.ghost 的 padding/圆角）",
+          ".btn.danger { border-color:rgba(255,92,92,.45); color:var(--red); }" in tpl17, "")
+    check("danger 用主题里的 --red 变量（不是硬编码色值）",
+          ".btn.danger:hover { background:rgba(255,92,92,.12); border-color:var(--red); color:var(--red); }" in tpl17, "")
+
+    # --- 17c. 列表更窄更矮 ---
+    for needle, why in ((".wrap { max-width: 960px;", "整体更窄"),
+                        (".list { display:flex; flex-direction:column; gap:7px; }", "行间距更小"),
+                        (".who { flex:0 0 196px;", "身份列更窄"),
+                        (".acts { flex:0 0 110px;", "操作列更窄"),
+                        (".ci-bar { height:4px;", "进度条更细")):
+        check("紧凑化：%s（%s）" % (needle.split("{")[0].strip(), why), needle in tpl17, "")
+    check("积分块把「档位名/时间/用量」压到同一行（省两行高度）",
+          'h+=\'<div class="ci">\'\n      +\'<div class="ci-info">\'\n      +\'<span class="ci-name">\'' in tpl17, "")
+
+    # --- 17d. 加载：三件事并发 + 启动预热 ---
+    check("首屏三个请求并发发起（不再等 load 回来才拉积分/签到）",
+          "load();\nloadCredits();\nloadCheckin();" in tpl17, "")
+    check("服务端启动时预热积分/签到缓存",
+          hasattr(wb, "warmup_async") and "warmup_async()" in (BIN / "wb_ui_server.py").read_text(encoding="utf-8"), "")
+
+    # --- 17e. 打开客户端 ---
+    exe = wb.find_client_exe()
+    check("能定位到 WorkBuddy 客户端可执行文件", exe is None or exe.is_file(), str(exe))
+    cs = wb.client_status()
+    check("client_status 返回可 JSON 序列化的 dict（Path 会让响应 500）",
+          isinstance(cs, dict) and isinstance(cs.get("pids"), list)
+          and isinstance(cs.get("exe"), str) and isinstance(cs.get("running"), bool), cs)
+    check("当前用户有客户端在运行时应能检出", cs["running"] is True, cs["pids"])
+    before = len(cs["pids"])
+    ok, msg = wb.open_client()
+    pids2 = wb.client_status()["pids"]
+    check("客户端已在运行时 open_client 不会重复启动", ok is True and len(pids2) <= before,
+          "%d -> %d" % (before, len(pids2)))
+    check("open_client 的返回消息可操作（说明是切前台还是已启动）",
+          ("前台" in msg) or ("已启动" in msg), msg[:80])
+
+    srv5, port5 = common.bind_server(wb.Handler, 8996)
+    threading.Thread(target=srv5.serve_forever, daemon=True).start()
+    try:
+        time.sleep(0.25)
+        st, raw = call(port5, "/api/client-status")
+        check("[wb] GET /api/client-status 可用", st == 200 and "client" in json.loads(raw), st)
+        st, raw = call(port5, "/api/open-client")
+        check("[wb] GET /api/open-client 被拒（写接口只收 POST）", st == 405, st)
+        st, raw = call(port5, "/api/open-client", "POST", {})
+        check("[wb] POST /api/open-client 可用",
+              st == 200 and "ok" in json.loads(raw), (st, raw[:80]))
+    finally:
+        srv5.shutdown()
+        srv5.server_close()
+
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0
 

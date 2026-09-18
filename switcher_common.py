@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -442,6 +443,111 @@ def acquire_single_instance(name):
         return None, False
 
 
+def list_processes():
+    """枚举当前进程，返回 {小写进程名: [pid, ...]}。
+
+    **检测不出来返回 None**（≠ 没有进程）—— 调用方必须区分这两者，
+    否则"枚举失败"会被当成"程序没在跑"（本会话踩过：tasklist 的 GBK 输出
+    让 UTF-8 解码在读取线程里炸掉，stdout 变空，于是 12 个客户端进程被当成 0 个）。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        # 不能用 text=True：tasklist 在中文 Windows 上输出 GBK，而本机 Python 处于
+        # UTF-8 模式，解码会在**读取线程里**抛 UnicodeDecodeError（异常不冒到调用方）。
+        # 我们只要 ASCII 的进程名，errors="replace" 就够。
+        r = subprocess.run(["tasklist", "/NH", "/FO", "CSV"], capture_output=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode != 0:
+            return None
+        text = (r.stdout or b"").decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return None
+    out = {}
+    for line in text.splitlines():
+        parts = [c.strip().strip('"') for c in line.strip().split(",")]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        name = parts[0].lower()
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        out.setdefault(name, []).append(pid)
+    return out
+
+
+def list_process_names():
+    """只要进程名集合；检测不出来返回 None。"""
+    procs = list_processes()
+    return None if procs is None else set(procs)
+
+
+def process_image_path(pid):
+    """取某个 pid 的可执行文件完整路径；取不到返回空串。"""
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                   wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(len(buf))
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return buf.value
+            return ""
+        finally:
+            k32.CloseHandle(h)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def focus_windows_of(pids, sw_restore=9):
+    """把指定 pid 的可见窗口切到前台。做不到返回 False（不抛异常）。
+
+    Windows 有前台锁定：`SetForegroundWindow` 可能被系统拒绝（返回 0）。
+    这里尽力而为，失败时调用方应改为提示用户从任务栏切过去。
+    """
+    if os.name != "nt" or not pids:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u32.IsWindowVisible.argtypes = [wintypes.HWND]
+        u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        want = set(int(p) for p in pids)
+        found = []
+        proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in want and u32.IsWindowVisible(hwnd):
+                found.append(hwnd)
+            return True
+
+        u32.EnumWindows(proc(_cb), 0)
+        if not found:
+            return False
+        u32.ShowWindow(found[0], sw_restore)
+        return bool(u32.SetForegroundWindow(found[0]))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def probe_instance(port, timeout=0.6, host="127.0.0.1"):
     """探测某个端口上是不是我们自己的实例。
 
@@ -515,18 +621,53 @@ def single_instance_guard(mutex_name, port, tries=PORT_TRIES, log=print, wait=5.
     反过来只探端口也不够：两个实例同时启动时都还没 bind，会双双通过。
     两步合起来才既覆盖过渡期、又挡住竞态。
     """
-    def _probe_all(timeout=0.4):
-        """在"请求的端口区间"和"默认端口区间"里找我们的实例。
+    def _probe_all(timeout=0.2):
+        """找我们的实例：**一次并发扫完所有候选端口**。
 
-        两个区间都要探：互斥体是**按工具全局**的，与端口无关。若只探请求区间，
-        那么"已有实例在默认端口、而这次显式传了别的 --port"就会探不到，
-        误报成 abort（实测踩过）。
+        候选 = 请求端口区间 ∪ 默认端口区间。默认区间是必要的 —— 互斥体是
+        **按工具全局**的、与端口无关，只探请求区间会在"已有实例在默认端口、
+        这次显式传了别的 --port"时误报 abort（实测踩过）。
+
+        命中优先级：请求端口 > 默认端口 > 端口最小者，保证结果确定。
+
+        ⚠️ 两点都是实测踩出来的：
+        - **必须并发**：本机连一个没人监听的回环端口**不会立刻 RST，会一直挂到超时**
+          （裸 socket 也要 2 秒），串行 10 个端口就是 10 倍（曾达 8.3s）。
+        - **超时必须短**（0.2s）：探测总耗时 ≈ 超时值；真实实例 20ms 内就应答，
+          0.2s 有 10 倍余量。
+        早先的写法是"先串行探两个优先端口、再串行扫两个区间"，冷启动要 0.86s ——
+        优先端口没命中时那 0.4s 是白花的。合成一次并发后只剩 0.2s。
         """
-        for start in ({int(port), int(default_port)} if default_port else {int(port)}):
-            info = probe_instance_range(start, tries=tries, timeout=timeout)
-            if info and str(info.get("pid")) != str(os.getpid()):
-                return info
-        return None
+        starts = list(dict.fromkeys([int(port)] + ([int(default_port)] if default_port else [])))
+        cands = []
+        for s in starts:
+            cands.extend(range(s, s + int(tries)))
+        cands = list(dict.fromkeys(cands))
+
+        found = {}
+        try:
+            import concurrent.futures as cf
+            with cf.ThreadPoolExecutor(max_workers=len(cands)) as ex:
+                futs = {ex.submit(probe_instance, p, timeout, "127.0.0.1"): p for p in cands}
+                for fut in cf.as_completed(futs):
+                    try:
+                        info = fut.result()
+                    except Exception:  # noqa: BLE001
+                        info = None
+                    if info and str(info.get("pid")) != str(os.getpid()):
+                        found[futs[fut]] = info
+        except Exception:  # noqa: BLE001  并发不可用时退回串行
+            for p in cands:
+                info = probe_instance(p, timeout=timeout)
+                if info and str(info.get("pid")) != str(os.getpid()):
+                    found[p] = info
+
+        if not found:
+            return None
+        for p in starts:
+            if p in found:
+                return found[p]
+        return found[min(found)]
 
     # 1) 端口上已经有我们的实例？（含不持互斥体的旧版本）
     info = _probe_all()
@@ -541,7 +682,7 @@ def single_instance_guard(mutex_name, port, tries=PORT_TRIES, log=print, wait=5.
     # 拿到句柄但对象已存在：对方可能刚启动、还没 bind。给它一点时间出现。
     deadline = time.time() + max(0.0, float(wait))
     while True:
-        info = _probe_all(timeout=0.3)
+        info = _probe_all(timeout=0.2)
         if info:
             return handle, "reuse", info
         if time.time() >= deadline:

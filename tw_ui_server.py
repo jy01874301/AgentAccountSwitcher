@@ -545,7 +545,7 @@ class Handler(common.BaseHandler):
         "AUTH_DIR": "tw_auth",
         "ACCEPT": ".json,application/json",
         "FILE_LABEL": "账号的 storage.json（含该账号加密登录态）",
-        "ADD_HINT": "点击展开，选择该账号的 storage.json 登录态",
+        "ADD_HINT": "点击展开，选择文件或粘贴该账号的 storage.json 内容",
         "EMPTY_HINT": "请放入该账号的 <code>storage.json</code>。",
         "CMD": "trae_switcher.cmd",
         "CREDITS": "",             # Trae 侧无 /api/credits，置空隐藏积分明细与「刷新积分」

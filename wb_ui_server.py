@@ -20,6 +20,7 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -227,6 +228,120 @@ def migrate_preview(target_name):
     data["needed"] = bool(old_uid and old_uid != new_uid
                           and (data.get("items") or data.get("conflicts")))
     return data
+
+
+CLIENT_PROCESS = "workbuddyai.exe"        # 桌面客户端进程名（小写）
+CLIENT_EXE_NAME = "WorkBuddyAI.exe"
+
+
+def find_client_exe():
+    """定位 WorkBuddy 客户端可执行文件；找不到返回 None。
+
+    只从**固定候选位置**和**正在运行的进程路径**里找，不接受任何外部输入 ——
+    这个结果会被拿去启动程序。
+    """
+    cands = []
+
+    # 1) 正在运行的进程：最可靠，那就是用户实际在用的那一份
+    procs = common.list_processes() or {}
+    for pid in procs.get(CLIENT_PROCESS, []):
+        p = common.process_image_path(pid)
+        if p and os.path.basename(p).lower() == CLIENT_EXE_NAME.lower():
+            cands.append(Path(p))
+
+    # 2) 常见安装位置
+    for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        base = os.environ.get(env)
+        if not base:
+            continue
+        cands.append(Path(base) / "WorkBuddyAI" / CLIENT_EXE_NAME)
+        cands.append(Path(base) / "Programs" / "WorkBuddyAI" / CLIENT_EXE_NAME)
+
+    # 3) 注册表卸载项里的 DisplayIcon / InstallLocation（尽力而为，失败不影响）
+    try:
+        import winreg
+        for hive, sub in ((winreg.HKEY_LOCAL_MACHINE,
+                           r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                          (winreg.HKEY_CURRENT_USER,
+                           r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")):
+            try:
+                root = winreg.OpenKey(hive, sub)
+            except OSError:
+                continue
+            n = winreg.QueryInfoKey(root)[0]
+            for i in range(n):
+                try:
+                    name = winreg.EnumKey(root, i)
+                    sk = winreg.OpenKey(root, name)
+                    disp = str(winreg.QueryValueEx(sk, "DisplayName")[0] or "")
+                except OSError:
+                    continue
+                if "workbuddy" not in disp.lower():
+                    continue
+                for val in ("DisplayIcon", "InstallLocation"):
+                    try:
+                        raw = str(winreg.QueryValueEx(sk, val)[0] or "").strip('"')
+                    except OSError:
+                        continue
+                    if not raw:
+                        continue
+                    p = Path(raw)
+                    cands.append(p if p.suffix.lower() == ".exe" else p / CLIENT_EXE_NAME)
+    except Exception:  # noqa: BLE001
+        pass
+
+    for c in cands:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def client_status():
+    """客户端状态。**返回 dict 而不是 tuple** —— 这个结果会直接进 JSON 响应，
+    tuple 里的 Path 序列化不了（会 500）。路径统一转成字符串。"""
+    procs = common.list_processes()
+    exe = find_client_exe()
+    return {
+        "running": bool(procs and procs.get(CLIENT_PROCESS)),
+        "pids": [] if procs is None else list(procs.get(CLIENT_PROCESS, [])),
+        "exe": str(exe) if exe else "",
+        "detectable": procs is not None,
+    }
+
+
+def open_client():
+    """打开 WorkBuddy 客户端；已在运行则把它切到前台，不重复启动。
+
+    切号之后客户端需要重新读取登录态 —— 但它自己不一定在跑，
+    所以这里给一个一键入口，而不是让用户去开始菜单找。
+    返回 (ok, message)。
+    """
+    procs = common.list_processes()
+    if procs is None:
+        return False, "无法枚举进程（tasklist 不可用），请手动打开 WorkBuddy 客户端"
+    pids = list(procs.get(CLIENT_PROCESS, []))
+    if pids:
+        if common.focus_windows_of(pids):
+            return True, "WorkBuddy 客户端已在运行，已切到前台（pid %s）" % pids[0]
+        return True, ("WorkBuddy 客户端已在运行（pid %s），但系统不允许本程序把它切到前台，"
+                      "请从任务栏点开" % pids[0])
+
+    exe = find_client_exe()
+    if not exe:
+        return False, ("找不到 WorkBuddy 客户端（%s）。"
+                       "如果你装在了非标准位置，请手动启动一次。" % CLIENT_EXE_NAME)
+    try:
+        # DETACHED_PROCESS：客户端不随本工具退出而结束，也不继承控制台
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen([str(exe)], cwd=str(exe.parent), close_fds=True,
+                         creationflags=flags)
+    except OSError as e:
+        return False, "启动客户端失败：%s" % common.scrub(e)
+    return True, "已启动 WorkBuddy 客户端：%s" % exe
 
 
 def switch_account(target_name, migrate=None):
@@ -939,7 +1054,7 @@ class Handler(common.BaseHandler):
         "AUTH_DIR": "wb_auth",
         "ACCEPT": ".info,application/json",
         "FILE_LABEL": "账号配置文件（.info）",
-        "ADD_HINT": "点击展开，选择或粘贴该账号的 .info 登录态",
+        "ADD_HINT": "点击展开，选择文件或粘贴该账号的 .info 登录态",
         "EMPTY_HINT": "请把 WorkBuddy 账号登录态文件（<code>workbuddy-*.info</code>）放进去。",
         "CMD": "workbuddy_switcher.cmd",
         "CREDITS": "1",            # 展示积分明细 + 「刷新积分」按钮（Trae 侧无该接口，置空即隐藏）
@@ -947,12 +1062,13 @@ class Handler(common.BaseHandler):
         "MIGRATE": "1",            # 切号时弹「是否迁移任务与项目」确认框（Trae 侧无此能力，置空即隐藏）
     }
     WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add",
-                       "/api/checkin", "/api/refresh-all")
+                       "/api/checkin", "/api/refresh-all", "/api/open-client")
     SOURCE = "wb"
     AUDIT_DIR = _BIN_DIR / "logs"
     AUDIT_ACTIONS = {"/api/switch": "switch", "/api/remove": "remove",
                      "/api/refresh": "refresh", "/api/add": "add",
-                     "/api/checkin": "checkin", "/api/refresh-all": "refresh-all"}
+                     "/api/checkin": "checkin", "/api/refresh-all": "refresh-all",
+                     "/api/open-client": "open-client"}
     APP_NAME = "wb_switcher"
     APP_VERSION = common.source_version(__file__, "wb")
     STARTED_AT = int(time.time())
@@ -969,12 +1085,19 @@ class Handler(common.BaseHandler):
             # 只读查签到状态。必须与 POST /api/checkin 分开：
             # BaseHandler 对 WRITE_ENDPOINTS 里的路径一律拒绝 GET（405）。
             return 200, checkin_snapshot(force="force=1" in (u.query or ""))
+        if u.path == "/api/client-status":
+            # 只读状态必须与写接口分开：/api/open-client 在 WRITE_ENDPOINTS 里，
+            # do_GET 对它的路径一律返回 405（和 /api/checkin 同一个坑）。
+            return 200, {"ok": True, "client": client_status()}
         if u.path == "/api/migrate-preview":
             # 只读扫描：切到这个账号需要迁移多少数据（供弹框展示）
             return 200, migrate_preview(dict(parse_qs(u.query or "")).get("name", [""])[0])
         return 404, {"ok": False, "message": "404"}
 
     def api_post(self, u, p):
+        if u.path == "/api/open-client":
+            ok, msg = open_client()
+            return 200, {"ok": ok, "message": msg, "client": client_status()}
         if u.path == "/api/switch":
             mig = p.get("migrate")
             if not isinstance(mig, dict):
@@ -998,6 +1121,36 @@ class Handler(common.BaseHandler):
         return 200, {"ok": ok, "message": msg}
 
 
+_WARMED = threading.Event()
+
+
+def warmup_async():
+    """后台预热「积分」与「签到」缓存。
+
+    首屏"完全加载"的耗时几乎全在这两个查询上（实测积分 ~680ms、签到 ~430ms，
+    前端已经并行，所以首屏要等 ~700ms）。服务在浏览器打开之前就起来了 ——
+    这里抢在用户点开页面之前把它们跑完，用户看到页面时缓存已热，两项都是 0ms。
+
+    两个查询各自内部已并发；这里再分成两个线程，让它们同时开始，
+    这样 ~0.7s 后两个缓存都热了（串行要 ~1.1s，会慢过用户打开页面）。
+    失败只打印，不影响服务本身。
+    """
+    if _WARMED.is_set():
+        return
+    _WARMED.set()
+
+    def _one(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001  预热失败不该影响任何功能
+            print("[预热] %s 失败（不影响使用）：%s" % (name, common.scrub(e, 120)), flush=True)
+
+    for name, fn in (("积分", lambda: credits_snapshot(False)),
+                     ("签到", lambda: checkin_snapshot(False))):
+        threading.Thread(target=_one, args=(name, fn), name="warmup-" + name,
+                         daemon=True).start()
+
+
 def serve(port=DEFAULT_PORT, open_browser=True, use_token=True):
     # 单实例保护：拿到互斥体才允许启动；已有实例则复用或报错退出，**绝不静默另起一个**。
     # 见 DESIGN_single_instance.md。
@@ -1019,6 +1172,8 @@ def serve(port=DEFAULT_PORT, open_browser=True, use_token=True):
         print("[提示] 默认端口 %d 被其它程序占用，已改用 %d（本实例唯一）" % (DEFAULT_PORT, port), flush=True)
     url = "http://127.0.0.1:%d/" % port
     print("本地服务已启动：%s  (Ctrl+C 停止)" % url, flush=True)
+    # 抢在浏览器打开之前把积分/签到缓存跑热，首屏就不用等那 ~700ms
+    warmup_async()
     if open_browser:
         # 用 open_page 而不是裸 webbrowser.open：只有"当前没有页面开着"才开，
         # 否则每次运行都会多一个指向同一地址的标签页。

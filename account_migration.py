@@ -23,7 +23,6 @@ import os
 import re
 import shutil
 import sqlite3
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -146,36 +145,13 @@ def running_clients():
     """返回正在运行的客户端进程名列表。
 
     返回 None 表示**检测不出来**（tasklist 不可用等），调用方应据此提示用户
-    自行确认，而不是当成"没在跑"。
+    自行确认，而不是当成"没在跑"。实现已抽到 `common.list_process_names()`
+    —— 那里集中处理了"GBK 输出 + UTF-8 解码会在读取线程里炸"这个坑。
     """
-    if os.name != "nt":
+    names = common.list_process_names()
+    if names is None:
         return None
-    try:
-        # ⚠️ 不能用 text=True：tasklist 在中文 Windows 上输出 GBK，
-        # 而本机 Python 处于 UTF-8 模式，解码会在**读取线程里**抛 UnicodeDecodeError
-        # —— 异常不冒到调用方，stdout 变成空，于是"检测不到进程"被静默当成
-        # "没有进程在跑"。实测踩过：本机 12 个 WorkBuddyAI.exe 在跑却返回 []。
-        # 我们只匹配 ASCII 进程名，所以用 errors="replace" 解码即可。
-        r = subprocess.run(
-            ["tasklist", "/NH", "/FO", "CSV"],
-            capture_output=True, timeout=15,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if r.returncode != 0:
-            return None
-        text = (r.stdout or b"").decode("utf-8", "replace")
-    except Exception:  # noqa: BLE001  检测失败不等于没在跑
-        return None
-    # 取 CSV 第一列做**精确**比对，不要用子串匹配 —— 否则 "workbuddy.exe"
-    # 会被 "workbuddyai.exe" 这类更长的名字误命中。
-    names = set()
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        first = line.split(",", 1)[0].strip().strip('"').lower()
-        if first:
-            names.add(first)
-    return sorted(names & set(CLIENT_PROCESS_NAMES))
+    return sorted(n for n in CLIENT_PROCESS_NAMES if n in names)
 
 
 # ---------------------------------------------------------------------------
