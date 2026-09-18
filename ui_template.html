@@ -61,7 +61,7 @@
   .row:hover { border-color:#3a4a72; box-shadow:0 8px 20px rgba(0,0,0,.22); }
   .row.cur { border-color:var(--green); background:linear-gradient(135deg,var(--card-2),var(--card)); }
 
-  .who { flex:0 0 210px; min-width:0; display:flex; gap:9px; align-items:flex-start; }
+  .who { flex:0 0 254px; min-width:0; display:flex; gap:9px; align-items:flex-start; }
   /* 头像全站统一：圆形渐变 + 昵称后两字。当前账号卡片与列表行共用同一个类 */
   .avatar {
     width:32px; height:32px; border-radius:50%; flex-shrink:0;
@@ -159,13 +159,18 @@
   .mini-btn:disabled { opacity:.5; cursor:not-allowed; }
 
   /* ---- 积分明细 ---- */
-  .credits { display:flex; flex-direction:column; gap:6px; }
+  .credits { display:flex; flex-direction:column; gap:6px; align-items:flex-start; }
   .credits-total { font-size:12px; color:var(--dim); display:flex; align-items:baseline; gap:8px; }
   .credits-total b { color:var(--text); font-size:14px; font-weight:700; }
   .credits-title { font-size:11.5px; color:var(--dim); letter-spacing:.3px; }
   .credits-msg { font-size:11.5px; color:var(--dim); line-height:1.45; }
   .credits-msg.err { color:var(--amber); }
-  .ci { display:flex; flex-direction:column; gap:3px; }
+    /* .ci 按内容宽度收缩，使「进度条 + 数字」那一排的总宽
+     恰好等于上方「档位名 + 时间」那一行 —— 两排左右对齐，
+     填充比例才能直接读出来（此前条子 240px、文字行 447px，
+     80% 的填充只占整行的 43%，看起来和「剩余20%」对不上）。*/
+  .ci { display:flex; flex-direction:column; gap:4px; width:fit-content;
+        min-width:300px; max-width:100%; }
   /* 时间与已使用量同一行、两端对齐。两块都 nowrap：实在放不下时整块换到下一行，
      绝不会出现"一侧折行、另一侧单行"那种基线错位 */
   .ci-info { display:flex; justify-content:space-between; align-items:baseline; gap:8px; flex-wrap:wrap; }
@@ -173,8 +178,9 @@
   .ci-name { font-size:12.5px; font-weight:600; color:var(--text); white-space:nowrap; }
   .ci-used { font-size:11.5px; color:var(--text); }
   .ci-when { font-size:11.5px; color:var(--dim); }
-  .ci-bar { height:4px; border-radius:2px; background:var(--card-2); overflow:hidden;
-            max-width:240px; margin-top:2px; }
+    .ci-line { display:flex; align-items:center; gap:10px; min-width:0; }
+  .ci-bar { flex:1 1 60px; min-width:60px; height:4px; border-radius:2px;
+            background:var(--card-2); overflow:hidden; }
   .ci-bar i { display:block; height:100%; border-radius:3px; background:#2bbfa8; }
   .credits-pending { font-size:12px; color:var(--dim); }
 
@@ -513,13 +519,16 @@ function creditsBlock(file){
     // 档位名 / 时间 / 已使用量全部压到**同一行**：原来档位名单独占一行，
     // 两档就多出两行高度（实测行高被积分块主导，而不是左侧身份列）。
     // 三块都 nowrap，极窄时整块换行也不会出现"半边折行"的基线错位。
+    // 第一排：档位名 + 时间；第二排：进度条 + 已使用量。
+    // 数字紧挨进度条，读者能直接把条长和百分比对上；两排总宽相同、左右对齐。
     h+='<div class="ci">'
       +'<div class="ci-info">'
       +'<span class="ci-name">'+esc(it.label)+'</span>'
-      +'<span class="ci-when">'+esc(it.time_label)+' '+esc(it.time||'-')+'</span>'
+      +'<span class="ci-when">'+esc(it.time_label)+' '+esc(it.time||'-')+'</span></div>'
+      +'<div class="ci-line">'
+      +'<div class="ci-bar"><i style="width:'+pct+'%"></i></div>'
       +'<span class="ci-used">已使用 '+fmtNum(it.used)+'/'+fmtNum(it.total)
       +' 剩余'+esc(it.remain_percent)+'%</span></div>'
-      +'<div class="ci-bar"><i style="width:'+pct+'%"></i></div>'
       +'</div>';
   });
   return h+'</div>';

@@ -1225,12 +1225,11 @@ def main():
     # --- 17c. 列表更窄更矮 ---
     for needle, why in ((".wrap { max-width: 960px;", "整体更窄"),
                         (".list { display:flex; flex-direction:column; gap:7px; }", "行间距更小"),
-                        # 210 是"够放下 workbuddy-<标识>.info 一行"的最小值：196 时 meta
-                        # 会折成两行、和下面的「登录态剩余」贴在一起（用户反馈的串行问题）。
-                        # 仍然比最初的 252 窄。
-                        (".who { flex:0 0 210px;", "身份列更窄（252→210）"),
+                        # 254 = 能容下「登录态剩余 · 日期」一行（实测该行 204px，
+                        # 加头像 32 + 间距 9）。窄于这个值它就会折成两行。
+                        (".who { flex:0 0 254px;", "身份列容得下剩余时间一行"),
                         (".acts { flex:0 0 110px;", "操作列更窄"),
-                        (".ci-bar { height:4px;", "进度条更细")):
+                        (".ci-bar { flex:1 1 60px; min-width:60px; height:4px;", "进度条更细且自适应")):
         check("紧凑化：%s（%s）" % (needle.split("{")[0].strip(), why), needle in tpl17, "")
     # --- 17c2. 身份列不再"串行"：meta 与 exp 各占独立位置 ---
     check("meta 不再重复 [当前] 标签已说明的「桌面端正在使用」",
@@ -1240,8 +1239,14 @@ def main():
           and '<span class="exp-ttl">' in tpl17 and '<span class="exp-when">' in tpl17, "")
     check("meta / exp 有正常行高与间距（折行后不贴在一起）",
           "line-height:1.4" in tpl17 and ".exp { font-size:12px; color:var(--dim); line-height:1.4; margin-top:4px;" in tpl17, "")
-    check("进度条已缩短（max-width 限制，不再横贯整行）",
-          "max-width:240px; margin-top:2px; }" in tpl17, "")
+    # 进度条与数字同排，整排宽度 == 上方文字行宽度（左右边缘对齐）。
+    # 否则填充比例读不出来：条子 240px、文字行 447px 时，80% 的填充只占整行的 43%。
+    check("进度条与数字同排（.ci-line 包裹 bar + used）",
+          '<div class="ci-line">' in tpl17 and ">已使用 '" in tpl17.replace('"', "'"), "")
+    check("进度条按内容宽度收缩并与上方文字行对齐",
+          "width:fit-content" in tpl17 and "min-width:300px; max-width:100%" in tpl17, "")
+    check("进度条自适应剩余宽度（不再写死 max-width）",
+          "max-width:240px" not in tpl17 and ".ci-line { display:flex; align-items:center; gap:10px;" in tpl17, "")
     check("积分块把「档位名/时间/用量」压到同一行（省两行高度）",
           'h+=\'<div class="ci">\'\n      +\'<div class="ci-info">\'\n      +\'<span class="ci-name">\'' in tpl17, "")
 
