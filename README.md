@@ -57,14 +57,48 @@ WorkBuddy 桌面端的本地登录态保存在：
    的备份改回正式名，否则桌面端会停在"没有 `workbuddy-desktop.info`"的无登录态；
 5. 清理残留的 `.logged-out` 登出标记；
 6. **写后自校验**：重新读取桌面端文件，确认其中的 uid 已是目标账号（与 Trae 切换器一致），
-   未通过则如实报失败，避免"报成功但实际没生效"。
+   未通过则如实报失败，避免"报成功但实际没生效"；
+7. **裁剪旧备份**（`prune_backups`）：纯善后，**必须放在第 6 步之后**。
+
+> ⚠️ 第 7 步的位置很关键。它曾经夹在「旧文件已改名走」和「新文件还没写」之间 ——
+> 一旦这里抛异常，`workbuddy-desktop.info` 就整个不存在了，客户端会认为没有登录态。
+> 而这里**真的会抛**：见下面「安全删除被拒」一节。
 
 **切换后的续期**：前端切换成功后会调用 `/api/refresh`，用目标账号的 `refreshToken` 向 WorkBuddy
 服务器真正续期（`POST /v2/plugin/auth/token/refresh`），拿到全新 `accessToken / expiresAt`，
 并把新有效期写回 `wb_auth\<目标>.info`，使列表里展示的剩余天数即刻更新。
 
-> 切号生成的备份文件本身仍是服务端有效的登录态。识别当前账号时会扫描该目录下全部 `.info`，
+> 切号生成的备份文件本身仍是服务端有效的登录态。识别当前账号时会扫描该目录下的 `.info`，
 > 跳过已登出（带 `.logged-out` 标记）的，其余按修改时间降序，最新的标记为当前账号。
+> **只认 `workbuddy-desktop` 及其切号备份**：同目录下还有 `workbuddy-desktop-ai.*`，
+> 那是 WorkBuddy AI 客户端自己的登录态，本工具既不读取也不裁剪 —— 不过滤的话，
+> 那边一写文件就会把"当前账号"顶掉，页面显示成别人的账号、切换按钮也永远变不成
+> "当前账号"，看起来像切换失败。
+
+### ⚠️ 安全删除被拒会让请求"凭空消失"（已修）
+
+这台机器的 Python 被注入了 WorkBuddy CLI 的**安全删除 shim**（`sitecustomize`）：任何删除
+先过一遍批量删除守卫（`safe-delete-bulk-guard.cjs`）。守卫判定 `confirmRequired` /
+`rejected` 时 `process.exit(2/3)`，Python 侧随即 **`raise SystemExit(1)`**。
+
+`SystemExit` 继承自 **`BaseException` 而不是 `Exception`**，于是它：
+
+1. 穿透 `prune_backups` 的 `except OSError`；
+2. 再穿透 `do_POST` 的 `except Exception`（后者当时还把 `TimeoutError` 和连接异常一起
+   当"客户端断开"处理，直接 `close_connection`）；
+3. 结果：**服务端不发任何响应就断连** → 浏览器只看到 `TypeError: Failed to fetch`
+   → 前端红色 toast「请求失败」→ 而**审计日志里一条记录都没有**。
+
+症状就是「切号偶发提示失败，但查不到任何原因」。现在三层都补上了：
+
+| 位置 | 修法 |
+|------|------|
+| `prune_backups` / `safe_unlink` | 连 `BaseException` 一起吞（只放行 `KeyboardInterrupt`）。裁剪只是善后，删不掉最多多留几份备份，**绝不允许因此让切号失败** |
+| `switch_account` | 裁剪挪到写后自校验**之后**，再包一层兜底 |
+| `BaseHandler.do_POST` / `do_GET` | 只有真正的连接类异常才算断连；`TimeoutError` 回 **504**、其余回 **500**，都带可读原因**并写审计** |
+
+复现与回归：`smoke_test.py` 第 13 段（用假异常复刻 `SystemExit` / `TimeoutError`，
+断言仍回 JSON 且审计有记录）。
 
 > **本工具只接管 `workbuddy-desktop.info`**。同一目录下若还出现 `workbuddy-desktop-ai.info`
 > 及其 `workbuddy-desktop-ai.<时间戳>...info` 备份，那是 **WorkBuddy AI 客户端自己的登录态**

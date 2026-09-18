@@ -253,23 +253,57 @@ def prune_backups(directory, pattern, keep=10, exclude=()):
 
     备份本身是**有效的登录态**，长期堆积等于把凭据散落在磁盘各处，
     因此每次产生新备份后调用本函数做一次清理。返回删除数量。
+
+    ⚠️ 本函数**绝不允许抛出**：它只是善后清理，删不掉最坏也只是多留几份备份，
+    但如果让异常冒出去，调用方（切号）会半途中断 —— 那是真正的数据损坏。
+    所以这里连 BaseException 一起吞（只放行 KeyboardInterrupt）。
+
+    为什么必须连 BaseException 一起吞：这台机器的 Python 被注入了 WorkBuddy CLI 的
+    「安全删除」shim（sitecustomize），删除会先过一遍批量删除守卫
+    （safe-delete-bulk-guard.cjs）。守卫判定 confirmRequired/rejected 时
+    process.exit(2/3)，Python 侧随即 `raise SystemExit(1)` —— SystemExit 继承自
+    BaseException 而不是 Exception，`except OSError` 和上层 `except Exception`
+    都兜不住，结果是请求连响应都不发就断连（浏览器只看到 Failed to fetch），
+    审计日志里一条记录都没有，完全查不到原因。实测就是切号偶发"提示失败"。
     """
     d = Path(directory)
     if not d.is_dir():
         return 0
     skip = set(exclude)
-    files = [f for f in d.glob(pattern) if f.is_file() and f.name not in skip]
-    if len(files) <= keep:
+    try:
+        files = [f for f in d.glob(pattern) if f.is_file() and f.name not in skip]
+        if len(files) <= keep:
+            return 0
+        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    except OSError:
         return 0
-    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
     removed = 0
     for f in files[keep:]:
         try:
             f.unlink()
             removed += 1
-        except OSError:
+        except KeyboardInterrupt:
+            raise
+        except BaseException:  # noqa: BLE001  含 shim 的 SystemExit
             pass
     return removed
+
+
+def safe_unlink(path):
+    """尽力删除一个文件，绝不抛出。用于「回滚 / 清理」这类善后动作。
+
+    与 prune_backups 同样的理由：调用方多半正处在"主操作已经失败、需要回滚"的
+    路径上，这里再抛一个异常只会把真正的失败原因盖掉。
+    """
+    try:
+        Path(path).unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except KeyboardInterrupt:
+        raise
+    except BaseException:  # noqa: BLE001
+        return False
 
 
 def port_in_use(host="127.0.0.1", port=8765, timeout=0.25):
@@ -377,6 +411,42 @@ class BaseHandler(BaseHTTPRequestHandler):
         return data
 
     # --- 路由骨架 -------------------------------------------------------
+    def _handle_request_error(self, exc, path="", target=""):
+        """把处理过程中冒出来的异常转成一个**能看见**的 JSON 响应 + 审计记录。
+
+        之前的写法是 `except (ConnectionError, BrokenPipeError, TimeoutError):
+        self.close_connection = True`，本意只是"客户端中途断开时别刷 traceback"，
+        但它顺手把两类**真实故障**也吞了：
+
+        - `TimeoutError` 同时是 `socket.timeout` 和 `file_lock` 超时抛的类型，
+          网络卡住/锁被占用都会走到这里；
+        - 这台机器注入的 WorkBuddy「安全删除」shim 在批量删除守卫拒绝时抛
+          `SystemExit(1)`（BaseException），`except Exception` 兜不住。
+
+        两者的共同后果是：**服务端不发任何响应就断连**，浏览器只看到
+        `TypeError: Failed to fetch`，审计日志一条没有 —— 用户报"切换账号提示失败"
+        却完全查不到原因。所以这里只把"确实已经写不回去"的连接类异常当断连处理，
+        其余一律回一个带原因的响应并记审计。
+        """
+        if isinstance(exc, (ConnectionError, BrokenPipeError)):
+            self.close_connection = True
+            return
+        if isinstance(exc, TimeoutError):
+            # 消息同样要脱敏：file_lock 的超时文案里带锁文件绝对路径
+            code = 504
+            message = "本地服务处理超时（可能被其它切换/续期占用，请稍后重试）：%s" % scrub(exc)
+        else:
+            code = 500
+            message = err_payload(exc)["message"]
+        payload = {"ok": False, "message": message, "error": type(exc).__name__}
+        if self.AUDIT_DIR and path:
+            audit(self.AUDIT_DIR, self.SOURCE,
+                  self.AUDIT_ACTIONS.get(path, path), target, False, message)
+        try:
+            self._send_json(payload, code)
+        except (ConnectionError, BrokenPipeError, TimeoutError):
+            self.close_connection = True
+
     def do_GET(self):
         try:
             u = urlparse(self.path)
@@ -390,16 +460,18 @@ class BaseHandler(BaseHTTPRequestHandler):
                 return
             code, payload = self.api_get(u)
             self._send_json(payload, code)
-        except (ConnectionError, BrokenPipeError, TimeoutError):
-            # 客户端已断开：无处回送，直接收尾，别再去写 500（那会二次抛错）
-            self.close_connection = True
-        except Exception as e:  # noqa: BLE001
-            self._send_json(err_payload(e), 500)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:  # noqa: BLE001  含 SystemExit（见 _handle_request_error）
+            self._handle_request_error(e)
 
     def do_POST(self):
+        path, target = "", ""
         try:
             u = urlparse(self.path)
+            path = u.path
             p = self._params()  # 先读净请求体，避免拒绝时客户端收到连接重置
+            target = str(p.get("name") or p.get("file") or "")
             if not self._guard():
                 return
             if self.TOKEN and self.headers.get("X-Switcher-Token") != self.TOKEN:
@@ -408,15 +480,14 @@ class BaseHandler(BaseHTTPRequestHandler):
                 return
             code, payload = self.api_post(u, p)
             if self.AUDIT_DIR:
-                target = str(p.get("name") or p.get("file") or "")
                 audit(self.AUDIT_DIR, self.SOURCE,
                       self.AUDIT_ACTIONS.get(u.path, u.path),
                       target, bool(payload.get("ok")), payload.get("message"))
             self._send_json(payload, code)
-        except (ConnectionError, BrokenPipeError, TimeoutError):
-            self.close_connection = True
-        except Exception as e:  # noqa: BLE001
-            self._send_json(err_payload(e), 500)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:  # noqa: BLE001  含 SystemExit（见 _handle_request_error）
+            self._handle_request_error(e, path, target)
 
     def api_get(self, url):
         raise NotImplementedError

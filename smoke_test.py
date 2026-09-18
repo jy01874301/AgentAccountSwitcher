@@ -602,6 +602,121 @@ def main():
     else:
         check("跳过前端 JS 语法检查（node 不在 PATH）", True, "")
 
+    print("\n== 13. 删除被拒时不得拖垮请求（安全删除 shim 会抛 SystemExit）==")
+    # 这台机器的 Python 被注入了 WorkBuddy CLI 的安全删除 shim：删除先过一遍
+    # 批量删除守卫（safe-delete-bulk-guard.cjs），守卫判定 confirmRequired/rejected
+    # 时 process.exit(2/3)，Python 侧随即 raise SystemExit(1)。
+    # SystemExit 是 BaseException 而非 Exception —— 它曾经穿透 prune_backups 的
+    # `except OSError`、再穿透 do_POST 的 `except Exception`，让请求**连响应都不发
+    # 就断连**（浏览器只看到 Failed to fetch，审计日志一条没有）。切号偶发"提示失败"
+    # 就是这个。下面三条断言分别守住三个防线。
+    real_unlink = Path.unlink
+
+    def _boom_unlink(self, *a, **k):
+        raise SystemExit(1)
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        for i in range(6):
+            f = d / ("bk.%02d.info" % i)
+            f.write_text("x", encoding="utf-8")
+            os.utime(f, (time.time() + i, time.time() + i))
+        Path.unlink = _boom_unlink
+        try:
+            n = common.prune_backups(d, "bk.*.info", keep=2)
+            ok_safe = common.safe_unlink(d / "bk.00.info")
+        finally:
+            Path.unlink = real_unlink
+        check("prune_backups 吞掉 SystemExit 并正常返回", n == 0, n)
+        check("删除被拒时备份保持原样（没被删掉）",
+              len(list(d.glob("bk.*.info"))) == 6, len(list(d.glob("bk.*.info"))))
+        check("safe_unlink 删除被拒时返回 False 而不是抛出", ok_safe is False, ok_safe)
+
+    # do_POST：api_post 里冒出 SystemExit / TimeoutError 时必须回一个能看见的 JSON
+    with tempfile.TemporaryDirectory() as td:
+        class _Boom(wb.Handler):
+            AUDIT_DIR = Path(td)
+
+            def api_post(self, u, p):
+                raise SystemExit(1)
+
+        class _Slow(wb.Handler):
+            AUDIT_DIR = Path(td)
+
+            def api_post(self, u, p):
+                raise TimeoutError("等待文件锁超时")
+
+        _Boom.TOKEN = None
+        _Slow.TOKEN = None
+        for label, cls, want in (("SystemExit", _Boom, 500), ("TimeoutError", _Slow, 504)):
+            s, port = common.bind_server(cls, 8941)
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+            try:
+                time.sleep(0.2)
+                st, raw = call(port, "/api/switch", "POST", {"name": "x"})
+                body = {}
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    pass
+                check("api_post 抛 %s 时仍回 JSON（HTTP %d，不再断连）" % (label, want),
+                      st == want and body.get("ok") is False, (st, raw[:90]))
+                check("api_post 抛 %s 时错误类型写进响应" % label,
+                      body.get("error") == label, body.get("error"))
+            finally:
+                s.shutdown()
+                s.server_close()
+        log = (Path(td) / "switcher.log")
+        txt = log.read_text(encoding="utf-8") if log.is_file() else ""
+        check("失败也写进了审计日志（可追溯）", "switch" in txt and "FAIL" in txt, txt[-90:])
+
+    # switch_account：裁剪备份抛异常也不能让切号失败，更不能留下"没有正式登录态"
+    usable2 = [a for a in wb.list_accounts() if a.get("ok")]
+    if not usable2:
+        check("[wb] 无可用账号素材，跳过裁剪异常用例", True, "")
+    else:
+        orig_dir, orig_info = wb.DESKTOP_DIR, wb.DESKTOP_INFO
+        real_prune = common.prune_backups
+
+        def _boom_prune(*a, **k):
+            raise SystemExit(1)
+
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                desk = Path(td)
+                info = desk / "workbuddy-desktop.info"
+                info.write_text('{"account": {"uid": "orig", "nickname": "原账号"}, "auth": {}}',
+                                encoding="utf-8")
+                wb.DESKTOP_DIR, wb.DESKTOP_INFO = desk, info
+                common.prune_backups = _boom_prune
+                try:
+                    ok, msg = wb.switch_account(Path(usable2[0]["path"]).name)
+                finally:
+                    common.prune_backups = real_prune
+                check("裁剪备份抛 SystemExit 时切号仍然成功", ok is True, msg[:80])
+                check("正式登录态文件存在（不会因裁剪失败而丢失）", info.is_file(), str(info))
+        finally:
+            wb.DESKTOP_DIR, wb.DESKTOP_INFO = orig_dir, orig_info
+
+    # current_account：必须只认本工具接管的那一份
+    orig_dir, orig_info = wb.DESKTOP_DIR, wb.DESKTOP_INFO
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            desk = Path(td)
+            good = Path(usable2[0]["path"]).read_text(encoding="utf-8") if usable2 else "{}"
+            mine = desk / "workbuddy-desktop.info"
+            mine.write_text(good, encoding="utf-8")
+            ai = desk / "workbuddy-desktop-ai.info"
+            ai.write_text(good, encoding="utf-8")
+            os.utime(mine, (time.time() - 100, time.time() - 100))   # 让 -ai 更新
+            os.utime(ai, (time.time(), time.time()))
+            wb.DESKTOP_DIR, wb.DESKTOP_INFO = desk, mine
+            names = [e["file"] for e in wb.current_account()]
+            check("当前账号只认 workbuddy-desktop*，不认 workbuddy-desktop-ai*",
+                  names == ["workbuddy-desktop.info"], names)
+    finally:
+        wb.DESKTOP_DIR, wb.DESKTOP_INFO = orig_dir, orig_info
+
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0
 

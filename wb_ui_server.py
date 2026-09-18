@@ -63,6 +63,8 @@ def _localappdata_dir():
 
 DESKTOP_DIR = Path(_localappdata_dir()) / wb.AUTH_REL_DIR
 DESKTOP_INFO = DESKTOP_DIR / "workbuddy-desktop.info"
+DESKTOP_ROOT_ID = DESKTOP_INFO.stem      # "workbuddy-desktop"，用来把同目录下
+                                         # workbuddy-desktop-ai.* 排除在外
 LOGOUT_SUFFIX = wb.LOGOUT_MARKER_SUFFIX  # ".logged-out"
 LOCK_DIR = _BIN_DIR / ".locks"      # 跨进程锁文件（不放进客户端配置目录）
 DESKTOP_BACKUP_KEEP = 10            # 桌面端切号备份保留份数（备份本身是有效登录态）
@@ -101,6 +103,7 @@ def list_accounts():
                 "uid": "",
                 "expires_at": None,
                 "refresh_expires_at": None,
+                "token_source": "",   # 字段必须齐：前端 ttlTag() 会读它
                 "reason": "登录态无法解析（内容可能不全或被加密）",
             })
             continue
@@ -137,6 +140,13 @@ def current_account():
     for f in DESKTOP_DIR.glob("*.info"):
         root_id, is_backup = wb.split_info_name(f.name)
         if not root_id:
+            continue
+        # 只认本工具接管的那一份（workbuddy-desktop + 它的切号备份）。
+        # 同目录下还有 workbuddy-desktop-ai.* —— 那是 WorkBuddy AI 客户端自己的
+        # 登录态（一年期），本工具既不读取也不裁剪。此前不过滤，而"当前账号"取的是
+        # mtime 最新的一个，于是 AI 客户端一写文件就会把当前账号顶掉：
+        # 页面显示成别人的账号，切换按钮也永远变不成"当前账号"，看起来像切换失败。
+        if root_id != DESKTOP_ROOT_ID:
             continue
         if (DESKTOP_DIR / ("%s.info%s" % (root_id, LOGOUT_SUFFIX))).exists():
             continue  # 该 id 会话已登出
@@ -230,11 +240,6 @@ def switch_account(target_name):
                 DESKTOP_INFO.replace(backup)
             except OSError as e:
                 return False, "轮换旧登录态失败：%s" % common.scrub(e)
-            pruned = common.prune_backups(
-                DESKTOP_DIR, "workbuddy-desktop.*.info",
-                keep=DESKTOP_BACKUP_KEEP, exclude={"workbuddy-desktop.info"})
-        else:
-            pruned = 0
 
         # 2. 写入目标账号。这一步失败必须回滚：否则正式文件已被改名走，
         #    桌面端会处于"没有登录态"的状态（此前只报失败、不回滚）。
@@ -269,6 +274,18 @@ def switch_account(target_name):
                 cur_nick = acc_after["nickname"]
             return False, ("写入后校验未通过：桌面端当前登录态仍为「%s」，切换可能未生效。"
                            "请确认 WorkBuddy 客户端未占用该文件后重试" % (cur_nick or "未知"))
+
+        # 5. 裁剪旧备份：纯善后，必须放在**新登录态写好且校验通过之后**。
+        #    此前它夹在「旧文件已改名走」和「新文件还没写」之间 —— 一旦这里抛异常
+        #    （本机的安全删除 shim 在批量删除守卫拒绝时会抛 SystemExit），
+        #    workbuddy-desktop.info 就整个不存在了，客户端会认为没有登录态。
+        #    prune_backups 内部已吞掉包括 SystemExit 在内的一切异常，这里再兜一层。
+        try:
+            pruned = common.prune_backups(
+                DESKTOP_DIR, "workbuddy-desktop.*.info",
+                keep=DESKTOP_BACKUP_KEEP, exclude={"workbuddy-desktop.info"})
+        except BaseException:  # noqa: BLE001
+            pruned = 0
 
     msg = "已切换为 %s（%s），桌面端将自动采纳新会话" % (acc["nickname"], target_name)
     if pruned:
@@ -315,19 +332,15 @@ def add_account(name, content):
         except OSError as e:
             return False, "写入账号文件失败：%s" % e
 
-        # 用现有脚本的解析器校验：只有能解析成有效登录态才保留，否则回滚删除
+        # 用现有脚本的解析器校验：只有能解析成有效登录态才保留，否则回滚删除。
+        # 回滚用 safe_unlink：这台机器的安全删除 shim 会抛 SystemExit（BaseException），
+        # 裸 unlink 会让"拒绝保存"变成"请求直接断连"，用户看不到任何提示。
         acc = wb.session_from_info_file(src)
         if not acc:
-            try:
-                src.unlink()
-            except OSError:
-                pass
+            common.safe_unlink(src)
             return False, "内容不是有效的 WorkBuddy 登录态信息（缺少字段或已加密），已回滚，请粘贴正确的账号文件内容"
         if not common.token_looks_complete((data.get("auth") or {}).get("accessToken")):
-            try:
-                src.unlink()
-            except OSError:
-                pass
+            common.safe_unlink(src)
             return False, ("accessToken 不完整（疑似粘贴时被截断），已回滚。"
                            "请整份复制客户端的 workbuddy-desktop.info 后重新添加")
     return True, "已新增账号 %s（%s）" % (acc["nickname"], fname)
@@ -345,10 +358,8 @@ def remove_account(file_name):
     if not target.is_file():
         return False, "账号文件不存在：%s" % base
     with common.file_lock("wb-auth-" + base, LOCK_DIR):
-        try:
-            target.unlink()
-        except OSError as e:
-            return False, "删除失败：%s" % e
+        if not common.safe_unlink(target) and target.exists():
+            return False, "删除失败：文件仍存在（可能被占用，或本机安全删除策略拒绝了本次删除）"
     return True, "已删除账号文件 %s" % base
 
 
