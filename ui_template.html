@@ -61,7 +61,7 @@
   .row:hover { border-color:#3a4a72; box-shadow:0 8px 20px rgba(0,0,0,.22); }
   .row.cur { border-color:var(--green); background:linear-gradient(135deg,var(--card-2),var(--card)); }
 
-  .who { flex:0 0 196px; min-width:0; display:flex; gap:9px; align-items:flex-start; }
+  .who { flex:0 0 210px; min-width:0; display:flex; gap:9px; align-items:flex-start; }
   /* 头像全站统一：圆形渐变 + 昵称后两字。当前账号卡片与列表行共用同一个类 */
   .avatar {
     width:32px; height:32px; border-radius:50%; flex-shrink:0;
@@ -71,10 +71,12 @@
   }
   .who-body { min-width:0; flex:1 1 auto; }
   .name { font-size:13.5px; font-weight:600; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
-  .meta { color:var(--dim); font-size:11.5px; margin-top:2px; word-break:break-all; }
-  .exp { font-size:12px; color:var(--dim); margin-top:3px; }
+  .meta { color:var(--dim); font-size:11.5px; line-height:1.4; margin-top:3px; word-break:break-all; }
+  .exp { font-size:12px; color:var(--dim); line-height:1.4; margin-top:4px;
+         display:flex; flex-wrap:wrap; gap:0 5px; }
   .exp b { color:var(--text); font-weight:600; }
   .exp.warn b { color:var(--amber); }
+  .exp-ttl, .exp-when { white-space:nowrap; }
   .reason { font-size:12px; color:var(--amber); line-height:1.5; margin-top:5px; }
 
   .ck { font-size:11.5px; color:var(--dim); margin-top:3px; display:flex; align-items:center; gap:5px; }
@@ -171,7 +173,8 @@
   .ci-name { font-size:12.5px; font-weight:600; color:var(--text); white-space:nowrap; }
   .ci-used { font-size:11.5px; color:var(--text); }
   .ci-when { font-size:11.5px; color:var(--dim); }
-  .ci-bar { height:4px; border-radius:2px; background:var(--card-2); overflow:hidden; }
+  .ci-bar { height:4px; border-radius:2px; background:var(--card-2); overflow:hidden;
+            max-width:240px; margin-top:2px; }
   .ci-bar i { display:block; height:100%; border-radius:3px; background:#2bbfa8; }
   .credits-pending { font-size:12px; color:var(--dim); }
 
@@ -625,9 +628,12 @@ function rowHtml(o){
   if(o.ok){
     const rd=remainDays(o.expires_at);
     const cls = rd!=null && rd<3 ? ' warn':'';
-    exp = '<div class="exp'+cls+'">登录态 '
+    // 拆成两个 nowrap 片段：列窄时在"天"与日期之间整体换行，
+    // 不会把"·"孤零零留在行尾（那样看起来就像和下一行串在一起）
+    exp = '<div class="exp'+cls+'">'
+        + '<span class="exp-ttl">登录态 '
         + (rd!=null ? (rd>=0 ? '剩余 <b>'+rd.toFixed(1)+'</b> 天' : '<b>已过期</b>') : '有效期未知')
-        + ' · '+fmtDate(o.expires_at)+'</div>';
+        + '</span><span class="exp-when">· '+fmtDate(o.expires_at)+'</span></div>';
   } else {
     exp = '<div class="reason">'+esc(o.reason||'不可用')+'</div>';
   }
@@ -650,7 +656,8 @@ function rowHtml(o){
     + '<div class="who"><div class="avatar">'+esc(initials(o.nickname))+'</div>'
     + '<div class="who-body">'
     + '<div class="name">'+esc(o.nickname)+' '+tags.join(' ')+'</div>'
-    + '<div class="meta">'+esc(o.file||'（不在账号库中）')+(o.isCurrent?' · 桌面端正在使用':'')+'</div>'
+    + '<div class="meta">'+esc(o.file||'（不在账号库中）')+'</div>'  // 不再追加「· 桌面端正在使用」—— 行首的 [当前] 标签已经说明同一件事，
+    // 重复会把这一行挤到折行，和下面的「登录态剩余」贴在一起（用户反馈的串行问题）
     + exp + checkinBlock(o.file)
     + '</div></div>'
     + '<div class="body">'+creditsBlock(o.file)+'</div>'
