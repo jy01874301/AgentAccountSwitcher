@@ -898,6 +898,10 @@ class BaseHandler(BaseHTTPRequestHandler):
     INDEX_NAME = None        # 或在 BASE_DIR / _internal 下按文件名查找
     BASE_DIR = None          # 查找根目录（打包版会被启动器改成 exe 所在目录）
     UI_CONTEXT = None        # 模板变量（两个切换器共用 ui_template.html）
+    # 除首页外的额外页面：路径 -> (文件名, 该页的模板变量 dict)。
+    # 用途是「一个进程对外提供多个视图」：入口页 / 国服视图 /wb / 国际服视图 /wbai
+    # 共用同一套令牌注入与页面心跳逻辑，不必各写一份 Handler。
+    PAGES = {}
     WRITE_ENDPOINTS = ()     # 只允许 POST 的路径
     server_version = "SwitcherHTTP/1.0"
     TOKEN = None             # 一次性访问令牌；非空时写操作必须带 X-Switcher-Token
@@ -953,6 +957,11 @@ class BaseHandler(BaseHTTPRequestHandler):
         return data
 
     # --- 路由骨架 -------------------------------------------------------
+    def audit_source(self, path=""):
+        """审计日志里的来源标记。默认固定 SOURCE；多通道的 Handler 会按路径改写，
+        这样 [wb] 与 [wbai] 的动作在同一份日志里能分辨出来。"""
+        return self.SOURCE
+
     def _handle_request_error(self, exc, path="", target=""):
         """把处理过程中冒出来的异常转成一个**能看见**的 JSON 响应 + 审计记录。
 
@@ -994,6 +1003,10 @@ class BaseHandler(BaseHTTPRequestHandler):
             u = urlparse(self.path)
             if u.path == "/":
                 self._serve_index()
+                return
+            if u.path in self.PAGES:
+                name, ctx = self.PAGES[u.path]
+                self._serve_page(name, ctx)
                 return
             if u.path == "/api/ping":
                 # 身份端点：让第二个实例能判断"这个端口上是不是我们自己"。
@@ -1039,12 +1052,12 @@ class BaseHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "message": "缺少或错误的一次性访问令牌"}, 401)
                 # 用映射后的动作名，别直接写 u.path —— 否则日志里出现的是
                 # [wb] /api/switch 而不是 [wb] switch，按动作统计会分成两组
-                audit(self.AUDIT_DIR, self.SOURCE,
+                audit(self.AUDIT_DIR, self.audit_source(u.path),
                       self.AUDIT_ACTIONS.get(u.path, u.path), "", False, "令牌校验失败")
                 return
             code, payload = self.api_post(u, p)
             if self.AUDIT_DIR:
-                audit(self.AUDIT_DIR, self.SOURCE,
+                audit(self.AUDIT_DIR, self.audit_source(u.path),
                       self.AUDIT_ACTIONS.get(u.path, u.path),
                       target, bool(payload.get("ok")), payload.get("message"))
             self._send_json(payload, code)
@@ -1060,21 +1073,31 @@ class BaseHandler(BaseHTTPRequestHandler):
         raise NotImplementedError
 
     def _index_path(self):
-        if self.INDEX_FILE:
+        return self._page_path(self.INDEX_NAME or "index.html")
+
+    def _page_path(self, name):
+        if self.INDEX_FILE and name == (self.INDEX_NAME or "index.html"):
             return Path(self.INDEX_FILE)
-        name = self.INDEX_NAME or "index.html"
         return resolve_data(self.BASE_DIR or Path(__file__).resolve().parent, name)
 
     def _serve_index(self):
-        idx = self._index_path()
+        self._serve_page(self.INDEX_NAME or "index.html", self.UI_CONTEXT)
+
+    def _serve_page(self, name, ctx=None):
+        """渲染并返回一个模板页。
+
+        首页与 PAGES 里的额外页走同一条路径 —— 页面心跳、模板渲染、一次性令牌注入
+        只写一份，避免"某个视图拿不到令牌于是所有写操作 401"这类只在子页面出现的坑。
+        """
+        idx = self._page_path(name)
         if not idx or not idx.is_file():
-            self._send(b"index not found", 404, "text/plain; charset=utf-8")
+            self._send(b"page not found", 404, "text/plain; charset=utf-8")
             return
-        # 首页被请求 = 刚刚有页面打开（可能是我们开的，也可能是用户手动开的）
+        # 页面被请求 = 刚刚有页面打开（可能是我们开的，也可能是用户手动开的）
         mark_page_seen()
         body = idx.read_bytes()
-        if self.UI_CONTEXT:
-            body = render_template(body, self.UI_CONTEXT)
+        if ctx:
+            body = render_template(body, ctx)
         if self.TOKEN:
             # 把一次性令牌注入页面：前端拿到后随写请求回传，
             # 进程外的脚本/程序拿不到（除非也去抓取首页并解析）

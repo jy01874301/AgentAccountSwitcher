@@ -15,19 +15,23 @@
 wb_switcher/
 ├── wb_ui_server.py        # 后端：账号读写/切换 + 极简本地 HTTP 服务（127.0.0.1:8765）
 ├── switcher_common.py     # 两个切换器共用的 HTTP 骨架 / 文件锁 / 备份裁剪 / 端口避让
-├── ui_template.html       # 前端模板（两份切换器共用，后端按 UI_CONTEXT 渲染后返回）
+├── ui_hub.html            # 统一入口页：左侧侧边导航栏，两个管理入口（国服 / 国际服）
+├── ui_template.html       # 两个管理视图共用的前端模板（后端按通道渲染后返回）
 ├── wb_ui_app.py           # 桌面版启动器（pywebview 窗口，可打包 exe）
 ├── workbuddy_switcher.cmd # Windows 启动脚本（双击即用）
-├── wb_auth/               # 切换用的账号配置库，放置 *.info 登录态文件（唯一真源，见下）
+├── wb_auth/               # 国服账号库，放置 *.info 登录态文件（唯一真源，见下）
 │   ├── workbuddy-jhan.info
 │   ├── workbuddy-Maggie ya.info
 │   ├── workbuddy-wtnong.info
 │   ├── workbuddy-wtnong1.info
 │   └── workbuddy-星空.info
+├── wbai_auth/             # 国际服（WorkBuddyAI）账号库，同样放 *.info
 ├── tw_ui_server.py / tw_ui_app.py / trae_switcher.cmd  # Trae 姊妹工具，见 README_Trae.md
 ├── WorkBuddySwitcher.spec / TraeSwitcher.spec  # 桌面版打包配置（pyinstaller <spec> --noconfirm）
 ├── import_token.py        # Trae 凭据导入（别机 tokens / storage.json → config.json）
 ├── check_ttl.py           # 登录态体检：签发通道 / 剩余天数 / accessToken 完整性（只读）
+├── check_exe_datadir.py   # 冻结态 exe 的数据目录基准自检（双探针法，重新打包后跑）
+├── window_state_guard.py  # 客户端主窗口「自动还原」诊断与修复（见「窗口状态守卫」一节）
 ├── smoke_test.py          # 回归自检：裁剪 / 文件锁 / 端口 / 接口 / 令牌校验（不碰真实登录态）
 ├── refresh_all.cmd / trae_refresh_all.cmd      # 全量续期（计划任务用，支持 /nopause）
 ├── install_refresh_task.ps1  # 注册「每 N 小时全量续期」计划任务（-Trae / -Remove / -Hours）
@@ -206,6 +210,59 @@ tail -20 logs/switcher.log                            # 失败原因
 ls -la "%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth" | grep workbuddy-desktop
 ```
 
+### 客户端窗口大小/位置被「自动还原」（窗口状态守卫）
+
+**与本工具无关** —— 本项目既不读也不写窗口状态文件，也不重启客户端（已 grep 确认）。
+
+两个客户端各把主窗口几何存一份，位置在**各自 userData 下**：
+
+| 通道 | 产品 | 状态文件 |
+|---|---|---|
+| `wb` | WorkBuddy（国服） | `%USERPROFILE%\.workbuddy\app\window-state.json` |
+| `wbai` | WorkBuddyAI（国际服） | `%USERPROFILE%\.workbuddy-ai\app\window-state.json` |
+
+schema：`{"version":2,"bounds":{x,y,width,height},"isMaximized":bool,"isFullScreen":bool}`
+
+三条关键事实（来自客户端 `app.asar` 内 `src/main/window/window-state.ts`）：
+
+1. `bounds` = `win.getNormalBounds()` —— **最大化之前的「还原尺寸」，不是当前窗口尺寸**，单位 DIP（缩放 1.25 时 ×1.25 才是物理像素）。
+2. 写时机：`resize` / `move` 后 **500ms 去抖**，全应用只有这一个写入方。
+3. 读时机：**只在建窗时**（冷启动 / 崩溃重建）。恢复顺序 = 按 `bounds` 建窗（隐藏）→ `ready-to-show` 时 `maximize()` → `show()`。
+
+**所以 `bounds` 就是「窗口被还原后的大小与位置」的唯一来源。** 它一旦被记成偏小的陈旧值，
+窗口每次离开最大化状态（拖标题栏 / 双击标题栏 / `Win+↓` / 贴边 / 重启后的建窗窗口期）
+都会缩到那个小尺寸。而它永远停在那个小值，是因为用户长期保持最大化 →
+不产生新的非最大化几何 → `resize`/`move` 不触发 → 小值被永久钉死。
+
+诊断与修复用 `window_state_guard.py`（纯标准库，独立 CLI，**未**打进 exe）：
+
+```bash
+python window_state_guard.py show                      # 看两个通道的现状与判定
+python window_state_guard.py list                      # 列出可见窗口（定位用）
+python window_state_guard.py capture --channel wbai    # 手动摆好后固化（推荐）
+python window_state_guard.py pin --channel wbai --size 1600x1000 --maximized --apply --live
+python window_state_guard.py check --fix --live        # 漂移则回写 + 就地修正运行中窗口
+python window_state_guard.py watch --channel wbai --seconds 120   # 抓「谁什么时候改的」
+```
+
+`--apply` / `--fix` 会先备份到 `window_state_backups/`，再 tmp + `os.replace` 原子写入。
+期望值存在 `window_state_golden.json`。建议登录时跑一次 `check --fix`，
+让每次冷启动建窗读到的都是 pinned 值。
+
+**`--live` 的意义**：客户端只在建窗时读状态文件，光改文件对**已在运行**的窗口无效。
+`--live` 用 Win32 `SetWindowPlacement` 直接改窗口的 `rcNormalPosition`（**保持 `showCmd`
+不变，不改变当前最大化状态，用户看不到跳变**），无需重启客户端。
+
+> ⚠️ **顺序不能反**（实测踩过）：必须**先改窗口、再写文件**。反过来的话，
+> `SetWindowPlacement` 触发的 `resize`/`move` 会让客户端 500ms 去抖后把**当时**的
+> `getNormalBounds()` 落盘，正好冲掉刚写的值（实测被改回 812x607）。
+> 工具里的 `apply_all()` 已按正确顺序实现并加了 1.2s 等待。
+
+完整诊断过程与证据见 `AUDIT_window_state_2026-09-20.md`。
+
+> ⚠️ DPI 约定：脚本**故意不调用** `SetProcessDpiAwareness`，保持 DPI-unaware，
+> 这样 Win32 返回虚拟化坐标（= DIP），可与 Electron 的 `bounds` 直接比对。
+
 ### 单实例保护（已实现）
 
 **同一时刻只允许一个实例。** 双击两次不会再起第二个：
@@ -301,11 +358,60 @@ ls -la "%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth" | grep workbuddy-des
 复现与回归：`smoke_test.py` 第 13 段（用假异常复刻 `SystemExit` / `TimeoutError`，
 断言仍回 JSON 且审计有记录）。
 
-> **本工具只接管 `workbuddy-desktop.info`**。同一目录下若还出现 `workbuddy-desktop-ai.info`
-> 及其 `workbuddy-desktop-ai.<时间戳>...info` 备份，那是 **WorkBuddy AI 客户端自己的登录态**
-> （`expiresAt` 为一年期，命名格式也由客户端自己生成），本工具既不读取、也不切换、也不裁剪它。
-> 备份裁剪的通配 `workbuddy-desktop.*.info` 匹配不到 `workbuddy-desktop-ai.*`（`desktop` 后面
-> 是连字符而不是点），所以那一族会原样保留 —— 这是预期行为，不是漏清理。
+> **本工具按「通道」接管登录态，一个进程同时服务两个通道**：
+> `workbuddy-desktop.info`（**国服**，`www.workbuddy.cn`）与
+> `workbuddy-desktop-ai.info`（**国际服**，`www.workbuddy.ai`）。
+> 两者**放在同一个目录**、文件格式完全相同，只是文件名与域名不同 —— 所以每处读写都必须
+> 按 `root_id` 过滤（国服只认 `workbuddy-desktop*`、国际服只认 `workbuddy-desktop-ai*`）。
+> 不过滤的话，一边写文件就会把另一边的"当前账号"顶掉：页面显示成别人的账号、
+> 切换按钮永远变不成"当前账号"，看起来像切换失败。备份裁剪的通配也各自独立
+> （`workbuddy-desktop.*.info` 匹配不到 `workbuddy-desktop-ai.*`，因为 `desktop` 后面
+> 是连字符而不是点），两族的备份互不干扰 —— 这是预期行为，不是漏清理。
+>
+> 详见下面的「双通道（国服 / 国际服）」。
+
+### 双通道（国服 / 国际服）
+
+页面入口是 `/`（统一入口页），左侧侧边导航栏有两个管理入口，各自指向一个**独立视图**：
+
+| 入口 | 服别 | 视图 | 接管的登录态 | 账号库 | 接口前缀 |
+|---|---|---|---|---|---|
+| WorkBuddy账号管理 | 国服 | `/wb` | `workbuddy-desktop.info`（`www.workbuddy.cn`） | `wb_auth\` | `/api/*` |
+| WorkBuddyAI账号管理 | 国际服 | `/wbai` | `workbuddy-desktop-ai.info`（`www.workbuddy.ai`） | `wbai_auth\` | `/api/wbai/*` |
+
+两个视图共用同一份 `ui_template.html`，差别全部来自后端注入的通道上下文：
+
+| 能力 | 国服 | 国际服 | 为什么 |
+|---|---|---|---|
+| 切换 / 增删账号 | ✅ | ✅ | 同一套文件读写逻辑 |
+| 积分明细 | ✅ | ✅ | **两个通道不是同一个计费网关**：国服 `copilot.tencent.com` / 国际服 `www.workbuddy.ai`。拿国际服的 accessToken 去打国服网关恒返回 HTTP 401（实测），所以 `endpoint` 必须按通道给 —— 见 `channel_cfg()` |
+| 签到状态 / 一键签到 | ✅ | ❌ | 国际服的签到接口**可达但活动未开启**（实测 `active=false`「签到活动未开启」），且按用户要求不迁移签到入口 |
+| 一键续期 | ✅ | ✅ | 同 `endpoint` 机制；续期路径 `/v2/plugin/auth/token/refresh`，国际服实测可续 |
+| 切号时迁移本地数据 | ✅ | ❌ | 迁移只对国服的数据目录（`~/.workbuddy`）验证过 |
+| 打开客户端 | ❌ | ❌ | 国服侧按用户要求去掉按钮（**接口保留**，迁移流程内部仍在用）；国际服在**接口层**也拒掉 —— 进程是按国服 exe 名枚举的，放行等于用 `/api/wbai/open-client` 去开国服客户端 |
+
+> ⚠️ 网关配置**只有 `channel_cfg(ch)` 一个入口**。早期四个调用点（积分、签到状态、
+> 签到、续期）各写一行 `wb.load_config(SCRIPT_DIR / "config.json")`，拿到的永远是国服
+> 网关 —— 加通道时最容易漏改的就是这种「每处各写一遍」的取配置方式。
+> 也**不要**用 `os.environ["WORKBUDDY_ENDPOINT"]` 覆盖：那是进程级的，两个通道在同一
+> 进程里同时服务，设了会把国服也一起改掉。
+
+后端实现上，一个通道 = `Channel` 配置对象（`wb_ui_server.py`）：
+
+```python
+CHANNELS = {"wb": Channel(...), "wbai": Channel(...)}
+```
+
+读写函数都接受 `ch` 参数（默认国服，保持 CLI / 计划任务 / 老调用的行为不变），
+内部只读 `ch.auth_dir` / `ch.desktop_info` / `ch.backup_glob` / `ch.lock_key` 这些属性。
+**「加一个通道」= 加一份配置，而不是复制一份 `switch_account`。**
+
+> ⚠️ 桌面端目录是**通道实例属性**（`ch.desktop_dir`），不是模块级常量。
+> 早期版本有个 `wb.DESKTOP_DIR`，自检靠改它把写盘重定向到临时目录；
+> 重构后那个名字不再生效，重定向**静默失效**，自检于是真的切了本机的登录态。
+> 现在统一走 `ch.redirect(目录)`，重定向没生效会立刻让断言失败，不会再静默。
+> 自检里那条 `[wb] 桌面端目录已重定向到临时目录` 断言就是防这件事复发。
+
 
 ### 并发与备份策略
 
@@ -336,21 +442,69 @@ python wb_ui_server.py --serve [--port 8765]  # 启动本地 HTTP 服务（端�
 python wb_ui_server.py --prune [N]      # 清理桌面端切号备份，只留最近 N 份（默认 10）
 ```
 
+加 `--channel wbai` 可把上述命令指向**国际服**通道：
+
+```bash
+python wb_ui_server.py --channel wbai --list
+python wb_ui_server.py --channel wbai --current
+python wb_ui_server.py --channel wbai --switch workbuddyai-xxx.info
+```
+
 ### 页面结构
 
+`/` 是**统一入口页**：左侧侧边导航栏两个管理入口，右侧是选中入口对应的独立视图
+（用 iframe 承载，两边 JS/CSS 完全隔离，不必把两个视图的前端揉成一个巨型文件）。
+
 ```
-┌ 导航栏（sticky 常驻顶部）────────────────────────────────────┐
-│ [logo] WorkBuddy 账号切换器   当前账号 可用账号 添加账号       │
-│                              ● 已连接   ↻ 刷新   ▶ 打开客户端 │
-└──────────────────────────────────────────────────────────────┘
-  提示块（首行是副标题）
-  当前桌面端账号          一行，右侧带「打开客户端」
-  可用账号（来自 wb_auth）  标题右侧是工具条：刷新积分 / 一键签到 / 一键续期
-  ＋ 添加账号              折叠卡片
-  可用账号列表             每行：身份 | 积分明细 | 操作
+┌ 侧边导航栏 ────────┬ 内容区（/wb 或 /wbai）────────────────────┐
+│ [logo] 账号管理     │  ● 已连接   ↻ 刷新                        │
+│ WorkBuddy 与        │ ────────────────────────────────────────  │
+│ WorkBuddyAI         │  提示块（首行是副标题）                    │
+│                     │  当前桌面端账号        一行                │
+│ 管理入口            │  可用账号（来自 <账号库>） 标题右侧是工具条 │
+│ ┃[国服] WorkBuddy   │  ＋ 添加账号            折叠卡片           │
+│ ┃      账号管理     │  可用账号列表           每行：身份|积分|操作│
+│ ┃      workbuddy-   │                                          │
+│ ┃      desktop.info │                                          │
+│ ┃      … · 当前：X  │                                          │
+│ ┃[国际服] WorkBuddyAI                                          │
+│ ┃      账号管理     │                                          │
+│ ┃      … · 当前：Y  │                                          │
+│ ● 本地服务已连接    │                                          │
+└─────────────────────┴──────────────────────────────────────────┘
 ```
 
-**导航栏**（`DESIGN` 无，直接看代码）：
+**侧边导航栏**（`ui_hub.html`）：
+
+| 入口 | 名称 | 服别 | 副标题（入口下方两行） | 状态行 |
+|---|---|---|---|---|
+| `/wb` | WorkBuddy账号管理 | 国服 | `workbuddy-desktop.info` / `www.workbuddy.cn · 账号库 wb_auth\` | 当前：<昵称> |
+| `/wbai` | WorkBuddyAI账号管理 | 国际服 | `workbuddy-desktop-ai.info` / `www.workbuddy.ai · 账号库 wbai_auth\` | 当前：<昵称> |
+
+交互与实现要点：
+
+- 入口是**真锚点**（`href="#/wb"` / `href="#/wbai"`），点击时脚本切视图并同步 hash ——
+  刷新页面、复制链接都能停在同一个视图；中键/新标签打开也照常可用。
+- 当前入口用 `aria-current` + `.on` 高亮；键盘可达（`focus-visible` 有描边）。
+- **iframe 懒加载**：没点过的视图不加载，点了才把 `data-src` 写进 `src`；
+  切回来不重新加载（两个 iframe 都留在 DOM 里，只是显示/隐藏切换）。
+- 入口下方的「当前：X」由入口页自己拉 `/api/current` 与 `/api/wbai/current` 得到
+  （都是只读 GET，不需要一次性令牌），每 30 秒自更新 —— 切完号不用手动刷新侧边栏。
+
+> ⚠️ **入口页必须由本地服务提供，不能当普通 html 文件打开。**
+> 双击 `ui_hub.html`、或把它丢到静态托管上时，`/api/*` 与两个 iframe 的 `/wb`、`/wbai`
+> 全都不可达。此时页面会**顶部弹出红色提示条**说明原因并给出正确地址
+> （`http://127.0.0.1:8765/`），侧边栏两个入口显示「未连接到本地服务」，
+> 内容区换成「视图不可用」占位 —— 而不是让浏览器甩出一个打不开的图标。
+> 正确入口：跑 `WorkBuddySwitcher.exe`（它自己会开窗口），或
+> `python wb_ui_server.py --serve` 后访问打印出来的地址。
+- 两个视图页在 iframe 里会自己认出被嵌入（`window.self!==window.top`），
+  隐藏自身的品牌与锚点导航（外层侧边栏已经有一份了），只保留右侧状态与工具按钮，
+  并把这一行降级成无边框工具条。
+- 重复页面探测由**入口页**负责（频道 `wb_switcher_hub`）；视图层在嵌入模式下不参与，
+  否则同一个入口页里的两个视图会互相把对方当成"重复页面"。
+
+**视图内导航栏**（`ui_template.html`，两个视图共用）：
 
 | 入口 | 位置 | 交互 |
 |---|---|---|
@@ -360,6 +514,7 @@ python wb_ui_server.py --prune [N]      # 清理桌面端切号备份，只留�
 
 > 当前账号行也放了「打开客户端」—— 切完号正是需要它重新读取登录态的时候，
 > 比让用户回到顶部导航更顺手。列表行则只有切换/删除。
+> **本机两个通道都把它关掉了**（`OPEN_CLIENT` 置空），Trae 侧仍保留。
 
 ### 「打开客户端」
 
@@ -376,6 +531,7 @@ exe 定位只从**固定候选位置**和**正在运行的进程路径**里找�
 下的 `WorkBuddyAI\WorkBuddyAI.exe` → 注册表卸载项的 `DisplayIcon` / `InstallLocation`。
 
 接口：`GET /api/client-status`（只读）、`POST /api/open-client`（写，需令牌）。
+两者都按通道分派：国际服分别返回 `{"ok":true,"client":null,"unsupported":true}` 与 `400 国际服不代管客户端进程`，不会谎报国服的进程状态。
 
 ### 加载性能
 
@@ -554,7 +710,9 @@ Windows 上**刚创建/刚写入的文件与目录**可能被杀软或索引器�
 
 | 方法 | 路径 | 参数 | 说明 |
 |------|------|------|------|
-| GET  | `/` | — | 返回前端页面 |
+| GET  | `/` | — | **统一入口页**（侧边导航栏，两个管理入口） |
+| GET  | `/wb` | — | **国服**管理视图（WorkBuddy 账号管理） |
+| GET  | `/wbai` | — | **国际服**管理视图（WorkBuddyAI 账号管理） |
 | GET  | `/api/accounts` | — | 列出 `wb_auth` 可用账号 |
 | GET  | `/api/current` | — | 桌面端当前账号 |
 | GET  | `/api/credits` | `?force=1` | 积分明细：各账号总剩余积分 + 套餐基础 / 平台奖励明细（缓存 10 分钟，`force` 强制回源） |
@@ -565,6 +723,16 @@ Windows 上**刚创建/刚写入的文件与目录**可能被杀软或索引器�
 | POST | `/api/add` | `{name, content}` | 新增账号 |
 | POST | `/api/checkin` | — | 一键签到：账号库全部可用账号各签一次 |
 | POST | `/api/refresh-all` | — | 一键续期：全部账号强制续期（跳过门卫） |
+
+**国际服通道**把上表的 `/api/xxx` 换成 `/api/wbai/xxx`（`accounts` / `current` /
+`switch` / `remove` / `add` / `credits` / `refresh` / `refresh-all` 都可用，走
+`https://www.workbuddy.ai` 网关；`checkin-status` 返回空列表并带 `unsupported: true`；
+`checkin` / `refresh-all` 中签到那条返回 400 并说明原因）。
+
+> 路由是**白名单式**的：只有注册在 `CHANNELS` 里的 key 才会被识别，
+> `/api/whatever/switch` 不会被误当成某个通道，而是落回国服的 404。
+> 两个前缀都登记进了 `WRITE_ENDPOINTS` —— 漏了的话，GET 不会对它们返回 405，
+> 写接口就能被 GET 摸到。
 
 > 签到状态是 **GET `/api/checkin-status`**、签到动作是 **POST `/api/checkin`** ——
 > 两者必须用不同路径：`WRITE_ENDPOINTS` 里的路径一律拒绝 GET（405），
@@ -697,7 +865,7 @@ try {
 体检命令：
 
 ```bash
-python check_ttl.py              # 扫 wb_auth 与 ..\自动签到\wb_auth
+python check_ttl.py              # 扫 wb_auth、wbai_auth 与 ..\自动签到\wb_auth
 python check_ttl.py wb_auth      # 只扫指定目录
 ```
 
@@ -781,9 +949,25 @@ $VENV = C:\Users\Administrator\.workbuddy-ai\binaries\python\envs\default
 & "$VENV\Scripts\python.exe" -m PyInstaller TraeSwitcher.spec --noconfirm
 ```
 
-产物在 `dist\WorkBuddySwitcher\`、`dist\TraeSwitcher\`。把账号目录（`wb_auth\`、`tw_auth\`）
-放到 exe 同级即可识别。验证 `webview` 确实打进去了：`dist\*\ _internal\` 下应能看到
-`webview\`、`pythonnet\`、`clr_loader\` 三个目录。
+产物在 `dist\WorkBuddySwitcher\`、`dist\TraeSwitcher\`。把账号目录（`wb_auth\`、
+`wbai_auth\`、`tw_auth\`）放到 exe 同级即可识别。验证 `webview` 确实打进去了：
+`dist\*\ _internal\` 下应能看到 `webview\`、`pythonnet\`、`clr_loader\` 三个目录。
+
+> ⚠️ **exe 的数据目录基准是「exe 同级」，不是 cwd、也不是 `_internal\`。**
+> 实现方式是 `wb_ui_app` / `tw_ui_app` 在 `import` 之后把
+> `srv._BIN_DIR` 指到 `Path(sys.executable).parent`（冻结态才这么干）。
+>
+> 因此**通道的账号库路径必须按 `_BIN_DIR` 现算**（`Channel.auth_dir` 是属性，
+> 不是 `__init__` 里存的快照），模块级路径常量一个都不能留 —— 它们全是导入时的快照，
+> 而这次改写发生在导入**之后**，改不到已经建好的通道上。
+> 踩过两次，表现分别是「自检真的切了本机登录态」和
+> 「打包后的 exe 跑去 `_internal\wb_auth\` 找账号，页面恒显示 0 个，源码运行却完全正常」。
+>
+> 部署后自检：把账号目录放到 exe 同级，跑
+> `WorkBuddySwitcher.exe --serve --port <冷门端口>`，再请求 `/api/accounts`，
+> 条数应与你放进去的文件数一致。
+> 或者直接跑 `python check_exe_datadir.py [exe 目录]`（双探针法，自动判两个通道
+> 读的是 exe 同级还是 `_internal\`，跑完自动清理探针）。
 
 ### 桌面版 exe 的命令行开关
 
@@ -791,11 +975,27 @@ $VENV = C:\Users\Administrator\.workbuddy-ai\binaries\python\envs\default
 WorkBuddySwitcher.exe                  :: 正常：开原生窗口
 WorkBuddySwitcher.exe --serve          :: 只跑本地 HTTP 服务，不开窗口（便于 curl 冒烟）
 WorkBuddySwitcher.exe --serve --port 8790
+
+:: 一次性动作会被转交后端（与 python wb_ui_server.py 同一套实现）
+WorkBuddySwitcher.exe --list
+WorkBuddySwitcher.exe --channel wbai --list
+WorkBuddySwitcher.exe --refresh-all [--force]
+WorkBuddySwitcher.exe --channel wbai --migrate-preview x.info
 ```
+
+> `--channel` / `--force` / `--migrate-mode` 是**修饰符**，单独出现不构成动作 ——
+> `WorkBuddySwitcher.exe --channel wbai` 仍然开原生窗口。
+> 以前这些动作被**静默忽略**：`WorkBuddySwitcher.exe --refresh-all` 不会续期，
+> 而是弹出一个窗口，脚本看退出码 0 还以为成功了。
 
 窗口版没有控制台，出了问题看不到任何提示。所以：
 
 - `--serve` 是唯一的排障入口（能用 curl 直接打接口）。
+- 一次性动作在**终端或脚本里**能正常拿到 stdout 与退出码（实测
+  `WorkBuddySwitcher.exe --channel wbai --migrate-preview x.info` 会打印 JSON 并返回 1）。
+  只有**双击**运行时没有控制台、`print` 无处可去 —— 那种场景请用
+  `python wb_ui_server.py ...`（`refresh_all.cmd` 走的就是那条路）。
+- 账号目录要放在 exe 同级，否则 `--list` 只会回 `{"accounts": []}`。
 - WebView 起不来时会退回系统浏览器，同时把原因写进 exe 同级的
   `logs\desktop-start.log` —— 否则用户只会看到"浏览器突然弹出来"，无从判断。
 
@@ -808,6 +1008,8 @@ WorkBuddySwitcher.exe --serve --port 8790
 - `pathex` / `ICON` 已改成基于 `SPEC` 的相对定位，换机器或换盘符不必再改 spec。
 - 运行时若找得到 `..\自动签到\config.json` 就优先读它的 `endpoint` 等配置；找不到则用
   内置默认值（`https://copilot.tencent.com`），不影响切号与续期。
+  ⚠️ 这个默认值只对**国服**成立 —— 国际服的网关是 `https://www.workbuddy.ai`，
+  由 `channel_cfg(ch)` 按通道覆盖（`Channel.endpoint`），不依赖 config.json 是否存在。
 - **源码改动后必须重新打包**，`dist\` 不会自动跟随源码。
 - ⚠️ **重新打包前先手工删掉 `dist\` 与 `build\`，并且先结束正在运行的 exe。**
   本机的 `rm` 是 WorkBuddy CLI 注入的安全删除 shim（走回收站），删大目录会
@@ -824,7 +1026,7 @@ WorkBuddySwitcher.exe --serve --port 8790
 python smoke_test.py
 ```
 
-64 项断言，覆盖：
+392 项断言，覆盖：
 
 - 备份裁剪、文件锁（超时/串行/**锁文件不随加锁次数增长**）、端口避让
 - 令牌注入健壮性（`<head>` 带属性时仍能注入）
@@ -836,9 +1038,46 @@ python smoke_test.py
 - 审计日志：记录切号、记录令牌失败、**不含凭据**
 - 令牌完整性校验（add 拒绝、列表标记、拒绝切换）、**拒绝路径穿越的 name**、增删闭环
 - 错误脱敏（500 响应不含用户目录）、依赖契约（缺模块/缺成员的可读报错）
-- 前端模板渲染（无残留占位符）、账号带 token_source 字段
+- 前端模板渲染（无残留占位符，**三个上下文 wb / wbai / tw 逐一校验**）、账号带 token_source 字段
+- **入口页与两个视图**：`/` 是统一入口页、侧边栏两个入口的名称与服别、
+  两个入口指向各自独立视图、国际服视图显示积分与续期但隐藏签到、接口前缀正确
+- **入口页的离线自证**：含离线提示条与占位、区分「未连接到本地服务」与「读取失败」、
+  离线时不加载 iframe（`show()` 带 `online` 门卫）
+- **账号库路径是派生值**：改 `_BIN_DIR` 后两个通道的 `auth_dir` 都跟着变；
+  模块级路径常量（`AUTH_DIR` / `DESKTOP_DIR` / `DESKTOP_INFO` / `DESKTOP_ROOT_ID`）一个都不存在
+- **国际服写路径**：`add` 用 `workbuddyai-` 前缀、`switch` 写 `workbuddy-desktop-ai.info`、
+  备份族是 `workbuddy-desktop-ai.*`，且**不碰**国服的正式文件与备份
+- **国际服不代管客户端**：`/api/wbai/open-client` 回 400、`/api/wbai/client-status` 不谎报国服进程
+- **两个通道各看各的文件**：国服只认 `workbuddy-desktop*`、国际服只认
+  `workbuddy-desktop-ai*`；国际服写接口只收 POST（405）
+- **能力守卫在函数内**：`migrate_preview` / `refresh_all` / `checkin_all` 自带守卫，
+  CLI 与 HTTP 两个入口行为一致（不靠调用方记得挡）
+- **按通道的函数都显式收 `ch`**：`credits_snapshot` / `checkin_snapshot` /
+  `checkin_account_file` / `checkin_all` / `refresh_all_ui` / `migrate_preview`
+  签名里都有 `ch`，内部不拿默认通道兜底
+- **积分/签到缓存按通道分区**：`_CREDITS_CACHE` / `_CHECKIN_CACHE` 是
+  `{通道 key: {...}}`；国际服命中自己那条、不串国服；缓存失效只清该通道
+- **CLI 退出码说真话**：`--channel wbai --migrate-preview` 非零退出且不输出国服数据；
+  无迁移能力的通道上带 `--migrate` 切号时，返回消息里明说「本次仅切换」
+- **exe 认 CLI 动作**：`--list` / `--switch` / `--refresh-all` / `--migrate-preview` 等
+  会被转交后端处理（以前被静默忽略并**弹出一个窗口**）；`--channel` 这类修饰符单独出现
+  时仍走「开原生窗口」
+- **数据目录基准只有一个改写入口**：`rebind(base)` 一次改全
+  （`_BIN_DIR` / `SCRIPT_DIR` / `LOCK_DIR` / `Handler.BASE_DIR` / `Handler.AUDIT_DIR`），
+  启动器里**一行 `srv.X = ...` 都不许有**（逐个赋值就是"漏改一个"的来源）
+- **Trae 侧目录也是派生值**：`auth_dir()` / `lock_dir()` / `backup_dir()` 按 `_BIN_DIR` 现算，
+  不再是 `TW_AUTH_DIR` / `LOCK_DIR` 这类导入时快照（以前半新半旧，`tw_backups` 是现算的）
+- **Trae 侧写路径**：切号 / 备份落 `tw_backups` / `remove` 闭环，全程临时目录 +
+  伪造的本机登录态，真实 Trae 登录态一个字节都不碰
 
-不改动真实登录态（切号用不存在的账号名触发，增删用临时文件后清理）。
+不改动真实登录态（切号一律在**重定向到临时目录的通道**上进行，增删用临时文件后清理）。
+
+> ⚠️ 改自检里「切号落盘」相关用例时注意：桌面端目录是**通道实例属性**，
+> 必须用 `wb.CHANNELS["wb"].redirect(临时目录)`，并断言重定向确实生效。
+> 早期版本改的是模块级 `wb.DESKTOP_DIR`，重构后那个名字不再生效 ——
+> 重定向静默失效，自检真的切了本机的登录态（跑完才发现，已从轮换备份还原）。
+> 现在有一条 `[wb] 桌面端目录已重定向到临时目录` 的断言把这件事钉住。
+
 改完代码建议跑一遍，退出码非 0 即有失败项。
 
 ---

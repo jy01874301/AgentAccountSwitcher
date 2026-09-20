@@ -252,6 +252,14 @@
   .nav-link:hover { background:var(--card-2); color:var(--text); }
   .nav-link.on { background:rgba(79,140,255,.16); color:var(--accent); }
   .nav-right { margin-left:auto; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+
+  /* ---- 嵌入模式：本页被「统一入口页」用 iframe 打开时 ----
+     外层已经有侧边导航栏（品牌 + 两个管理入口），这里再显示一份就重复了。
+     所以隐藏品牌与锚点导航，并把这一行降级成**无边框工具条** —— 只留右侧的
+     连接状态/刷新/打开客户端，它们是这个视图自己的操作区。 */
+  .embed .nav-brand, .embed .nav-links { display:none; }
+  .embed .dup-bar { display:none !important; }
+  .embed .nav { background:transparent; border-color:transparent; padding:0 2px; margin-bottom:14px; }
   .nav-status { display:flex; align-items:center; font-size:12.5px; color:var(--dim); }
 </style>
 </head>
@@ -368,18 +376,32 @@
 
 <script>
 const UI = { authDir: "{{AUTH_DIR}}", cmd: "{{CMD}}", credits: "{{CREDITS}}", checkin: "{{CHECKIN}}",
-             migrate: "{{MIGRATE}}", openClient: "{{OPEN_CLIENT}}" };
+             migrate: "{{MIGRATE}}", openClient: "{{OPEN_CLIENT}}", refresh: "{{REFRESH}}",
+             view: "{{VIEW}}" };
 // 「打开客户端」只在 Trae 侧显示（WorkBuddy 侧按用户要求去掉）
 if(UI.openClient!=='1'){
   var _ob=document.getElementById('openClientBtn');
   if(_ob) _ob.style.display='none';
 }
+// 「一键续期」按后端能力显示。两个通道的续期网关**不同**（国服 copilot.tencent.com /
+// 国际服 www.workbuddy.ai），由后端按通道选；能力关闭时置空即隐藏，避免点了必然失败。
+if(UI.refresh!=='1'){
+  var _rb=document.getElementById('rfBtn');
+  if(_rb) _rb.style.display='none';
+}
 
-const API = { accounts:'/api/accounts', current:'/api/current', switch:'/api/switch', add:'/api/add',
-              remove:'/api/remove', refresh:'/api/refresh', credits:'/api/credits',
-              checkinStatus:'/api/checkin-status', checkin:'/api/checkin', refreshAll:'/api/refresh-all',
-              migratePreview:'/api/migrate-preview', pageAlive:'/api/page-alive',
-              openClient:'/api/open-client' };
+// 统一入口页用 iframe 承载本视图，此时外层已有侧边导航栏，隐藏本页自己的品牌与锚点。
+// 用 window.self!==window.top 判断，不需要服务端额外传参。
+if(window.self!==window.top){ document.documentElement.classList.add('embed'); }
+
+// 各视图的接口前缀由后端注入：国服 "/api/"，国际服 "/api/wbai/"。
+// pageAlive 不带前缀 —— 页面心跳是服务进程级的，与通道无关。
+const API = { accounts:'{{API_BASE}}accounts', current:'{{API_BASE}}current', switch:'{{API_BASE}}switch',
+              add:'{{API_BASE}}add', remove:'{{API_BASE}}remove', refresh:'{{API_BASE}}refresh',
+              credits:'{{API_BASE}}credits', checkinStatus:'{{API_BASE}}checkin-status',
+              checkin:'{{API_BASE}}checkin', refreshAll:'{{API_BASE}}refresh-all',
+              migratePreview:'{{API_BASE}}migrate-preview', openClient:'{{API_BASE}}open-client',
+              pageAlive:'/api/page-alive' };
 
 // ---- 页面心跳 + 重复页面识别 ---------------------------------------------
 // 心跳让服务端知道"还有页面开着"，这样重复运行启动脚本时不会再开一个标签页。
@@ -395,8 +417,12 @@ const API = { accounts:'/api/accounts', current:'/api/current', switch:'/api/swi
   document.addEventListener('visibilitychange', function(){ if(!document.hidden) beat(); });
 
   if(typeof BroadcastChannel === 'undefined') return;
+  // 嵌入模式（统一入口页的 iframe）不参与重复页面探测：入口页本身负责这件事，
+  // 视图层再判一次只会把"同一个入口页里的另一个视图"当成重复页面。
+  if(window.self!==window.top) return;
   var mine=Math.random().toString(36).slice(2), ch;
-  try{ ch=new BroadcastChannel('wb_switcher_page'); }catch(e){ return; }
+  // 频道名带视图标识：国服 /wb 与国际服 /wbai 是两个独立视图，同时开着不算重复
+  try{ ch=new BroadcastChannel('wb_switcher_page_'+(UI.view||'wb')); }catch(e){ return; }
   ch.onmessage=function(e){
     var d=e.data||{};
     if(d.t==='hello' && d.id!==mine){ ch.postMessage({t:'taken', to:d.id, by:mine}); }
@@ -736,9 +762,14 @@ function renderCurrent(){
     box.innerHTML='<div class="empty">'+esc(c.reason||'桌面端当前未登录')+'</div>';
     return;
   }
+  // 逐项判断缺哪些能力：国际服现在**有积分、没签到**，写死"积分与签到"
+  // 会把它的正常状态说成缺陷。
+  const lack=[];
+  if(UI.credits==='1') lack.push('积分');
+  if(UI.checkin==='1') lack.push('签到');
   document.getElementById('curHint').textContent = file
     ? '（账号库中：'+file+'）'
-    : '（不在账号库中，无法显示积分与签到）';
+    : (lack.length ? '（不在账号库中，无法显示'+lack.join('与')+'）' : '（不在账号库中）');
   box.innerHTML = rowHtml({
     isCurrent:true, ok:true, file:file,
     nickname:c.nickname||c.file||'未知',
@@ -942,11 +973,14 @@ async function doSwitch(file, nick, btn, mig){
     }
     if(data.ok){
       if(btn){ btn.disabled=false; btn.textContent='当前账号'; }
-      // 续期只动本地账号库文件，不必等客户端采纳，切完立即发
-      try{
-        const sd=await post(API.refresh,{file:file});
-        toast(sd.message, sd.ok?'ok':'err');
-      }catch(e){}
+      // 续期只动本地账号库文件，不必等客户端采纳，切完立即发。
+      // 能力关闭的通道（见 UI.refresh）直接跳过，避免发一个必然被拒的请求。
+      if(UI.refresh==='1'){
+        try{
+          const sd=await post(API.refresh,{file:file});
+          toast(sd.message, sd.ok?'ok':'err');
+        }catch(e){}
+      }
       await settleAfterSwitch(nick);
     } else if(btn){ btn.disabled=false; btn.textContent='切换到该账号'; }
   }catch(err){

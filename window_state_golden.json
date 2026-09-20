@@ -1,0 +1,22 @@
+{
+  "wb": {
+    "bounds": {
+      "height": 1000,
+      "width": 1600,
+      "x": 224,
+      "y": 56
+    },
+    "isFullScreen": false,
+    "isMaximized": true
+  },
+  "wbai": {
+    "bounds": {
+      "height": 1000,
+      "width": 1600,
+      "x": 224,
+      "y": 56
+    },
+    "isFullScreen": false,
+    "isMaximized": true
+  }
+}

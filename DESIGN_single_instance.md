@@ -239,7 +239,7 @@ python wb_ui_server.py --serve
 | 启动流程接入 | `wb_ui_server.serve` / `tw_ui_server.serve` / `wb_ui_app.main` / `tw_ui_app.main` |
 | 迁移前置检查 | `account_migration.other_instance()`；被拒时**不创建任何备份目录** |
 | 两个 `.cmd` | 改成实跑 `python -c "import sys;assert ..."` 做版本校验；保留 ASCII + CRLF |
-| 回归自检 | 第 15 段 29 条断言；**总计 189 项全 PASS** |
+| 回归自检 | 第 15 段 29 条断言；**当时总计 189 项全 PASS**（断言数会随迭代增长，当前值以 `README.md` 为准） |
 
 ### 实测结果（13 条场景里已验的）
 

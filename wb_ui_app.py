@@ -40,13 +40,15 @@ for p in (PROJECT_ROOT, BASE_DIR):
 import wb_ui_server as srv        # noqa: E402
 import switcher_common as common  # noqa: E402
 
-# 固定数据目录为 exe 所在目录（保证 wb_auth 与 exe 同级即可被识别）
-srv._BIN_DIR = BASE_DIR
-srv.SCRIPT_DIR = PROJECT_ROOT
-srv.AUTH_DIR = BASE_DIR / "wb_auth"
-srv.LOCK_DIR = BASE_DIR / ".locks"
-srv.Handler.BASE_DIR = BASE_DIR          # 前端页面按 exe 目录 → _internal 依次查找
-srv.Handler.AUDIT_DIR = BASE_DIR / "logs"
+# 固定数据目录为 exe 所在目录（保证 wb_auth / wbai_auth 与 exe 同级即可被识别）。
+#
+# ⚠️ 走 `srv.rebind()` 这一个入口，**不要**在这里逐个赋 `srv.X = ...`。
+# 以前这里写着 5 行赋值，其中 `srv.AUTH_DIR` 在双通道重构后退化成了导入时的
+# 快照别名 —— 写它不再生效，结果是打包后的 exe 跑去 `_internal\wb_auth\` 找账号、
+# 页面恒显示 0 个（源码运行却完全正常）。漏改一个名字就是这个下场，
+# 所以现在把所有基准的改写收进一个函数，改不全都不可能。
+# 账号库本身是按 `_BIN_DIR` 现算的（见 `Channel.auth_dir` 属性），不依赖这里。
+srv.rebind(BASE_DIR, PROJECT_ROOT)
 
 PORT = srv.DEFAULT_PORT
 
@@ -61,6 +63,31 @@ def _port_alive(port, timeout=0.6):
                 return r.status == 200
         except Exception:  # noqa: BLE001
             time.sleep(0.2)
+    return False
+
+
+# wb_ui_server 的一次性 CLI 动词。
+#
+# exe 是**桌面启动器**（入口是 wb_ui_app），默认只认 --serve / --no-window / --port，
+# 其余参数以前被**静默忽略** —— 于是 `WorkBuddySwitcher.exe --refresh-all` 不会续期，
+# 而是弹出一个窗口；脚本/计划任务看退出码 0，会以为命令执行了。
+# （实测踩到：`WorkBuddySwitcher.exe --channel wbai --migrate-preview x.info`
+#   直接开了一个 GUI 窗口，前台 shell 一直等它退出。）
+# 这些动词语义明确、且都是"跑完就退"，交给 wb_ui_server.main() 处理才是用户的本意。
+# `--serve` 故意不在表里：它由本文件处理（走的是 bind_server + 保活那条路）。
+# 只列**动作**动词：`--channel` / `--force` / `--migrate-mode` 这类是修饰符，
+# 单独出现时仍然应该走"开窗口"（否则 `exe --channel wbai` 会变成开浏览器，
+# 比开原生窗口还怪）。判据是"有没有一个跑完就退的动作"。
+_SERVER_ACTIONS = ("--list", "--current", "--switch", "--migrate-preview",
+                   "--prune", "--refresh-all")
+
+
+def _wants_server_cli(argv):
+    """命令行里是否出现了 wb_ui_server 的一次性动作（支持 `--prune=3` 这种写法）。"""
+    for a in argv:
+        for v in _SERVER_ACTIONS:
+            if a == v or a.startswith(v + "="):
+                return True
     return False
 
 
@@ -117,7 +144,16 @@ def _log_startup(msg):
 
 
 def main():
-    headless, requested = _parse_args(sys.argv[1:])
+    argv = sys.argv[1:]
+    # 一次性 CLI 动作（--list / --switch / --refresh-all / --migrate-preview …）→
+    # 交给后端处理，绝不开窗口。详见 _SERVER_ACTIONS 的注释。
+    # 注意：windowed 构建没有控制台，print 无处可去 —— 这些命令**行为**是对的
+    # （文件真的会改），但看不到输出。要看得见的输出请用
+    # `python wb_ui_server.py ...`（refresh_all.cmd 走的就是那条路）。
+    if _wants_server_cli(argv):
+        return srv.main()
+
+    headless, requested = _parse_args(argv)
 
     # 单实例保护：拿到互斥体才允许起服务。见 DESIGN_single_instance.md。
     handle, action, info = common.single_instance_guard(

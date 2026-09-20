@@ -33,12 +33,14 @@ for p in (PROJECT_ROOT, BASE_DIR):
 import tw_ui_server as srv        # noqa: E402
 import switcher_common as common  # noqa: E402
 
-# 固定数据目录为 exe 所在目录（保证 tw_auth 与 exe 同级即可被识别）
-srv._BIN_DIR = BASE_DIR
-srv.TW_AUTH_DIR = BASE_DIR / "tw_auth"
-srv.LOCK_DIR = BASE_DIR / ".locks"
-srv.Handler.BASE_DIR = BASE_DIR          # 前端页面按 exe 目录 → _internal 依次查找
-srv.Handler.AUDIT_DIR = BASE_DIR / "logs"
+# 固定数据目录为 exe 所在目录（保证 tw_auth 与 exe 同级即可被识别）。
+#
+# ⚠️ 走 `srv.rebind()` 这一个入口，**不要**在这里逐个赋 `srv.X = ...`。
+# 以前这里写着 4 行赋值（含 `srv.TW_AUTH_DIR` / `srv.LOCK_DIR` 两个模块常量），
+# 而 `tw_backups` 却是调用时现算的 —— 同一个文件里两种写法，
+# 漏改一个就是「账号库在一个目录、备份在另一个目录」的静默分家。
+# 现在账号库 / 锁 / 备份都按 `_BIN_DIR` 现算，这里只交代基准目录。
+srv.rebind(BASE_DIR)
 
 PORT = srv.DEFAULT_PORT
 

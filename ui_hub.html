@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>账号管理 · 统一入口</title>
+<style>
+  :root {
+    --bg: #0f1626;
+    --card: #1a2338;
+    --card-2: #222d47;
+    --border: #2c3a5c;
+    --text: #e6edf7;
+    --dim: #8b9ab8;
+    --accent: #4f8cff;
+    --accent-2: #2f6fef;
+    --green: #3ddc97;
+    --amber: #ffc24d;
+    --red: #ff5c5c;
+    --radius: 14px;
+    /* 两个通道的主题色：国服=品牌蓝，国际服=青绿，用来在侧边栏一眼区分 */
+    --wb: #4f8cff;
+    --wbai: #35c8b0;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); overflow:hidden;
+  }
+
+  /* ---- 重复页面提示条（与两个视图同款）---- */
+  .dup-bar { position:fixed; top:0; left:0; right:0; z-index:60; display:flex; align-items:center;
+             gap:14px; justify-content:space-between; padding:10px 18px;
+             background:rgba(255,194,77,.12); border-bottom:1px solid rgba(255,194,77,.4);
+             color:var(--amber); font-size:13px; }
+  .dup-txt { display:flex; flex-direction:column; gap:2px; }
+  .dup-txt span { font-size:12px; color:var(--dim); }
+  .btn-ghost { background:transparent; border:1px solid var(--border); color:var(--text);
+               border-radius:9px; padding:6px 12px; font-size:12.5px; cursor:pointer;
+               font-family:inherit; }
+  .btn-ghost:hover { background:var(--card-2); }
+
+  /* ---- 离线提示条：本页不是由本地服务提供的（双击 html / 静态托管）----
+     这时 /api/* 全部不可达，页面只剩空壳。必须说清楚"该从哪打开"，
+     否则用户只会看到一堆「读取失败」，无从判断是页面坏了还是服务没起。 */
+  .off-bar { position:fixed; top:0; left:0; right:0; z-index:70; display:none;
+             align-items:center; gap:14px; justify-content:space-between; padding:10px 18px;
+             background:rgba(255,92,92,.14); border-bottom:1px solid rgba(255,92,92,.45);
+             color:var(--red); font-size:13px; }
+  .off-bar.on { display:flex; }
+  /* 提示条是 fixed 的，不占流 —— 离线时把主体整体下移，否则会盖住侧边栏顶部 */
+  body.offline .app { height:calc(100vh - 52px); margin-top:52px; }
+  .off-txt { display:flex; flex-direction:column; gap:2px; }
+  .off-txt span { font-size:12px; color:var(--dim); }
+  .off-txt code { background:var(--card-2); border-radius:5px; padding:1px 5px;
+                  color:var(--text); font-size:11.5px; }
+
+  /* ---- 整体：左侧侧边导航栏 + 右侧内容区 ---- */
+  .app { display:flex; height:100vh; }
+
+  .side {
+    flex:0 0 268px; width:268px; display:flex; flex-direction:column;
+    background:var(--card); border-right:1px solid var(--border);
+  }
+  .brand { display:flex; align-items:center; gap:10px; padding:16px 16px 14px; }
+  .brand .logo {
+    width:34px; height:34px; border-radius:10px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; font-size:17px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: 0 6px 16px rgba(79,140,255,.32);
+  }
+  .brand-name { font-size:14px; font-weight:600; line-height:1.3; }
+  .brand-sub { font-size:11.5px; color:var(--dim); }
+
+  /* ---- 侧边导航栏：两个管理入口 ---- */
+  .side-nav { display:flex; flex-direction:column; gap:6px; padding:4px 10px 10px; }
+  .side-label { font-size:11px; color:var(--dim); padding:2px 6px 4px; letter-spacing:.4px; }
+  .entry {
+    display:grid; grid-template-columns:auto 1fr; grid-template-rows:auto auto auto;
+    column-gap:8px; row-gap:2px; align-items:center;
+    padding:10px 11px; border-radius:11px; cursor:pointer; text-decoration:none;
+    color:var(--text); border:1px solid transparent;
+    transition:background .12s, border-color .12s;
+  }
+  .entry:hover { background:var(--card-2); }
+  .entry:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  .entry.on { background:rgba(79,140,255,.13); border-color:rgba(79,140,255,.45); }
+  .entry-badge {
+    grid-row:1; font-size:10.5px; font-weight:600; line-height:1;
+    padding:3px 6px; border-radius:6px; white-space:nowrap;
+  }
+  .entry-badge.wb   { background:rgba(79,140,255,.20); color:#9dc0ff; }
+  .entry-badge.wbai { background:rgba(53,200,176,.20); color:#7ee6d3; }
+  .entry-name { grid-row:1; font-size:13.5px; font-weight:600; }
+  .entry-desc { grid-column:2; font-size:11.5px; color:var(--dim); line-height:1.35; }
+  .entry-cur  { grid-column:2; font-size:11.5px; color:var(--dim); }
+  .entry-cur b { color:var(--text); font-weight:600; }
+  .entry-cur .dot { display:inline-block; width:6px; height:6px; border-radius:50%;
+                    background:var(--dim); margin-right:5px; vertical-align:1px; }
+  .entry-cur.ok .dot { background:var(--green); }
+  .entry-cur.no .dot { background:var(--red); }
+
+  .side-foot { margin-top:auto; padding:12px 16px 14px; border-top:1px solid var(--border);
+               font-size:12px; color:var(--dim); display:flex; flex-direction:column; gap:6px; }
+  .side-foot .status-dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+                           background:var(--dim); margin-right:6px; }
+  .side-foot .status-dot.on { background:var(--green); box-shadow:0 0 8px var(--green); }
+  .side-foot .status-dot.off { background:var(--red); }
+  .side-foot .note { font-size:11px; line-height:1.5; }
+
+  /* ---- 内容区：两个独立管理视图，各自一个 iframe ---- */
+  .main { flex:1; position:relative; background:var(--bg); }
+  .view { position:absolute; inset:0; width:100%; height:100%; border:0;
+          background:var(--bg); display:none; }
+  .view.on { display:block; }
+
+  /* 离线占位：iframe 指向的 /wb、/wbai 也是服务提供的，没有服务只会显示
+     浏览器自带的"打不开"图标 —— 看着像页面坏了。换成一段说明。 */
+  .view-off { position:absolute; inset:0; display:none; flex-direction:column;
+              align-items:center; justify-content:center; gap:10px; text-align:center;
+              padding:0 40px; color:var(--dim); }
+  .view-off .vo-ico { font-size:40px; opacity:.5; }
+  .view-off b { color:var(--text); font-size:15px; }
+  .view-off span { font-size:12.5px; line-height:1.7; max-width:460px; }
+  .view-off code { background:var(--card-2); border-radius:5px; padding:1px 5px;
+                   color:var(--text); font-size:11.5px; }
+  body.offline .view { display:none !important; }
+  body.offline .view-off { display:flex; }
+</style>
+</head>
+<body>
+<div class="dup-bar" id="dupBar" style="display:none;">
+  <div class="dup-txt">
+    <b>这个入口页已经开着另一个标签页了</b>
+    <span>为保持只有一个页面实例，建议关掉这一个。数据两边是同一份，不会丢。</span>
+  </div>
+  <button class="btn-ghost" onclick="closeThisTab()">关闭此页</button>
+</div>
+
+<div class="off-bar" id="offBar">
+  <div class="off-txt">
+    <b>没有连上本地服务，页面数据不可用</b>
+    <span>本页必须由本机服务提供，直接打开 html 文件或静态托管时 /api/* 全部不可达。
+          请改从 <code id="offUrl">http://127.0.0.1:8765/</code> 打开，或运行
+          <code>WorkBuddySwitcher.exe</code> 由它自动打开。</span>
+  </div>
+</div>
+
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">&#128172;</div>
+      <div>
+        <div class="brand-name">账号管理</div>
+        <div class="brand-sub">WorkBuddy 与 WorkBuddyAI</div>
+      </div>
+    </div>
+
+    <!-- 侧边导航栏：两个管理入口。href 是真锚点，中键/新标签也能用；
+         点击时由脚本切换右侧视图，并同步 hash（刷新后停在同一个视图）。 -->
+    <nav class="side-nav" id="sideNav" aria-label="账号管理入口">
+      <div class="side-label">管理入口</div>
+
+      <a class="entry" href="#/wb" data-view="wb" id="entryWb" aria-current="true"
+         title="WorkBuddy（国服）账号管理：切换 workbuddy-desktop.info，账号库 wb_auth\">
+        <span class="entry-badge wb">国服</span>
+        <span class="entry-name">WorkBuddy账号管理</span>
+        <span class="entry-desc">切换 <code>workbuddy-desktop.info</code><br>www.workbuddy.cn · 账号库 wb_auth\</span>
+        <span class="entry-cur" id="curWb"><span class="dot"></span>读取中…</span>
+      </a>
+
+      <a class="entry" href="#/wbai" data-view="wbai" id="entryWbai"
+         title="WorkBuddyAI（国际服）账号管理：切换 workbuddy-desktop-ai.info，账号库 wbai_auth\">
+        <span class="entry-badge wbai">国际服</span>
+        <span class="entry-name">WorkBuddyAI账号管理</span>
+        <span class="entry-desc"><code>workbuddy-desktop-ai.info</code><br>www.workbuddy.ai · 账号库 wbai_auth\</span>
+        <span class="entry-cur" id="curWbai"><span class="dot"></span>读取中…</span>
+      </a>
+    </nav>
+
+    <div class="side-foot">
+      <div><span class="status-dot off" id="srvDot"></span><span id="srvText">连接本地服务…</span></div>
+      <div class="note">两个入口各自独立：国服与国际服的登录态文件、账号库、可用功能都互不影响。</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="view-off" id="viewOff">
+      <div class="vo-ico">&#128268;</div>
+      <b>视图不可用</b>
+      <span>这两个管理视图本身就是服务提供的页面（<code>/wb</code> 与 <code>/wbai</code>），
+            没有本地服务时无法加载。请从 <code>http://127.0.0.1:8765/</code> 重新打开。</span>
+    </div>
+    <iframe class="view" id="viewWb" data-src="/wb" title="WorkBuddy（国服）账号管理"></iframe>
+    <iframe class="view" id="viewWbai" data-src="/wbai" title="WorkBuddyAI（国际服）账号管理"></iframe>
+  </main>
+</div>
+
+<script>
+// 两个入口 → 两个独立视图。视图用 iframe 承载：
+// 它们各自是一套完整的页面（自己的工具条、弹框、状态），iframe 是唯一能保证
+// 两边 JS/CSS 完全不互相干扰的隔离方式，也免得把两个视图的前端揉成一个巨型文件。
+const VIEWS = {
+  wb:   { el: document.getElementById('viewWb'),   entry: document.getElementById('entryWb'),
+          cur: document.getElementById('curWb'),   api: '/api/current',       title: 'WorkBuddy账号管理（国服）' },
+  wbai: { el: document.getElementById('viewWbai'), entry: document.getElementById('entryWbai'),
+          cur: document.getElementById('curWbai'), api: '/api/wbai/current',  title: 'WorkBuddyAI账号管理（国际服）' },
+};
+let active = 'wb';
+let online = false;          // 由 refreshSide() 维护；离线时不加载 iframe（必然失败）
+
+function show(key){
+  if(!VIEWS[key]) key = 'wb';
+  active = key;
+  Object.keys(VIEWS).forEach(function(k){
+    const v = VIEWS[k];
+    // 首次激活时才真正加载 iframe：没点过的视图不必现在就发请求。
+    // 离线时也不加载 —— 只会得到浏览器的"打不开"图标，不如让占位说明顶上。
+    if(k===key && online && !v.el.getAttribute('src')) v.el.setAttribute('src', v.el.dataset.src);
+    v.el.classList.toggle('on', k===key);
+    v.entry.classList.toggle('on', k===key);
+    if(k===key){ v.entry.setAttribute('aria-current','true'); }
+    else { v.entry.removeAttribute('aria-current'); }
+  });
+  document.title = VIEWS[key].title + ' · 统一入口';
+}
+
+document.getElementById('sideNav').addEventListener('click', function(e){
+  const a = e.target.closest('.entry');
+  if(!a) return;
+  e.preventDefault();                 // 视图切换不刷新页面，交给 show()
+  const key = a.dataset.view;
+  if(location.hash !== '#/'+key) location.hash = '#/'+key;
+  show(key);
+});
+
+function fromHash(){
+  const m = /^#\/(wb|wbai)$/.exec(location.hash || '');
+  show(m ? m[1] : 'wb');
+}
+window.addEventListener('hashchange', fromHash);
+
+// ---- 侧边栏每个入口下的「当前账号」摘要 -------------------------------
+// 只读接口，不需要一次性令牌；查不到就如实说，不假装。
+async function loadCurrent(key){
+  const v = VIEWS[key];
+  try{
+    const r = await fetch(v.api, {cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const d = await r.json();
+    const c = (d.current || [])[0];
+    if(!c || c.ok === false){
+      v.cur.className = 'entry-cur no';
+      v.cur.innerHTML = '<span class="dot"></span>' + ((c && c.reason) || '桌面端当前未登录');
+      return;
+    }
+    v.cur.className = 'entry-cur ok';
+    v.cur.innerHTML = '<span class="dot"></span>当前：<b>' + esc(c.nickname || c.file || '未知') + '</b>';
+  }catch(e){
+    v.cur.className = 'entry-cur no';
+    // 区分"服务没连上"与"服务回了错"：前者是打开方式不对，后者才是真故障。
+    // 混成一句「读取失败」会让人往错的方向查。
+    v.cur.innerHTML = '<span class="dot"></span>' +
+      (/^HTTP \d/.test(e.message) ? '读取失败 ' + e.message.slice(5) : '未连接到本地服务');
+  }
+}
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function refreshSide(){
+  const was = online;
+  try{
+    const r = await fetch('/api/ping', {cache:'no-store'});
+    const d = await r.json();
+    online = !!d.ok;
+    document.getElementById('srvDot').className = 'status-dot ' + (online ? 'on' : 'off');
+    document.getElementById('srvText').textContent = online ? '本地服务已连接' : '本地服务未连接';
+  }catch(e){
+    online = false;
+    document.getElementById('srvDot').className = 'status-dot off';
+    document.getElementById('srvText').textContent = '本地服务未连接';
+  }
+  // 离线时把话说明白：这个页面不是从服务打开的，光说「读取失败」没人能查下去
+  document.getElementById('offBar').classList.toggle('on', !online);
+  document.body.classList.toggle('offline', !online);
+  if(!online){
+    for(const k of ['wb', 'wbai']){
+      VIEWS[k].cur.className = 'entry-cur no';
+      VIEWS[k].cur.innerHTML = '<span class="dot"></span>未连接到本地服务';
+    }
+    return;
+  }
+  // 服务刚恢复：把当前视图补上（离线期间 show() 没给它设 src）
+  if(!was) show(active);
+  await Promise.all([loadCurrent('wb'), loadCurrent('wbai')]);
+}
+
+// ---- 页面心跳：让服务端知道"还有页面开着"，重复启动时不再开新标签页 ----
+(function(){
+  function beat(){ try{ fetch('/api/page-alive', {cache:'no-store'}).catch(function(){}); }catch(e){} }
+  beat();
+  setInterval(beat, 5000);
+  document.addEventListener('visibilitychange', function(){ if(!document.hidden) beat(); });
+})();
+
+// ---- 重复页面识别（视图层在嵌入模式下不参与，由入口页负责）----
+(function(){
+  if(typeof BroadcastChannel === 'undefined') return;
+  const mine = Math.random().toString(36).slice(2);
+  let ch;
+  try{ ch = new BroadcastChannel('wb_switcher_hub'); }catch(e){ return; }
+  ch.onmessage = function(e){
+    const d = e.data || {};
+    if(d.t === 'hello' && d.id !== mine) ch.postMessage({t:'taken', to:d.id, by:mine});
+    else if(d.t === 'taken' && d.to === mine){ document.getElementById('dupBar').style.display='flex'; }
+  };
+  ch.postMessage({t:'hello', id:mine});
+})();
+
+function closeThisTab(){
+  window.close();
+  setTimeout(function(){
+    const el = document.getElementById('dupBar');
+    if(el && el.style.display !== 'none'){
+      const s = el.querySelector('.dup-txt span');
+      if(s) s.textContent = '浏览器不允许脚本关闭这个标签页，请手动关闭（Ctrl+W）。';
+    }
+  }, 400);
+}
+
+fromHash();
+refreshSide();
+setInterval(refreshSide, 30000);   // 侧边栏摘要定期自更新（切完号不用手动刷）
+</script>
+</body>
+</html>

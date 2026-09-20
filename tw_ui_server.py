@@ -62,10 +62,30 @@ tw = common.require_module(
 
 AUTH_KEY = tw.AUTH_KEY  # "iCubeAuthInfo://icube.cloudide"
 
-# 账号库目录固定为本工具所在目录下的 tw_auth
-TW_AUTH_DIR = _BIN_DIR / "tw_auth"
-LOCK_DIR = _BIN_DIR / ".locks"   # 跨进程锁文件（不放进客户端配置目录）
-TW_BACKUP_KEEP = 10              # tw_backups 保留份数（备份本身是有效登录态）
+# 三个数据目录都**按 _BIN_DIR 现算**，不存模块级常量。
+# 冻结态启动器（tw_ui_app）要在 import **之后**把 _BIN_DIR 改指到 exe 所在目录，
+# 好让「账号库与 exe 同级」这个部署约定成立；存成常量就收不到那次改写。
+# 这个坑在本项目已经踩过两次（见 MEMORY.md）：**改了不生效**的常量名比没有更坏，
+# 它会诱使下一个人去改一个已经没人读的名字。
+# 此前这里正是半新半旧：`TW_AUTH_DIR` / `LOCK_DIR` 两个模块常量是导入时快照，
+# 而 `tw_backups` 是调用时现算 —— 同一个文件里两种写法，漏改一个就是
+# 「账号库在一个目录、备份在另一个目录」的静默分家。
+def auth_dir():
+    """账号素材库目录（`<基准目录>/tw_auth`）。"""
+    return _BIN_DIR / "tw_auth"
+
+
+def lock_dir():
+    """跨进程锁文件目录（`<基准目录>/.locks`，不放进客户端配置目录）。"""
+    return _BIN_DIR / ".locks"
+
+
+def backup_dir():
+    """切号备份目录（`<基准目录>/tw_backups`，备份本身是有效登录态）。"""
+    return _BIN_DIR / "tw_backups"
+
+
+TW_BACKUP_KEEP = 10              # tw_backups 保留份数
 DEFAULT_PORT = 8766
 
 
@@ -75,7 +95,7 @@ def _appdata_dir():
     不能只写 os.environ.get("APPDATA")：某些启动方式（计划任务、精简环境、
     从非登录 shell 拉起）下该变量为空，而这里一旦拿到空串就会静默返回空路径
     列表，界面表现为"未发现 storage.json"——即使文件就在那儿，且切号也会被
-    拒。WorkBuddy 侧（wb_ui_server.DESKTOP_DIR 与 workbuddy_checkin.auth_dirs）
+    拒。WorkBuddy 侧（`wb_ui_server._localappdata_dir()` 与 workbuddy_checkin.auth_dirs）
     一直带同样的回退，这里补齐对齐。
     """
     return os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
@@ -194,9 +214,9 @@ def list_accounts():
     并且列表里还会和当前账号重复出现一条。
     """
     out = []
-    if not TW_AUTH_DIR.is_dir():
+    if not auth_dir().is_dir():
         return out
-    for f in sorted(TW_AUTH_DIR.glob("*.json")):
+    for f in sorted(auth_dir().glob("*.json")):
         data = _read_json(f)
         if not isinstance(data, dict):
             out.append({"file": f.name, "path": str(f), "ok": False, "uid": "",
@@ -302,7 +322,7 @@ def switch_account(file_name):
     返回 (ok, message)。
     """
     base = os.path.basename((file_name or "").replace("\\", "/"))
-    src = TW_AUTH_DIR / base
+    src = auth_dir() / base
     if not src.is_file():
         return False, "目标账号文件不存在：%s" % base
     if not base.endswith(".json"):
@@ -325,7 +345,7 @@ def switch_account(file_name):
         return False, "未在本机发现 Trae storage.json，请先登录 Trae 客户端"
 
     # 「备份 + 覆盖写 + 自校验」必须串行，否则与另一次切号交叉会写坏 storage.json
-    with common.file_lock("tw-storage", LOCK_DIR):
+    with common.file_lock("tw-storage", lock_dir()):
         cur = _read_json(sp)
         if not isinstance(cur, dict):
             return False, "本机 storage.json 无法读取，无法切换"
@@ -343,15 +363,17 @@ def switch_account(file_name):
         # 备份本机正式文件到独立备份目录（避免在原目录 rename，Trae 运行时可能拒绝 rename）
         now = datetime.datetime.now(datetime.timezone.utc)
         ts = now.strftime("%Y-%m-%dT%H%M%SZ")
-        backup_dir = _BIN_DIR / "tw_backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        backup = backup_dir / ("storage.%s.%d.json" % (ts, os.getpid()))
+        # 局部名不能叫 backup_dir —— 那会遮蔽同名的模块函数，
+        # 让上面那行变成"给自己赋值"的 UnboundLocalError。
+        bdir = backup_dir()
+        bdir.mkdir(parents=True, exist_ok=True)
+        backup = bdir / ("storage.%s.%d.json" % (ts, os.getpid()))
         raw = sp.read_bytes()
         try:
             backup.write_bytes(raw)
         except OSError as e:
             return False, "备份本机登录态失败：%s" % common.scrub(e)
-        pruned = common.prune_backups(backup_dir, "storage.*.json", keep=TW_BACKUP_KEEP)
+        pruned = common.prune_backups(bdir, "storage.*.json", keep=TW_BACKUP_KEEP)
 
         # 写入目标账号登录态 + 附属设备密钥（其余键保留本机的）
         cur[AUTH_KEY] = target_enc
@@ -406,7 +428,7 @@ def add_account(name, content):
     fname, err = safe_info_name(name)
     if err:
         return False, err
-    src = TW_AUTH_DIR / fname
+    src = auth_dir() / fname
     if src.exists():
         return False, "已存在同名账号文件：%s" % fname
     try:
@@ -421,8 +443,8 @@ def add_account(name, content):
         return False, "内容不是有效的 Trae 登录态：%s" % perr
     if not common.token_looks_complete(info["token"]):
         return False, "登录态里的 token 不完整（疑似粘贴截断），请整份复制该账号的 storage.json 后重新添加"
-    TW_AUTH_DIR.mkdir(parents=True, exist_ok=True)
-    with common.file_lock("tw-auth-" + fname, LOCK_DIR):
+    auth_dir().mkdir(parents=True, exist_ok=True)
+    with common.file_lock("tw-auth-" + fname, lock_dir()):
         if src.exists():
             return False, "已存在同名账号文件：%s" % fname
         try:
@@ -438,10 +460,10 @@ def remove_account(file_name):
         return False, "非法的文件名"
     if not base.endswith(".json"):
         return False, "只能删除 .json 账号素材文件"
-    target = TW_AUTH_DIR / base
+    target = auth_dir() / base
     if not target.is_file():
         return False, "账号文件不存在：%s" % base
-    with common.file_lock("tw-auth-" + base, LOCK_DIR):
+    with common.file_lock("tw-auth-" + base, lock_dir()):
         try:
             target.unlink()
         except OSError as e:
@@ -474,7 +496,7 @@ def refresh_account_file(file_name):
         return False, "非法的文件路径"
     if not base.endswith(".json"):
         return False, "只能续期 .json 账号素材文件"
-    target = TW_AUTH_DIR / base
+    target = auth_dir() / base
     if not target.is_file():
         return False, "tw_auth 中不存在账号文件：%s" % base
     data = _read_json(target)
@@ -487,7 +509,7 @@ def refresh_account_file(file_name):
     # script_dir 必须用 PROJECT_ROOT（自动签到）：trae_work_checkin 会把轮换后的
     # refreshToken 写进 script_dir/token_cache.json，此前传素材目录的父级（wb_switcher）
     # 等于另起一份缓存，与签到脚本各持一代 refreshToken —— 一方轮换后另一方的旧凭据即失效。
-    with common.file_lock("tw-auth-" + base, LOCK_DIR):
+    with common.file_lock("tw-auth-" + base, lock_dir()):
         try:
             ok, msg, kind = tw.refresh_account(acc, PROJECT_ROOT, cfg, _NULLLOG)
         except Exception as e:
@@ -549,10 +571,15 @@ class Handler(common.BaseHandler):
         "EMPTY_HINT": ("请放入该账号的 <code>storage.json</code>。"
                        "直接运行 exe 时，账号目录要放在 exe 同级（用 .cmd 启动就是本目录）。"),
         "CMD": "trae_switcher.cmd",
+        # 接口前缀 / 视图标识：模板由两个切换器共用，这两个占位符必须两边都配
+        "API_BASE": "/api/",
+        "VIEW": "tw",
         "CREDITS": "",             # Trae 侧无 /api/credits，置空隐藏积分明细与「刷新积分」
         "CHECKIN": "",             # Trae 侧无 /api/checkin，置空隐藏签到状态与「一键签到」
         # Trae 侧无账号数据迁移能力，置空隐藏迁移确认框
         "MIGRATE": "",
+        # Trae 侧保留「一键续期」（有 /api/refresh-all）
+        "REFRESH": "1",
         # Trae 侧保留「打开客户端」按钮（WorkBuddy 侧按用户要求去掉）
         "OPEN_CLIENT": "1",
     }
@@ -588,6 +615,23 @@ class Handler(common.BaseHandler):
         else:
             return 404, {"ok": False, "message": "404"}
         return 200, {"ok": ok, "message": msg}
+
+
+def rebind(base_dir):
+    """把**所有**数据目录基准一次性指到 base_dir（冻结态启动器调用）。
+
+    ⚠️ 只能走这一个入口，不要在启动器里逐个写 `srv.X = ...`。
+    漏一个就是「账号库在一个目录、锁和备份在另一个目录」这类静默分家，
+    而冻结态 exe 恰恰是最难复现的场景（源码运行永远正常）。
+    以前 `tw_ui_app` 写了 4 行赋值，那 4 行就是漏改的来源。
+
+    账号库 / 锁 / 备份目录本身已改成按 `_BIN_DIR` 现算（见 `auth_dir()` /
+    `lock_dir()` / `backup_dir()`），这里只需管那些"必须落在类属性上"的名字。
+    """
+    global _BIN_DIR
+    _BIN_DIR = Path(base_dir)
+    Handler.BASE_DIR = _BIN_DIR          # 前端页面按 exe 目录 → _internal 依次查找
+    Handler.AUDIT_DIR = _BIN_DIR / "logs"
 
 
 def serve(port=DEFAULT_PORT, open_browser=True, use_token=True):
@@ -638,7 +682,7 @@ def main():
     args = ap.parse_args()
 
     if args.prune is not None:
-        n = common.prune_backups(_BIN_DIR / "tw_backups", "storage.*.json",
+        n = common.prune_backups(backup_dir(), "storage.*.json",
                                  keep=max(0, int(args.prune)))
         print("已清理 %d 份 tw_backups 备份（保留最近 %d 份）" % (n, args.prune))
         common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "prune",

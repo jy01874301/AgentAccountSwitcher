@@ -691,7 +691,7 @@ if (computeCheck(Buffer.from(userId,"utf8"), salt) !== header.userIdCheck)
 | `account_migration.py`（新，约 560 行） | 目录判定 / 进程检测 / 扫描预览 / 迁移 / 校验 / 回滚 / 备份裁剪 |
 | `wb_ui_server.py` | `switch_account(name, migrate)` 返回 3 元组；新增 `current_uid()` / `migrate_preview()`；`GET /api/migrate-preview`；`POST /api/switch` 接受 `migrate`；CLI `--migrate` / `--migrate-mode` / `--migrate-preview` |
 | `ui_template.html` | 迁移确认弹框（数据清单 / 冲突 / 警告 / 选项 / 移动-共享 / 三出口）；`{{MIGRATE}}` 占位符（tw 侧为空即隐藏） |
-| `smoke_test.py` 第 14 段 | 28 条断言：算法复现、目录判定、进程检测、完整迁移、校验、回滚、接口与模板。**总计 159 项全 PASS** |
+| `smoke_test.py` 第 14 段 | 28 条断言：算法复现、目录判定、进程检测、完整迁移、校验、回滚、接口与模板。**当时总计 159 项全 PASS**（断言数会随迭代增长，当前值以 `README.md` 为准） |
 | 两个 exe | 已重建，`account_migration` 已确认打进包（接口返回正常 JSON 而非 ImportError） |
 
 ### 实现期新发现的两个真 bug（自检抓到的）

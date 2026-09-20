@@ -28,7 +28,10 @@ a = Analysis(
     ['wb_ui_app.py'],
     pathex=[SIBLING, HERE],
     binaries=[],
-    datas=[('ui_template.html', '.'), ('README.md', '.'), ('check_ttl.py', '.')],
+    # check_ttl.py / check_exe_datadir.py 是部署后自检用的小工具，跟着 exe 一起发，
+    # 免得用户手上只有 exe 时没法自查（前者看有效期，后者看账号库基准对不对）。
+    datas=[('ui_template.html', '.'), ('ui_hub.html', '.'), ('README.md', '.'),
+           ('check_ttl.py', '.'), ('check_exe_datadir.py', '.')],
     # account_migration 是顶层 import，静态分析扫得到；显式列出是为了防止
     # 将来被改成条件导入后悄悄漏掉（漏了会表现为"切号正常但没有迁移功能"）。
     hiddenimports=['webview', 'switcher_common', 'workbuddy_checkin', 'account_migration'],

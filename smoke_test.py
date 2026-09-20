@@ -9,7 +9,9 @@
     python smoke_test.py
 退出码 0 表示全部通过，1 表示有失败项。
 """
+import ast
 import http.client
+import inspect
 import json
 import os
 import re
@@ -23,6 +25,33 @@ import time
 from pathlib import Path
 
 BIN = Path(__file__).resolve().parent
+
+
+# 启动器**不许**自己赋的路径名。用白名单式列举而不是"任何 srv.X ="：
+# 启动器合法地要写 `srv.Handler.TOKEN = ...`（一次性令牌），一刀切会假失败。
+PATH_NAMES = ("_BIN_DIR", "SCRIPT_DIR", "LOCK_DIR", "TW_AUTH_DIR", "AUTH_DIR",
+              "DESKTOP_DIR", "DESKTOP_INFO", "DESKTOP_ROOT_ID")
+
+
+def assigns_paths(src):
+    """启动器里是否出现"自己给路径赋值"（应改成调用 srv.rebind()）。"""
+    code = code_only(src)
+    for n in PATH_NAMES:
+        if re.search(r"^\s*srv\.%s\s*=" % re.escape(n), code, re.M):
+            return True
+    return bool(re.search(r"^\s*srv\.Handler\.(BASE_DIR|AUDIT_DIR)\s*=", code, re.M))
+
+
+def code_only(src):
+    """剥掉注释行，只留代码 —— 断言"源码里没有 X"时必须先过一遍它。
+
+    这个假失败本会话已经踩过**三次**：说明性注释里提到 `srv.AUTH_DIR = ...`、
+    `import ast`、`srv.X = ...`，全文匹配就把注释当成代码。
+    比对 spec 里"没写死绝对路径"那条同理（那条还要额外剥模块 docstring）。
+    """
+    return "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
+
+
 sys.path.insert(0, str(BIN))
 sys.path.insert(0, str(BIN.parent / "自动签到"))
 import switcher_common as common  # noqa: E402
@@ -139,7 +168,7 @@ def main():
 
     print("\n== 5. 切换器接口 ==")
     servers = []
-    bad_file = wb.AUTH_DIR / "workbuddy-__bad.info"
+    bad_file = wb.CHANNELS["wb"].auth_dir / "workbuddy-__bad.info"
     try:
         s_wb, port_wb = common.bind_server(wb.Handler, 8911)
         s_tw, port_tw = common.bind_server(tw.Handler, 8912)
@@ -148,10 +177,77 @@ def main():
             servers.append(s)
         time.sleep(0.3)
 
+        # 入口页 / 两个视图的关系本身就是断言对象：
+        #   /      → 统一入口页（侧边导航栏，两个管理入口）
+        #   /wb    → WorkBuddy（国服）账号管理视图
+        #   /wbai  → WorkBuddyAI（国际服）账号管理视图
+        st, raw = call(port_wb, "/")
+        hub = raw.decode("utf-8", "replace")
+        check("[wb] GET / 返回统一入口页", st == 200 and "统一入口" in hub, st)
+        check("[wb] 入口页含侧边导航栏（side-nav）", 'class="side-nav"' in hub, "")
+        check("[wb] 侧边栏两个管理入口齐全",
+              'data-view="wb"' in hub and 'data-view="wbai"' in hub, "")
+        check("[wb] 入口名称区分 WorkBuddy / WorkBuddyAI",
+              "WorkBuddy账号管理" in hub and "WorkBuddyAI账号管理" in hub, "")
+        check("[wb] 入口标注国服 / 国际服", "国服" in hub and "国际服" in hub, "")
+        check("[wb] 两个入口指向各自独立视图",
+              'data-src="/wb"' in hub and 'data-src="/wbai"' in hub, "")
+        check("[wb] 入口页无残留占位符", "{{" not in hub, hub[:60])
+        # 入口页必须能自证"不是从服务打开的"。曾经只在侧边栏写一句「读取失败」，
+        # 用户双击 html / 静态托管时看到它完全无从判断 —— 是页面坏了还是服务没起。
+        check("[wb] 入口页含离线提示条与离线占位",
+              'id="offBar"' in hub and 'id="viewOff"' in hub, "")
+        check("[wb] 入口页离线时区分「未连接到本地服务」与「读取失败」",
+              "未连接到本地服务" in hub and "'读取失败 ' + e.message.slice(5)" in hub, "")
+        check("[wb] 入口页离线时不加载 iframe（show() 带 online 门卫）",
+              "if(k===key && online && !v.el.getAttribute('src'))" in hub, "")
+
+        st, raw = call(port_wb, "/wbai")
+        wbai_html = raw.decode("utf-8", "replace")
+        check("[wb] GET /wbai 返回国际服视图",
+              st == 200 and "WorkBuddyAI 账号管理" in wbai_html, st)
+        check("[wb] 国际服视图显示积分与续期、不显示签到",
+              'credits: "1"' in wbai_html and 'refresh: "1"' in wbai_html
+              and 'checkin: ""' in wbai_html and 'migrate: ""' in wbai_html, "")
+        # 两个通道的计费网关不是同一个：拿国际服的 accessToken 去打国服网关恒 401，
+        # 页面上就是每行「积分接口 HTTP 401」。endpoint 必须按通道给（见 channel_cfg）。
+        check("[wb] 两个通道的网关配置各自独立",
+              wb.channel_cfg("wb")["endpoint"] != wb.channel_cfg("wbai")["endpoint"]
+              and "workbuddy.ai" in wb.channel_cfg("wbai")["endpoint"],
+              (wb.channel_cfg("wb")["endpoint"], wb.channel_cfg("wbai")["endpoint"]))
+        check("[wb] 国际服视图接口前缀指向 /api/wbai/",
+              "'/api/wbai/accounts'" in wbai_html, "")
+        st, raw = call(port_wb, "/api/wbai/accounts")
+        check("[wb] GET /api/wbai/accounts 可用",
+              st == 200 and json.loads(raw).get("ok"), st)
+        st, raw = call(port_wb, "/api/wbai/current")
+        wbai_cur = json.loads(raw).get("current") or []
+        check("[wb] /api/wbai/current 只认 workbuddy-desktop-ai*",
+              st == 200 and all(e["file"].startswith("workbuddy-desktop-ai") for e in wbai_cur),
+              [e["file"] for e in wbai_cur][:3])
+        st, raw = call(port_wb, "/api/wbai/switch", "GET")
+        check("[wb] 国际服写接口同样只收 POST（405）", st == 405, st)
+        # 客户端进程是按国服 exe 名枚举的，两个通道没有区分手段 ——
+        # 国际服必须在接口层拒掉，否则 /api/wbai/open-client 会把**国服**客户端拉起来。
+        st, raw = call(port_wb, "/api/wbai/open-client", "POST", {})
+        check("[wb] /api/wbai/open-client 被拒（不代管客户端进程）",
+              st == 400 and "不代管客户端进程" in raw.decode("utf-8", "replace"),
+              raw[:90])
+        st, raw = call(port_wb, "/api/wbai/client-status")
+        j_ai_cs = json.loads(raw)
+        check("[wb] /api/wbai/client-status 不谎报国服进程",
+              st == 200 and j_ai_cs.get("client") is None and j_ai_cs.get("unsupported") is True,
+              raw[:90])
+        st, raw = call(port_wb, "/api/client-status")
+        check("[wb] 国服 /api/client-status 仍返回真实进程状态",
+              st == 200 and isinstance(json.loads(raw).get("client"), dict), raw[:70])
+
         for label, port in (("[wb]", port_wb), ("[tw]", port_tw)):
-            st, raw = call(port, "/")
+            path = "/wb" if label == "[wb]" else "/"
+            st, raw = call(port, path)
             html = raw.decode("utf-8", "replace")
-            check(label + " GET / 返回前端", st == 200 and "切换器" in html, st)
+            check(label + " GET %s 返回视图页" % path,
+                  st == 200 and ("账号管理" in html or "切换器" in html), st)
             check(label + " 模板已渲染（无残留占位符）", "{{" not in html, html[:60])
             # 三个工具按钮都默认隐藏，由 loadCredits / loadCheckin 按后端能力点亮
             check(label + " 工具条含三个按钮",
@@ -159,6 +255,10 @@ def main():
             check(label + " 一键续期按钮已接上",
                   "doRefreshAll()" in html and "/api/refresh-all" in html, st)
             if label == "[wb]":
+                check("[wb] 国服视图沿用历史接口前缀 /api/",
+                      "'/api/accounts'" in html and "'/api/wbai/" not in html, "")
+                check("[wb] 视图在 iframe 中会隐藏自身导航（嵌入模式）",
+                      "window.self!==window.top" in html and "classList.add('embed')" in html, "")
                 check("[wb] 前端含积分明细模板", "积分明细" in html and "credBtn" in html, st)
                 # 时间与已使用量同行、两端对齐；两块 nowrap 保证不会"一侧折行一侧单行"
                 check("[wb] 积分明细同行布局", "ci-info" in html and "ci-when" in html, st)
@@ -239,7 +339,7 @@ def main():
             # 先清掉上一轮可能残留的测试文件：本机删除走安全删除 shim，被中断的运行
             # 可能 fail-closed 把文件留在原地，下一次跑就会让"未落盘"断言假失败。
             bad_file.unlink(missing_ok=True)
-            (wb.AUTH_DIR / "workbuddy-__smoke.info").unlink(missing_ok=True)
+            (wb.CHANNELS["wb"].auth_dir / "workbuddy-__smoke.info").unlink(missing_ok=True)
 
             # 残缺登录态：add 必须拒绝，且不能留下文件
             broken = json.loads(good)
@@ -269,7 +369,7 @@ def main():
 
             # 正常增删闭环
             st, raw = call(port_wb, "/api/add", "POST", {"name": "__smoke", "content": good})
-            tmp_file = wb.AUTH_DIR / "workbuddy-__smoke.info"
+            tmp_file = wb.CHANNELS["wb"].auth_dir / "workbuddy-__smoke.info"
             check("[wb] add 正常内容", json.loads(raw).get("ok") and tmp_file.is_file(), raw[:90])
             st, raw = call(port_wb, "/api/remove", "POST", {"file": tmp_file.name})
             check("[wb] remove", json.loads(raw).get("ok") and not tmp_file.exists(), raw[:90])
@@ -281,9 +381,12 @@ def main():
         wb.Handler.TOKEN = None
         tw.Handler.TOKEN = None
 
-    print("\n== 5b. 切号落盘与失败回滚（DESKTOP_* 重定向到临时目录）==")
-    # 真实桌面端登录态绝不能碰，所以把 DESKTOP_DIR / DESKTOP_INFO 指到临时目录，
-    # 这样能完整走一遍「轮换备份 → 写新文件 → 写后自校验」的成功与失败路径。
+    print("\n== 5b. 切号落盘与失败回滚（桌面端目录重定向到临时目录）==")
+    # ⚠️ 真实桌面端登录态绝不能碰，所以必须把**通道实例**的 desktop_dir 指到临时目录。
+    # 早期版本改的是模块级 wb.DESKTOP_DIR / wb.DESKTOP_INFO —— 重构引入通道之后
+    # 这两个名字不再是生效路径，重定向静默失效，自检于是真的切了本机的登录态。
+    # 现在统一走 Channel.redirect()，重定向失败会直接写错目录、断言立刻失败，不会再静默。
+    ch_wb = wb.CHANNELS["wb"]
     usable = [a for a in wb.list_accounts() if a.get("ok")]
     if not usable:
         check("[wb] 无可用账号素材，跳过落盘/回滚用例", True, "wb_auth 下没有可解析的 .info")
@@ -291,14 +394,79 @@ def main():
         target_name = Path(usable[0]["path"]).name
         target_uid = usable[0]["uid"]
         original = '{"account": {"uid": "orig-uid", "nickname": "原账号"}, "auth": {}}'
-        orig_dir, orig_info = wb.DESKTOP_DIR, wb.DESKTOP_INFO
+        orig_dir, orig_name = ch_wb.desktop_dir, ch_wb.info_name
         try:
             # --- 成功路径：正式文件应变成目标账号，原内容进备份 ---
             with tempfile.TemporaryDirectory() as td:
                 desk = Path(td)
                 info = desk / "workbuddy-desktop.info"
                 info.write_text(original, encoding="utf-8")
-                wb.DESKTOP_DIR, wb.DESKTOP_INFO = desk, info
+                ch_wb.redirect(desk)
+                check("[wb] 桌面端目录已重定向到临时目录（真实登录态不受影响）",
+                      ch_wb.desktop_info == info, str(ch_wb.desktop_info))
+
+                # --- 账号库路径必须是「派生值」而不是「导入时的快照」 ---
+                # 冻结态 exe 会在 import 之后把 wb._BIN_DIR 指到 exe 所在目录，好让
+                # 「账号库与 exe 同级」这个部署约定成立。若 Channel.auth_dir 是
+                # __init__ 里存下的快照，那次改写就落不到已建好的通道上 ——
+                # 表现是打包后的 exe 跑去 _internal\wb_auth\ 找账号、页面恒显示 0 个，
+                # 而源码运行一切正常（双通道重构时踩过）。
+                _bin_save = wb._BIN_DIR
+                try:
+                    wb._BIN_DIR = Path(td) / "exe_dir"
+                    check("[wb] 账号库路径派生自 _BIN_DIR（不是导入时快照）",
+                          wb.channel("wb").auth_dir == Path(td) / "exe_dir" / "wb_auth",
+                          str(wb.channel("wb").auth_dir))
+                    check("[wb] 国际服账号库同样跟随 _BIN_DIR",
+                          wb.channel("wbai").auth_dir == Path(td) / "exe_dir" / "wbai_auth",
+                          str(wb.channel("wbai").auth_dir))
+                finally:
+                    wb._BIN_DIR = _bin_save
+                check("[wb] 还原 _BIN_DIR 后账号库回到源码目录",
+                      wb.channel("wb").auth_dir == _bin_save / "wb_auth",
+                      str(wb.channel("wb").auth_dir))
+
+                # 模块级路径常量一个都不能复活：它们全是导入时的快照，
+                # 而冻结态 exe 恰恰要在导入之后改基准目录 —— 留一个就留一个坑。
+                for _dead in ("AUTH_DIR", "DESKTOP_DIR", "DESKTOP_INFO", "DESKTOP_ROOT_ID"):
+                    check("wb_ui_server 不再暴露模块级路径常量 %s" % _dead,
+                          not hasattr(wb, _dead), getattr(wb, _dead, None))
+                _app_src = (Path(__file__).resolve().parent / "wb_ui_app.py").read_text(encoding="utf-8")
+                # 只匹配**真实赋值**，不扫全文：说明性注释里会提到 srv.AUTH_DIR，
+                # 全文匹配会把注释当成代码（这个假失败本会话已经踩过好几次）。
+                # 现在更进一步：启动器**一行都不许自己赋**，必须走 srv.rebind() ——
+                # 逐个赋 5 行正是"漏改一个"的来源（AUTH_DIR 就是这么退化成快照别名的）。
+                check("wb_ui_app 只走 srv.rebind()，不逐个赋路径",
+                      "srv.rebind(" in _app_src and not assigns_paths(_app_src), "")
+                # exe 是桌面启动器：一次性 CLI 动作必须转交 wb_ui_server.main()，
+                # 否则会被静默忽略并**弹出一个窗口**（脚本/计划任务还当它成功了）。
+                check("wb_ui_app 把一次性 CLI 动作转交后端（不开窗口）",
+                      "_wants_server_cli(argv)" in _app_src and "return srv.main()" in _app_src, "")
+                # 修饰符单独出现时不该被当成动作（`exe --channel wbai` 仍应开原生窗口）
+                check("wb_ui_app 不把 --channel 这类修饰符当动作",
+                      '"--channel"' not in _app_src.split("_SERVER_ACTIONS = (")[1].split(")")[0], "")
+                # 行为验证用「抽出来 exec」而不是 import wb_ui_app：
+                # 后者在 import 时会把 srv._BIN_DIR 重置回项目目录，
+                # 而本段正处在临时目录重定向里 —— import 会把重定向冲掉，
+                # 后面的断言就会去动真实数据目录（这个坑本会话踩过）。
+                _ns = {}
+                exec(compile(ast.Module(body=[
+                    _n for _n in ast.parse(_app_src).body
+                    if (isinstance(_n, ast.Assign) and any(
+                            getattr(_t, "id", "") == "_SERVER_ACTIONS" for _t in _n.targets))
+                    or (isinstance(_n, ast.FunctionDef) and _n.name == "_wants_server_cli")
+                ], type_ignores=[]), "<wb_ui_app-cli>", "exec"), _ns)
+                _wants = _ns["_wants_server_cli"]
+                check("wb_ui_app._wants_server_cli 认得动作与 = 写法",
+                      _wants(["--refresh-all"]) is True
+                      and _wants(["--prune=3"]) is True
+                      and _wants(["--list"]) is True
+                      and _wants(["--channel", "wbai", "--switch", "x.info"]) is True
+                      and _wants(["--serve", "--port", "8790"]) is False
+                      and _wants(["--channel", "wbai"]) is False
+                      and _wants(["--force"]) is False
+                      and _wants([]) is False, "")
+
                 ok, msg, _mig = wb.switch_account(target_name)
                 acc_now = wb.wb.session_from_info_file(info) if info.is_file() else None
                 backups = [p for p in desk.glob("*.info") if p.name != "workbuddy-desktop.info"]
@@ -315,7 +483,7 @@ def main():
                 info = desk / "workbuddy-desktop.info"
                 info.write_text(original, encoding="utf-8")
                 info.with_suffix(".info.tmp").mkdir()      # 让 tmp.write_text 必失败
-                wb.DESKTOP_DIR, wb.DESKTOP_INFO = desk, info
+                ch_wb.redirect(desk)
                 ok, msg, _mig = wb.switch_account(target_name)
                 check("写入失败时返回失败", ok is False, msg[:80])
                 check("失败信息含回滚说明", "已回滚为原登录态" in msg, msg[:110])
@@ -326,7 +494,189 @@ def main():
                       [p.name for p in desk.glob("workbuddy-desktop.*.info")] == [],
                       [p.name for p in desk.glob("*.info")])
         finally:
-            wb.DESKTOP_DIR, wb.DESKTOP_INFO = orig_dir, orig_info
+            ch_wb.redirect(orig_dir, orig_name)
+
+    print("\n== 5c. 国际服（WorkBuddyAI）写路径：切号 / 增删 / 两通道互不误伤 ==")
+    # 国际服是本次新增的通道。读路径（/api/wbai/*）已有覆盖，但**写路径**此前一条用例
+    # 都没有 —— 而它恰恰是唯一会动 workbuddy-desktop-ai.info 的代码，也是本次新增配置
+    # （info_name / backup_glob / account_prefix / lock_key）最该被钉住的地方。
+    # 全程在临时目录：账号库走 _BIN_DIR 派生，桌面端走 redirect。
+    ch_wbai = wb.CHANNELS["wbai"]
+    usable_ai = [a for a in wb.list_accounts() if a.get("ok")]
+    if not usable_ai:
+        check("[wbai] 无可用账号素材，跳过写路径用例", True, "wb_auth 下没有可解析的 .info")
+    else:
+        good_ai = Path(usable_ai[0]["path"]).read_text(encoding="utf-8")
+        target_ai = Path(usable_ai[0]["path"]).name
+        target_ai_uid = usable_ai[0]["uid"]
+        o_dir_ai, o_name_ai = ch_wbai.desktop_dir, ch_wbai.info_name
+        o_bin_ai = wb._BIN_DIR
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            desk = root / "desk"
+            desk.mkdir()
+            wb._BIN_DIR = root                      # 账号库跟着基准目录走
+            ch_wbai.redirect(desk)
+            try:
+                auth = wb.channel("wbai").auth_dir
+                check("[wbai] 账号库指向临时目录（随 _BIN_DIR 派生）",
+                      auth == root / "wbai_auth", str(auth))
+
+                # --- 1) 新增账号：文件名前缀必须是 workbuddyai-，不能是国服的 workbuddy- ---
+                ok_add, msg_add = wb.add_account("__ai", good_ai, "wbai")
+                added = sorted(p.name for p in auth.glob("*.info"))
+                check("[wbai] add 落盘用 workbuddyai- 前缀（不是 workbuddy-）",
+                      ok_add and added == ["workbuddyai-__ai.info"], "%s %s" % (ok_add, added))
+
+                # --- 2) 切号：正式文件必须是 workbuddy-desktop-ai.info ---
+                # 同一个临时桌面目录里**同时**放国服的正式文件：切国际服绝不能碰它。
+                wb_info = desk / "workbuddy-desktop.info"
+                wb_info.write_text('{"account": {"uid": "wb-keep", "nickname": "国服原账号"}, "auth": {}}',
+                                   encoding="utf-8")
+                wb_orig = wb_info.read_text(encoding="utf-8")
+                ai_info = desk / "workbuddy-desktop-ai.info"
+                ai_orig = '{"account": {"uid": "ai-orig", "nickname": "国际服原账号"}, "auth": {}}'
+                ai_info.write_text(ai_orig, encoding="utf-8")
+
+                ok_sw, msg_sw, _mig_ai = wb.switch_account("workbuddyai-__ai.info", ch="wbai")
+                acc_ai = wb.wb.session_from_info_file(ai_info) if ai_info.is_file() else None
+                baks_ai = sorted(p.name for p in desk.glob("workbuddy-desktop-ai.*.info"))
+                check("[wbai] 切号成功（临时目录）", ok_sw is True, msg_sw[:80])
+                check("[wbai] 正式文件已变成目标账号",
+                      bool(acc_ai) and acc_ai["uid"] == target_ai_uid,
+                      acc_ai and acc_ai["uid"])
+                check("[wbai] 备份前缀是 workbuddy-desktop-ai.*",
+                      len(baks_ai) == 1, baks_ai)
+                check("[wbai] 备份内容是切换前的国际服登录态",
+                      baks_ai and (desk / baks_ai[0]).read_text(encoding="utf-8") == ai_orig, baks_ai)
+                # 关键：国服的正式文件与备份一个都不能被国际服切号碰到
+                check("[wbai] 切国际服不动国服的正式文件",
+                      wb_info.is_file() and wb_info.read_text(encoding="utf-8") == wb_orig, "")
+                check("[wbai] 切国际服不为国服产生备份",
+                      [p.name for p in desk.glob("workbuddy-desktop.*.info")] == [], 
+                      [p.name for p in desk.glob("*.info")])
+
+                # --- 3) 不能拿国服的文件当国际服目标（跨通道误切）---
+                ok_cross, msg_cross, _ = wb.switch_account(target_ai, ch="wbai")
+                check("[wbai] 拒绝切到只在国服账号库里存在的文件",
+                      ok_cross is False, msg_cross[:80])
+
+                # --- 3b) 无迁移能力的通道上给了 migrate：必须**说出来**，不能静默丢掉 ---
+                # 以前直接 `migrate = None`，返回 ok=true + migration=null，
+                # 用户会以为数据也迁过去了（实际只切了号）。
+                ok_sw2, msg_sw2, mig2 = wb.switch_account(
+                    "workbuddyai-__ai.info", {"enabled": True}, "wbai")
+                check("[wbai] 带 migrate 切号时明说「仅切换」（不静默丢弃）",
+                      ok_sw2 is True and mig2 is None
+                      and "不支持本地数据迁移，本次仅切换" in msg_sw2, msg_sw2[:120])
+
+                # --- 4) 删除闭环 ---
+                ok_rm, msg_rm = wb.remove_account("workbuddyai-__ai.info", "wbai")
+                check("[wbai] remove 生效",
+                      ok_rm and not (auth / "workbuddyai-__ai.info").exists(), msg_rm[:80])
+            finally:
+                wb._BIN_DIR = o_bin_ai
+                ch_wbai.redirect(o_dir_ai, o_name_ai)
+        check("[wbai] 收尾后账号库回到源码目录",
+              wb.channel("wbai").auth_dir == o_bin_ai / "wbai_auth",
+              str(wb.channel("wbai").auth_dir))
+
+    print("\n== 5d. 数据目录基准：tw 侧改成派生值 + rebind() 一次改全 ==")
+    # tw 侧此前是半新半旧：`TW_AUTH_DIR` / `LOCK_DIR` 是导入时快照，
+    # 而 `tw_backups` 是调用时现算 —— 同一个文件里两种写法，漏改一个就是
+    # 「账号库在一个目录、备份在另一个目录」的静默分家。
+    # 现在三个目录都是函数（按 `_BIN_DIR` 现算），启动器只调 `rebind()`。
+    for _dead in ("TW_AUTH_DIR", "LOCK_DIR"):
+        check("tw_ui_server 不再暴露模块级路径常量 %s" % _dead,
+              not hasattr(tw, _dead), getattr(tw, _dead, None))
+    for _fn in ("auth_dir", "lock_dir", "backup_dir", "rebind"):
+        check("tw_ui_server 提供 %s()" % _fn, callable(getattr(tw, _fn, None)), "")
+    _twapp_src = (BIN / "tw_ui_app.py").read_text(encoding="utf-8")
+    check("tw_ui_app 只走 srv.rebind()，不逐个赋路径",
+          "srv.rebind(" in _twapp_src and not assigns_paths(_twapp_src), "")
+    # 行为验证：rebind 到临时目录后，**每一个**入口都得跟着走
+    with tempfile.TemporaryDirectory() as _td5d:
+        _root5d = Path(_td5d)
+        _save_tw = (tw._BIN_DIR, tw.Handler.BASE_DIR, tw.Handler.AUDIT_DIR)
+        try:
+            tw.rebind(_root5d)
+            check("tw rebind 后账号库/锁/备份都指向新基准",
+                  tw.auth_dir() == _root5d / "tw_auth"
+                  and tw.lock_dir() == _root5d / ".locks"
+                  and tw.backup_dir() == _root5d / "tw_backups", str(tw.auth_dir()))
+            check("tw rebind 后页面目录与审计目录也指向新基准",
+                  tw.Handler.BASE_DIR == _root5d and tw.Handler.AUDIT_DIR == _root5d / "logs",
+                  str(tw.Handler.AUDIT_DIR))
+        finally:
+            tw._BIN_DIR, tw.Handler.BASE_DIR, tw.Handler.AUDIT_DIR = _save_tw
+        check("tw 还原后账号库回到源码目录",
+              tw.auth_dir() == _save_tw[0] / "tw_auth", str(tw.auth_dir()))
+    # wb 侧同样验一遍 —— `rebind` 是 wb_ui_app 唯一的改写入口
+    with tempfile.TemporaryDirectory() as _td5d:
+        _root5d = Path(_td5d)
+        _save_wb = (wb._BIN_DIR, wb.SCRIPT_DIR, wb.LOCK_DIR,
+                    wb.Handler.BASE_DIR, wb.Handler.AUDIT_DIR)
+        try:
+            wb.rebind(_root5d, _root5d / "script")
+            check("wb rebind 后基准/锁/页面/审计全指向新目录",
+                  wb._BIN_DIR == _root5d and wb.SCRIPT_DIR == _root5d / "script"
+                  and wb.LOCK_DIR == _root5d / ".locks"
+                  and wb.Handler.BASE_DIR == _root5d
+                  and wb.Handler.AUDIT_DIR == _root5d / "logs", str(wb.LOCK_DIR))
+            check("wb rebind 后两个通道账号库跟着走",
+                  wb.channel("wb").auth_dir == _root5d / "wb_auth"
+                  and wb.channel("wbai").auth_dir == _root5d / "wbai_auth", "")
+        finally:
+            (wb._BIN_DIR, wb.SCRIPT_DIR, wb.LOCK_DIR,
+             wb.Handler.BASE_DIR, wb.Handler.AUDIT_DIR) = _save_wb
+
+    print("\n== 5e. Trae 侧写路径：切号 / 备份 / 删除（全程临时目录）==")
+    # `tw.switch_account` 是本工具里**唯一**会重写客户端登录态的代码，
+    # 而它此前一条自动化用例都没有（wb 侧有 §5b/§5c，tw 侧一直空着）——
+    # 上面那个"局部名遮蔽模块函数"的 UnboundLocalError 就落在这条路径上，
+    # 没有用例的话只能等用户切号时才发现。
+    # 全程重定向：账号库走 rebind()，客户端 storage.json 走 _appdata_dir()，
+    # 用的是**伪造的**本机登录态，真实 Trae 登录态一个字节都不碰。
+    _tw_usable = [a for a in tw.list_accounts() if a.get("ok")]
+    if not _tw_usable:
+        check("[tw] 无可用素材，跳过写路径用例", True, "tw_auth 下没有可切换的 storage.json")
+    else:
+        _tw_target = _tw_usable[0]["file"]
+        _tw_asset = (BIN / "tw_auth" / _tw_target).read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as _td5e:
+            _r5e = Path(_td5e)
+            _save5e = (tw._BIN_DIR, tw.Handler.BASE_DIR, tw.Handler.AUDIT_DIR, tw._appdata_dir)
+            try:
+                tw.rebind(_r5e)
+                tw.auth_dir().mkdir(parents=True, exist_ok=True)
+                (tw.auth_dir() / _tw_target).write_text(_tw_asset, encoding="utf-8")
+                # 伪造本机登录态：不含任何真实凭据，只求结构能过解析
+                _cand = tw.tw.CANDIDATE_DIRS[0]
+                _sp = _r5e / "appdata" / _cand / "User" / "globalStorage" / "storage.json"
+                _sp.parent.mkdir(parents=True, exist_ok=True)
+                _fake = {tw.AUTH_KEY: "FAKE-ENC-NOT-A-REAL-TOKEN", "editor.fontSize": 14}
+                _sp.write_text(json.dumps(_fake), encoding="utf-8")
+                tw._appdata_dir = lambda: str(_r5e / "appdata")
+
+                check("[tw] 本机登录态已重定向到临时目录（真实 Trae 登录态不受影响）",
+                      tw._desktop_storage() == _sp, str(tw._desktop_storage()))
+                ok_sw, msg_sw = tw.switch_account(_tw_target)
+                after = json.loads(_sp.read_text(encoding="utf-8"))
+                baks = sorted(p.name for p in tw.backup_dir().glob("storage.*.json"))
+                check("[tw] 切号成功（临时目录）", ok_sw is True, msg_sw[:90])
+                check("[tw] 备份落在 tw_backups，内容 = 切换前的本机登录态",
+                      len(baks) == 1 and json.loads(
+                          (tw.backup_dir() / baks[0]).read_text(encoding="utf-8")) == _fake,
+                      baks)
+                check("[tw] 正式文件已换成目标账号密文，且保留本机其它键",
+                      bool(after.get(tw.AUTH_KEY)) and after.get(tw.AUTH_KEY) != _fake[tw.AUTH_KEY]
+                      and after.get("editor.fontSize") == 14,
+                      str(after.get(tw.AUTH_KEY))[:40])
+                check("[tw] remove 闭环",
+                      tw.remove_account(_tw_target)[0]
+                      and not (tw.auth_dir() / _tw_target).exists(), "")
+            finally:
+                (tw._BIN_DIR, tw.Handler.BASE_DIR, tw.Handler.AUDIT_DIR, tw._appdata_dir) = _save5e
 
     print("\n== 6. 一次性令牌 + 审计日志 ==")
     with tempfile.TemporaryDirectory() as td:
@@ -409,7 +759,7 @@ def main():
     try:
         time.sleep(0.3)
 
-        def boom():
+        def boom(*a, **k):
             raise ValueError("泄漏路径 C:/Users/Administrator/secret/token.info")
 
         wb.list_accounts = boom
@@ -489,7 +839,10 @@ def main():
     print("\n== 9. 打包配置（spec）==")
     # 打包出的 exe 不在自检范围内，但 spec 的静态缺陷可以在这里拦住：
     # hiddenimports 漏项属于「构建成功但双击一闪而过」，跑一次构建才发现，代价高。
-    import ast
+    # ⚠️ 这里曾经有一句函数内 `import ast`。Python 里函数内的 import 会让 `ast`
+    # 在整个 main() 里变成**局部变量**，于是前面 §5b 里用到的 `ast.Module(...)`
+    # 直接 UnboundLocalError —— 报错点在 400 行开外，根因却在 710 行。
+    # ast 已在模块顶部导入，不要在这里再写一次。
     for spec_name, dep in (("WorkBuddySwitcher.spec", "workbuddy_checkin"),
                            ("TraeSwitcher.spec", "trae_work_checkin")):
         spec = BIN / spec_name
@@ -508,6 +861,13 @@ def main():
         code = "\n".join(ln.split("#", 1)[0] for ln in code.splitlines())
         check("%s 代码中未写死 D:/AI项目 绝对路径" % spec_name,
               "D:/AI项目" not in code and "D:\\AI项目" not in code, text[:0])
+    # 部署后自检脚本要跟着 exe 一起发，且本身得能编译 ——
+    # 它平时不参与运行，写错了只有在用户手上才会暴露。
+    check("WorkBuddySwitcher.spec 带上部署自检脚本 check_exe_datadir.py",
+          "check_exe_datadir.py" in (BIN / "WorkBuddySwitcher.spec").read_text(encoding="utf-8"),
+          "")
+    check("check_exe_datadir.py 语法正确",
+          bool(ast.parse((BIN / "check_exe_datadir.py").read_text(encoding="utf-8"))), "")
 
     print("\n== 10. Trae 登录态路径的 APPDATA 回退 ==")
     # 此前 tw 侧只写 os.environ.get("APPDATA")，变量为空就静默返回空列表，
@@ -535,16 +895,23 @@ def main():
     try:
         os.environ["LOCALAPPDATA"] = ""            # 关键：置空而不是删除
         got_local = wb._localappdata_dir()
-        # 复现模块级表达式：DESKTOP_DIR 在 import 时就算好了，直接读它测不出环境变量变化
-        got_desktop = Path(wb._localappdata_dir()) / wb.wb.AUTH_REL_DIR
     finally:
         os.environ.pop("LOCALAPPDATA", None)
         if saved_local is not None:
             os.environ["LOCALAPPDATA"] = saved_local
     check("LOCALAPPDATA 为空串时回退到 ~/AppData/Local",
           bool(got_local) and "AppData" in got_local and "Local" in got_local, repr(got_local))
-    check("LOCALAPPDATA 为空串时 DESKTOP_DIR 仍是绝对路径（不会落到当前目录）",
-          got_desktop.is_absolute() and "CodeBuddyExtension" in str(got_desktop), str(got_desktop))
+    # 断言**真实常量**，而不是把表达式重写一遍 —— 后者在常量本身写错时照样通过，
+    # 等于测了个副本。（该常量在 import 时算好，改环境变量影响不到它，
+    # 所以"环境变量为空"的行为由上一条直接测函数来覆盖。）
+    check("DESKTOP_DIR_BASE 是绝对路径且指向 CodeBuddyExtension（不会落到当前目录）",
+          wb.DESKTOP_DIR_BASE.is_absolute()
+          and "CodeBuddyExtension" in str(wb.DESKTOP_DIR_BASE),
+          str(wb.DESKTOP_DIR_BASE))
+    # 通道的桌面端目录必须是**派生**的，不能是另一份独立快照
+    check("通道 desktop_dir 派生自 DESKTOP_DIR_BASE",
+          wb.CHANNELS["wb"].desktop_dir == wb.DESKTOP_DIR_BASE,
+          str(wb.CHANNELS["wb"].desktop_dir))
 
     print("\n== 11. 续期门卫（计划任务默认不强制刷新）==")
     # 计划任务每天跑一次 --refresh-all，但默认 force=False，交给上级
@@ -584,7 +951,8 @@ def main():
     # 模板是两个切换器共用的，任何一边漏配 UI_CONTEXT 都会在页面上留下裸 {{KEY}}；
     # 而脚本里一个语法错误会让整页白屏，且只有打开浏览器才看得出来 —— 这里一并守住。
     tpl = (BIN / "ui_template.html").read_text(encoding="utf-8")
-    for label, ctx in (("[wb]", wb.Handler.UI_CONTEXT), ("[tw]", tw.Handler.UI_CONTEXT)):
+    for label, ctx in (("[wb]", wb.Handler.UI_CONTEXT), ("[tw]", tw.Handler.UI_CONTEXT),
+                       ("[wbai]", wb.Handler.PAGES["/wbai"][1])):
         rendered = common.render_template(tpl, ctx).decode("utf-8")
         left = sorted(set(re.findall(r"\{\{[A-Za-z0-9_]+\}\}", rendered)))
         check("%s 模板占位符全部有值" % label, not left, left)
@@ -676,7 +1044,7 @@ def main():
     if not usable2:
         check("[wb] 无可用账号素材，跳过裁剪异常用例", True, "")
     else:
-        orig_dir, orig_info = wb.DESKTOP_DIR, wb.DESKTOP_INFO
+        orig_dir, orig_name = ch_wb.desktop_dir, ch_wb.info_name
         real_prune = common.prune_backups
 
         def _boom_prune(*a, **k):
@@ -688,7 +1056,7 @@ def main():
                 info = desk / "workbuddy-desktop.info"
                 info.write_text('{"account": {"uid": "orig", "nickname": "原账号"}, "auth": {}}',
                                 encoding="utf-8")
-                wb.DESKTOP_DIR, wb.DESKTOP_INFO = desk, info
+                ch_wb.redirect(desk)
                 common.prune_backups = _boom_prune
                 try:
                     ok, msg, _mig = wb.switch_account(Path(usable2[0]["path"]).name)
@@ -697,10 +1065,10 @@ def main():
                 check("裁剪备份抛 SystemExit 时切号仍然成功", ok is True, msg[:80])
                 check("正式登录态文件存在（不会因裁剪失败而丢失）", info.is_file(), str(info))
         finally:
-            wb.DESKTOP_DIR, wb.DESKTOP_INFO = orig_dir, orig_info
+            ch_wb.redirect(orig_dir, orig_name)
 
     # current_account：必须只认本工具接管的那一份
-    orig_dir, orig_info = wb.DESKTOP_DIR, wb.DESKTOP_INFO
+    orig_dir, orig_name = ch_wb.desktop_dir, ch_wb.info_name
     try:
         with tempfile.TemporaryDirectory() as td:
             desk = Path(td)
@@ -711,12 +1079,22 @@ def main():
             ai.write_text(good, encoding="utf-8")
             os.utime(mine, (time.time() - 100, time.time() - 100))   # 让 -ai 更新
             os.utime(ai, (time.time(), time.time()))
-            wb.DESKTOP_DIR, wb.DESKTOP_INFO = desk, mine
+            ch_wb.redirect(desk)
             names = [e["file"] for e in wb.current_account()]
             check("当前账号只认 workbuddy-desktop*，不认 workbuddy-desktop-ai*",
                   names == ["workbuddy-desktop.info"], names)
+            # 同一份素材放进国际服通道，结论必须反过来 —— 两个通道各看各的文件
+            ch_wbai = wb.CHANNELS["wbai"]
+            o_dir2, o_name2 = ch_wbai.desktop_dir, ch_wbai.info_name
+            try:
+                ch_wbai.redirect(desk)
+                names_ai = [e["file"] for e in wb.current_account("wbai")]
+                check("国际服通道只认 workbuddy-desktop-ai*",
+                      names_ai == ["workbuddy-desktop-ai.info"], names_ai)
+            finally:
+                ch_wbai.redirect(o_dir2, o_name2)
     finally:
-        wb.DESKTOP_DIR, wb.DESKTOP_INFO = orig_dir, orig_info
+        ch_wb.redirect(orig_dir, orig_name)
 
     print("\n== 14. 账号数据迁移（全程在临时目录，不碰真实数据）==")
     mig = wb.migration
@@ -914,7 +1292,7 @@ def main():
         time.sleep(0.25)
         st, raw = call(port3, "/api/migrate-preview?name=nope.info")
         check("[wb] GET /api/migrate-preview 可用", st == 200 and json.loads(raw).get("ok") is False, st)
-        st, raw = call(port3, "/")
+        st, raw = call(port3, "/wb")     # 迁移弹框属于国服视图，入口页里没有
         html = raw.decode("utf-8", "replace")
         check("[wb] 迁移弹框已注入", 'id="migModal"' in html and 'migrate: "1"' in html, st)
         check("[wb] 迁移预览接口已接上", "/api/migrate-preview" in html, "")
@@ -929,7 +1307,8 @@ def main():
         srv3.shutdown()
         srv3.server_close()
     tpl = (BIN / "ui_template.html").read_text(encoding="utf-8")
-    for label, ctx in (("[wb]", wb.Handler.UI_CONTEXT), ("[tw]", tw.Handler.UI_CONTEXT)):
+    for label, ctx in (("[wb]", wb.Handler.UI_CONTEXT), ("[tw]", tw.Handler.UI_CONTEXT),
+                       ("[wbai]", wb.Handler.PAGES["/wbai"][1])):
         rendered = common.render_template(tpl, ctx).decode("utf-8")
         left = sorted(set(re.findall(r"\{\{[A-Za-z0-9_]+\}\}", rendered)))
         check("%s MIGRATE 占位符已配（无残留）" % label, not left, left)
@@ -1269,6 +1648,13 @@ def main():
           "load();\nloadCredits();\nloadCheckin();" in tpl17, "")
     check("服务端启动时预热积分/签到缓存",
           hasattr(wb, "warmup_async") and "warmup_async()" in (BIN / "wb_ui_server.py").read_text(encoding="utf-8"), "")
+    # 缓存按通道分区，预热也必须逐通道 —— 只热国服的话国际服首屏仍要现查 ~0.7s。
+    # 断言"按通道遍历 + 按能力过滤"，别扫全文中文（会命中注释）。
+    _warm_src = (BIN / "wb_ui_server.py").read_text(encoding="utf-8")
+    check("预热覆盖每个通道（按 supports 过滤能力）",
+          "for key in CHANNELS:" in _warm_src
+          and 'jobs.append(("%s·积分" % key' in _warm_src
+          and '_ch.supports("credits")' in _warm_src, "")
 
     # --- 17e. 打开客户端 ---
     exe = wb.find_client_exe()
@@ -1453,6 +1839,92 @@ def main():
           's["needed"] = bool(' in (BIN / "account_migration.py").read_text(encoding="utf-8"), "")
     check("建议6：migrate_preview 不再重算 needed",
           'data["needed"] = bool(' not in src_wb19, "")
+
+    # --- 19d. 能力守卫必须在函数里，而不是只在 HTTP 层 ---
+    # 迁移扫描的是国服客户端的本地数据目录。守卫一度只写在 api_get 里，
+    # 于是 `--channel wbai --migrate-preview` 能绕过它，拿到一份国服数据的预览
+    # （root / sessions / automations 全是国服的），看着像"国际服也要迁移"。
+    # 守卫写进 migrate_preview() 本身，HTTP 与 CLI 两个入口才只有一个真相来源。
+    _mig_src = src_wb19.split("def migrate_preview(")[1].split("\ndef ")[0]
+    check("19d：migrate_preview 自带能力守卫（CLI 也挡得住）",
+          'supports("migrate")' in _mig_src, "")
+    _ai_target = None
+    for _a in wb.list_accounts():
+        if _a.get("ok"):
+            _ai_target = Path(_a["path"]).name
+            break
+    if _ai_target:
+        _pv_ai = wb.migrate_preview(_ai_target, "wbai")
+        check("[wbai] migrate_preview 拒绝且不泄露国服数据",
+              _pv_ai.get("ok") is False and _pv_ai.get("needed") is False
+              and "不支持本地数据迁移" in (_pv_ai.get("message") or "")
+              and "root" not in _pv_ai and "sessions" not in _pv_ai,
+              _pv_ai)
+        # 拒绝时还要带 unsupported 标记，与 /api/credits、/api/checkin-status、
+        # /api/client-status 同款 —— CLI 靠它区分「通道没这能力」与「这次扫描失败」。
+        check("[wbai] migrate_preview 拒绝时带 unsupported 标记",
+              _pv_ai.get("unsupported") is True, _pv_ai)
+        _pv_wb = wb.migrate_preview(_ai_target, "wb")
+        check("[wb] migrate_preview 仍返回真实扫描结果",
+              "root" in _pv_wb and "sessions" in _pv_wb, list(_pv_wb)[:6])
+        check("[wb] migrate_preview 不带 unsupported 标记",
+              "unsupported" not in _pv_wb, list(_pv_wb)[:6])
+    else:
+        check("[wbai] 无可用账号素材，跳过 migrate_preview 守卫用例", True, "")
+
+    # --- 19e. CLI 的退出码要说真话 ---
+    # `--migrate-preview` 曾恒 return 0：能力被拒时 JSON 里写着 ok=false，
+    # 但脚本用 `$?` 判断会当成成功。--switch / --refresh-all 都会给非零退出码，
+    # 它没有理由例外。
+    _main_src = src_wb19.split("def main(")[1]
+    check("19e：--migrate-preview 按 unsupported 给退出码",
+          'return 1 if out.get("unsupported") else 0' in _main_src, "")
+    # `--migrate` 在无迁移能力的通道上被静默丢弃过（只切号，却回 ok=true + migration=null）
+    _sw_src = src_wb19.split("def switch_account(")[1].split("\ndef ")[0]
+    check("19e：switch_account 记录被丢弃的 migrate 并写进返回消息",
+          "migrate_dropped" in _sw_src and "不支持本地数据迁移，本次仅切换" in _sw_src, "")
+    # 真跑一遍 CLI（不只扫源码）。国际服走的是"立刻返回"分支，不碰磁盘。
+    if _ai_target:
+        _r_ai = subprocess.run(
+            [sys.executable, str(BIN / "wb_ui_server.py"),
+             "--channel", "wbai", "--migrate-preview", _ai_target],
+            capture_output=True, text=True, cwd=str(BIN))
+        check("19e：[CLI] --channel wbai --migrate-preview 退出码非零",
+              _r_ai.returncode == 1, _r_ai.returncode)
+        check("19e：[CLI] 国际服预览输出里没有国服数据",
+              "root" not in _r_ai.stdout and "sessions" not in _r_ai.stdout,
+              _r_ai.stdout.strip()[:80])
+
+    # --- 19f. 积分/签到快照必须按通道取数，且缓存按通道分区 ---
+    # `credits_snapshot` / `checkin_snapshot` / `checkin_account_file` 原来内部写死
+    # `list_accounts()` + `channel(DEFAULT_CHANNEL).auth_dir`，和 checkin_all 同一类隐患：
+    # 国服是目前唯一有这些能力的通道，所以现网没症状；能力一开放就会静默读错账号库。
+    # 更隐蔽的是**缓存**：`_CHECKIN_CACHE` 是模块级的，不分区就会把国服那份结果喂给国际服。
+    for _fn in (wb.credits_snapshot, wb.checkin_snapshot, wb.checkin_account_file,
+                wb.checkin_all, wb.refresh_all_ui, wb.migrate_preview):
+        check("%s 显式收通道 ch" % _fn.__name__,
+              "ch" in inspect.signature(_fn).parameters,
+              list(inspect.signature(_fn).parameters))
+    check("积分/签到缓存按通道 key 分区（不再是扁平单槽）",
+          "_CREDITS_CACHE[ch.key]" in src_wb19 and "_CHECKIN_CACHE[ch.key]" in src_wb19
+          and '_CREDITS_CACHE = {}' in src_wb19 and '_CHECKIN_CACHE = {}' in src_wb19, "")
+    # 往国际服那条缓存里塞一份带标记的假结果：真按通道分区的话，这次调用会
+    # **命中缓存直接返回**（不发任何网络请求），并且带回标记。
+    _saved_ck = dict(wb._CHECKIN_CACHE)
+    try:
+        wb._CHECKIN_CACHE["wbai"] = {"ts": time.time(),
+                                     "payload": {"ok": True, "accounts": [], "marker": "ai"}}
+        _ai_ck = wb.checkin_snapshot(False, "wbai")
+        check("[wbai] 签到快照命中自己那条缓存（没串到国服）",
+              _ai_ck.get("marker") == "ai" and _ai_ck.get("cached") is True, _ai_ck)
+        wb._CHECKIN_CACHE["wb"] = {"ts": 1.0, "payload": {"ok": True, "accounts": []}}
+        wb._invalidate_checkin_cache("wbai")
+        check("签到缓存失效只清该通道（另一个通道的结果留着）",
+              "wbai" not in wb._CHECKIN_CACHE and "wb" in wb._CHECKIN_CACHE,
+              sorted(wb._CHECKIN_CACHE))
+    finally:
+        wb._CHECKIN_CACHE.clear()
+        wb._CHECKIN_CACHE.update(_saved_ck)
 
     # --- 19b. 2026-09-20 的 5 项界面调整 ---
     check("① exp 里不再显示具体到期日期", "fmtDate(o.expires_at)" not in tpl17, "")

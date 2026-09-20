@@ -2,6 +2,7 @@
 tw_auth/
 tw_backups/
 wb_auth/
+wbai_auth/
 
 # 续期 token 缓存（含 refreshToken）
 token_cache*.json
@@ -24,6 +25,10 @@ output/
 
 # 跨进程锁文件
 .locks/
+
+# 窗口状态守卫的备份（每次 pin/check --fix 都会生成一份，是运行产物不是源码；
+# 期望值在 window_state_golden.json 里，那个要入库）
+window_state_backups/
 
 # 临时 / 调试残留
 .trash*/

@@ -11,7 +11,7 @@
 TTL 由服务端下发、可能随时调整，本脚本始终以文件里的实际时间戳为准。
 
 用法：
-    python check_ttl.py                    # 扫描本目录 wb_auth 与 ../自动签到/wb_auth
+    python check_ttl.py                    # 扫描本目录 wb_auth / wbai_auth 与 ../自动签到/wb_auth
     python check_ttl.py 目录1 目录2 ...
 """
 import base64
@@ -82,6 +82,7 @@ def scan(directory):
 def main():
     args = sys.argv[1:]
     dirs = args or [str(Path(__file__).resolve().parent / "wb_auth"),
+                    str(Path(__file__).resolve().parent / "wbai_auth"),
                     str(Path(__file__).resolve().parent.parent / "自动签到" / "wb_auth")]
     rows = []
     for d in dirs:
