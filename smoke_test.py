@@ -1236,18 +1236,18 @@ def main():
     # --- 17c. 列表更窄更矮 ---
     for needle, why in ((".wrap { max-width: 860px;", "整体更窄且贴合行内容"),
                         (".list { display:flex; flex-direction:column; gap:7px; }", "行间距更小"),
-                        # 272 = 「登录态 剩余 X 天」105 + 间隙 5 + 「· 总剩余积分 X」115
-                        # = 225px，加头像 32 + 间距 9 = 266，留 6px 余量。
-                        (".who { flex:0 0 272px;", "身份列容得下剩余时间+总积分一行"),
+                        # 248 = 最宽的「昵称 + [当前] + [长期 55天]」约 198px
+                        # + 头像 32 + 间距 9 + 9 余量。定小了名字会折成两行。
+                        (".who { flex:0 0 248px;", "身份列容得下名字+两个标签一行"),
                         (".acts { flex:0 0 110px;", "操作列更窄"),
-                        (".ci-bar { flex:1 1 60px; min-width:60px; height:4px;", "进度条更细且自适应")):
+                        (".ci-bar { flex:1 1 auto; min-width:60px; height:4px;", "进度条更细且吃满整行")):
         check("紧凑化：%s（%s）" % (needle.split("{")[0].strip(), why), needle in tpl17, "")
     # --- 17c2. 身份列不再"串行"：meta 与 exp 各占独立位置 ---
     check("meta 不再重复 [当前] 标签已说明的「桌面端正在使用」",
           "' · 桌面端正在使用'" not in tpl17, "")
-    check("exp 两个 nowrap 片段（登录态剩余 / 总剩余积分）",
-          ".exp-ttl, .exp-total { white-space:nowrap; }" in tpl17
-          and '<span class="exp-ttl">' in tpl17 and "totalRemainHtml(o.file)" in tpl17, "")
+    check("exp 只留总剩余积分（登录态剩余已删）",
+          ".exp-total { white-space:nowrap; }" in tpl17
+          and "totalRemainHtml(o.file)" in tpl17 and "exp-ttl" not in tpl17, "")
     check("meta / exp 有正常行高与间距（折行后不贴在一起）",
           "line-height:1.4" in tpl17 and ".exp { font-size:12px; color:var(--dim); line-height:1.4; margin-top:4px;" in tpl17, "")
     # 进度条与数字同排，整排宽度 == 上方文字行宽度（左右边缘对齐）。
@@ -1259,7 +1259,8 @@ def main():
     check("积分块填满 .body（不留死区）",
           ".ci { display:flex; flex-direction:column; gap:4px; width:100%; }" in tpl17, "")
     check("进度条自适应剩余宽度（不再写死 max-width）",
-          "max-width:240px" not in tpl17 and ".ci-line { display:flex; align-items:center; gap:10px;" in tpl17, "")
+          "max-width:240px" not in tpl17
+          and ".ci-line { display:flex; align-items:center; position:relative; min-height:18px;" in tpl17, "")
     check("积分块把「档位名/时间/用量」压到同一行（省两行高度）",
           'h+=\'<div class="ci">\'\n      +\'<div class="ci-info">\'\n      +\'<span class="ci-name">\'' in tpl17, "")
 
@@ -1461,11 +1462,12 @@ def main():
     check("③ 积分块标题行整行删掉（credits-title / credits-total 全无）",
           "credits-title" not in tpl17 and "credits-total" not in tpl17, "")
     check("④ 已使用/剩余默认隐藏，悬停进度条才显示",
-          ".ci-used { visibility:hidden; }" in tpl17
-          and ".ci-bar:hover ~ .ci-used { visibility:visible; }" in tpl17, "")
-    check("④ 用 visibility 而非 display（悬停时不抖动）",
-          ".ci-used { visibility:hidden; }" in tpl17
-          and ".ci-used { display:none" not in tpl17, "")
+          "opacity:0; transition:opacity .12s" in tpl17
+          and ".ci-bar:hover ~ .ci-used { opacity:1; }" in tpl17, "")
+    check("④ 浮层绝对定位（不占位 → 进度条吃满整行、不留空档）",
+          ".ci-used { position:absolute; right:0;" in tpl17, "")
+    check("④ pointer-events:none（否则鼠标移到浮层上会一闪一闪）",
+          "pointer-events:none" in tpl17.split(".ci-used {")[1].split("}")[0], "")
     check("④ 进度条命中区上下各扩 7px（4px 的条子太难点中）",
           'content:""; position:absolute; left:0; right:0; top:-7px; bottom:-7px;' in tpl17, "")
     check("④ 去掉 overflow:hidden 后由 <i> 自带圆角（否则填充会露直角）",
@@ -1481,6 +1483,20 @@ def main():
           "UI.openClient==='1'" in tpl17, "")
     check("⑤ wb 侧当前行仍保留空的 .acts（三列网格与下面的行对齐）",
           '\'<div class="acts"></div>\'' in tpl17, "")
+
+    # --- 19c. 2026-09-20 第二轮：删登录态剩余 + 布局优化 ---
+    check("① 渲染逻辑里不再有「登录态」字样",
+          "登录态 ' +" not in tpl17 and ">登录态<" not in tpl17, "")
+    check("① 不再渲染剩余天数（原 exp-ttl 已删）",
+          "exp-ttl" not in tpl17, "")
+    check("① 总剩余积分保留在身份列", 'class="exp-total"' in tpl17, "")
+    check("② 快过期信号转到通道标签上（soon 态 + title 带天数）",
+          ".tag-ttl.soon { background:rgba(255,92,92,.15); color:var(--red); }" in tpl17
+          and "rd<3" in tpl17 and "登录态剩余 " in tpl17, "")
+    check("② 通道标签的 55天/30天 仍在（那是通道有效期，不是剩余天数）",
+          "长期 " in tpl17 and "短期 " in tpl17, "")
+    check("③ 「· 」前缀去掉（只剩一项时不该留分隔符）",
+          '>· 总剩余积分 ' not in tpl17, "")
 
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0
