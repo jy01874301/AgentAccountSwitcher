@@ -1236,18 +1236,18 @@ def main():
     # --- 17c. 列表更窄更矮 ---
     for needle, why in ((".wrap { max-width: 860px;", "整体更窄且贴合行内容"),
                         (".list { display:flex; flex-direction:column; gap:7px; }", "行间距更小"),
-                        # 254 = 能容下「登录态剩余 · 日期」一行（实测该行 204px，
-                        # 加头像 32 + 间距 9）。窄于这个值它就会折成两行。
-                        (".who { flex:0 0 254px;", "身份列容得下剩余时间一行"),
+                        # 272 = 「登录态 剩余 X 天」105 + 间隙 5 + 「· 总剩余积分 X」115
+                        # = 225px，加头像 32 + 间距 9 = 266，留 6px 余量。
+                        (".who { flex:0 0 272px;", "身份列容得下剩余时间+总积分一行"),
                         (".acts { flex:0 0 110px;", "操作列更窄"),
                         (".ci-bar { flex:1 1 60px; min-width:60px; height:4px;", "进度条更细且自适应")):
         check("紧凑化：%s（%s）" % (needle.split("{")[0].strip(), why), needle in tpl17, "")
     # --- 17c2. 身份列不再"串行"：meta 与 exp 各占独立位置 ---
     check("meta 不再重复 [当前] 标签已说明的「桌面端正在使用」",
           "' · 桌面端正在使用'" not in tpl17, "")
-    check("exp 拆成两个 nowrap 片段（折行时不会留下孤立的 ·）",
-          ".exp-ttl, .exp-when { white-space:nowrap; }" in tpl17
-          and '<span class="exp-ttl">' in tpl17 and '<span class="exp-when">' in tpl17, "")
+    check("exp 两个 nowrap 片段（登录态剩余 / 总剩余积分）",
+          ".exp-ttl, .exp-total { white-space:nowrap; }" in tpl17
+          and '<span class="exp-ttl">' in tpl17 and "totalRemainHtml(o.file)" in tpl17, "")
     check("meta / exp 有正常行高与间距（折行后不贴在一起）",
           "line-height:1.4" in tpl17 and ".exp { font-size:12px; color:var(--dim); line-height:1.4; margin-top:4px;" in tpl17, "")
     # 进度条与数字同排，整排宽度 == 上方文字行宽度（左右边缘对齐）。
@@ -1452,6 +1452,35 @@ def main():
           's["needed"] = bool(' in (BIN / "account_migration.py").read_text(encoding="utf-8"), "")
     check("建议6：migrate_preview 不再重算 needed",
           'data["needed"] = bool(' not in src_wb19, "")
+
+    # --- 19b. 2026-09-20 的 5 项界面调整 ---
+    check("① exp 里不再显示具体到期日期", "fmtDate(o.expires_at)" not in tpl17, "")
+    check("② 总剩余积分移到身份列（挂在 exp 那一行）",
+          "totalRemainHtml(o.file)" in tpl17 and 'class="exp-total"' in tpl17, "")
+    # 用类名而不是中文文本：中文会出现在注释里（这个断言第一版就是这么假失败的）
+    check("③ 积分块标题行整行删掉（credits-title / credits-total 全无）",
+          "credits-title" not in tpl17 and "credits-total" not in tpl17, "")
+    check("④ 已使用/剩余默认隐藏，悬停进度条才显示",
+          ".ci-used { visibility:hidden; }" in tpl17
+          and ".ci-bar:hover ~ .ci-used { visibility:visible; }" in tpl17, "")
+    check("④ 用 visibility 而非 display（悬停时不抖动）",
+          ".ci-used { visibility:hidden; }" in tpl17
+          and ".ci-used { display:none" not in tpl17, "")
+    check("④ 进度条命中区上下各扩 7px（4px 的条子太难点中）",
+          'content:""; position:absolute; left:0; right:0; top:-7px; bottom:-7px;' in tpl17, "")
+    check("④ 去掉 overflow:hidden 后由 <i> 自带圆角（否则填充会露直角）",
+          "overflow:hidden" not in tpl17.split(".ci-bar {")[1].split("}")[0]
+          and ".ci-bar i { display:block; height:100%; border-radius:2px;" in tpl17, "")
+    check("⑤ wb 侧不显示「打开客户端」（OPEN_CLIENT 置空）",
+          wb.Handler.UI_CONTEXT.get("OPEN_CLIENT") == "", repr(wb.Handler.UI_CONTEXT.get("OPEN_CLIENT")))
+    check("⑤ tw 侧保留「打开客户端」",
+          tw.Handler.UI_CONTEXT.get("OPEN_CLIENT") == "1", repr(tw.Handler.UI_CONTEXT.get("OPEN_CLIENT")))
+    check("⑤ 导航栏按钮按 UI.openClient 隐藏",
+          "if(UI.openClient!=='1')" in tpl17 and "openClientBtn" in tpl17, "")
+    check("⑤ 当前账号行的按钮也按 UI.openClient 开关",
+          "UI.openClient==='1'" in tpl17, "")
+    check("⑤ wb 侧当前行仍保留空的 .acts（三列网格与下面的行对齐）",
+          '\'<div class="acts"></div>\'' in tpl17, "")
 
     print("\n失败项：%s" % (FAIL or "无"))
     return 1 if FAIL else 0

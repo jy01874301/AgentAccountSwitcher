@@ -1154,7 +1154,10 @@ class Handler(common.BaseHandler):
         "CMD": "workbuddy_switcher.cmd",
         "CREDITS": "1",            # 展示积分明细 + 「刷新积分」按钮（Trae 侧无该接口，置空即隐藏）
         "CHECKIN": "1",            # 展示签到状态 + 「一键签到」按钮（Trae 侧无该接口，置空即隐藏）
-        "MIGRATE": "1",            # 切号时弹「是否迁移任务与项目」确认框（Trae 侧无此能力，置空即隐藏）
+        # 切号时弹「是否迁移任务与项目」确认框（Trae 侧无此能力，置空即隐藏）
+        "MIGRATE": "1",
+        # 「打开客户端」按钮：WorkBuddy 侧按用户要求去掉，置空即隐藏
+        "OPEN_CLIENT": "",
     }
     WRITE_ENDPOINTS = ("/api/switch", "/api/remove", "/api/refresh", "/api/add",
                        "/api/checkin", "/api/refresh-all", "/api/open-client")
