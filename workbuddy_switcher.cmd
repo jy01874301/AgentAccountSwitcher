@@ -30,10 +30,15 @@ REM point you at it and exit, instead of silently starting a second one on a
 REM shifted port. The port is only shifted when some OTHER program holds it,
 REM and the actual address is always printed below.
 python wb_ui_server.py --serve
-if "%ERRORLEVEL%"=="1" (
+set RC=%ERRORLEVEL%
+if "%RC%"=="1" (
     echo.
     echo [ERROR] Could not start the service ^(see the message above^).
     pause
 )
 echo.
 echo Service stopped.
+REM Must exit with an explicit code: without it the script's exit status comes
+REM from the LAST command (echo), which is always 0 -- scheduled tasks and any
+REM caller checking %ERRORLEVEL% would treat a failed start as success.
+exit /b %RC%

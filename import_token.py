@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 AUTH_KEY = "iCubeAuthInfo://icube.cloudide"
@@ -294,6 +295,35 @@ def load_input(path, say):
     return out
 
 
+def _atomic_write_text(path, text):
+    """原子落盘：先写**同目录**临时文件，fsync 后再 os.replace 覆盖目标。
+
+    ⚠️ 原先直接 `out.write_text(...)` 覆写含 refresh_token 的 config.json ——
+    中途被打断（Ctrl+C / 断电 / 杀软锁文件）会留下**截断的**文件，
+    等于**全部账号凭据一次性丢失**。`os.replace` 在同一卷上是原子的：
+    读到的要么是旧内容、要么是新内容，没有中间态（见 AUDIT_2026-09-24.md P2-12）。
+
+    临时文件必须与目标同目录 —— 跨卷时 os.replace 会退化成「复制 + 删除」，就不原子了。
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                    dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:  # noqa: BLE001  含 KeyboardInterrupt —— 临时文件别留下
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def merge_write(output, tokens):
     out = Path(output).resolve()
     if out.is_dir():
@@ -306,10 +336,9 @@ def merge_write(output, tokens):
         except (OSError, ValueError) as e:
             raise SystemExit("目标文件 %s 不是有效的 JSON 配置（%r），未写入" % (out, e))
         data["tokens"] = tokens
-        out.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_text(out, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     else:
-        out.write_text(json.dumps({"tokens": tokens}, ensure_ascii=False, indent=2) + "\n",
-                       encoding="utf-8")
+        _atomic_write_text(out, json.dumps({"tokens": tokens}, ensure_ascii=False, indent=2) + "\n")
     if os.name == "posix":
         try:
             os.chmod(out, 0o600)

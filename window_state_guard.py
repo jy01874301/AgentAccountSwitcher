@@ -107,9 +107,15 @@ kernel32.QueryFullProcessImageNameW.restype = w.BOOL
 kernel32.QueryFullProcessImageNameW.argtypes = [
     ctypes.c_void_p, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD)]
 kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = w.DWORD
 
 user32.GetWindowPlacement.argtypes = [w.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
 user32.GetWindowPlacement.restype = w.BOOL
+user32.GetClassNameW.argtypes = [w.HWND, w.LPWSTR, ctypes.c_int]
+user32.ShowWindow.argtypes = [w.HWND, ctypes.c_int]
+user32.SetForegroundWindow.argtypes = [w.HWND]
+user32.AttachThreadInput.argtypes = [w.DWORD, w.DWORD, w.BOOL]
 user32.SetWindowPlacement.argtypes = [w.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
 user32.SetWindowPlacement.restype = w.BOOL
 
@@ -138,12 +144,17 @@ def proc_image_path(pid):
         kernel32.CloseHandle(h)
 
 
-def enum_windows():
-    """枚举所有可见且有标题的顶层窗口，返回 dict 列表。"""
+def enum_windows(include_hidden=False):
+    """枚举有标题的顶层窗口，返回 dict 列表。
+
+    默认只收可见窗口（`cmd_list` / `find_window` 要的是"看得见的那个"）。
+    `include_hidden=True` 时连**隐藏**窗口一起收 —— 客户端收进托盘后主窗口就是
+    隐藏的，只有这样才能找到它（见 `cmd_revive`）。
+    """
     out = []
 
     def cb(hwnd, _lparam):
-        if not user32.IsWindowVisible(hwnd):
+        if not include_hidden and not user32.IsWindowVisible(hwnd):
             return True
         n = user32.GetWindowTextLengthW(hwnd)
         if n <= 0:
@@ -157,10 +168,14 @@ def enum_windows():
         wp = WINDOWPLACEMENT()
         wp.length = ctypes.sizeof(WINDOWPLACEMENT)
         user32.GetWindowPlacement(hwnd, ctypes.byref(wp))
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls, 256)
         out.append({
             "hwnd": hwnd,
             "title": buf.value,
             "pid": pid.value,
+            "cls": cls.value,
+            "visible": bool(user32.IsWindowVisible(hwnd)),
             "exe": proc_image_path(pid.value),
             "rect": [r.left, r.top, r.right - r.left, r.bottom - r.top],
             "show_cmd": wp.showCmd,
@@ -254,8 +269,38 @@ def read_state(channel):
         return "CORRUPT"
 
 
+BACKUP_KEEP = 20      # window_state_backups/ 只保留最近多少份
+
+
+def _prune_backups(keep=BACKUP_KEEP):
+    """把 window_state_backups/ 裁剪到最近 keep 份，返回删除数量。
+
+    ⚠️ 本脚本是**独立分发**的（随 exe 放在 `_internal/` 下，用户直接 `python` 跑），
+    **不能** import `switcher_common` —— 它的代码在 exe 的 PYZ 归档里，独立脚本取不到。
+    所以这里自己实现一份最小的裁剪，与 `common.prune_backups` 语义一致。
+    任何异常都吞掉：裁剪只是善后，删不掉最坏就是多留几份（见 AUDIT_2026-09-24.md P2-11）。
+    """
+    try:
+        files = sorted((p for p in BACKUP_DIR.glob("*.window-state.*.json") if p.is_file()),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return 0
+    removed = 0
+    for p in files[int(keep):]:
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def backup_state(channel, reason):
-    """把当前状态文件复制到 window_state_backups/，返回备份路径（失败返回 None）。"""
+    """把当前状态文件复制到 window_state_backups/，返回备份路径（失败返回 None）。
+
+    写完就裁剪到最近 `BACKUP_KEEP` 份 —— 原先只增不删，长期堆积既占空间，
+    也把窗口几何历史一直留在磁盘上（见 AUDIT_2026-09-24.md P2-11）。
+    """
     src = state_path(channel)
     if not src.exists():
         return None
@@ -264,10 +309,11 @@ def backup_state(channel, reason):
     dst = BACKUP_DIR / ("%s.window-state.%s.%s.json" % (channel, ts, reason))
     try:
         shutil.copy2(src, dst)
-        return dst
     except BaseException as exc:  # noqa: BLE001 - 备份失败不应中断主流程
         print("  ! 备份失败：%s" % exc)
         return None
+    _prune_backups()
+    return dst
 
 
 def write_state(channel, state):
@@ -356,6 +402,58 @@ def verdict(channel, state):
 # ---------------------------------------------------------------- 命令
 
 
+def cmd_revive(args):
+    """把「只剩托盘图标、点不出来」的客户端主窗口唤出来。
+
+    成因：Electron 客户端关闭时走的是 `win.hide()` 而不是退出 —— 进程还在、
+    托盘图标还在，但主窗口 `IsWindowVisible=0`。此时点托盘图标，应用按
+    toggle 逻辑可能又执行一次 hide，于是永远出不来。
+
+    办法：直接对主窗口 `ShowWindow`（保持它原来的最大化/还原状态），
+    再尝试置前。这里**不改** window-state.json。
+    """
+    channels = [args.channel] if args.channel else ["wb", "wbai"]
+    wins = enum_windows(include_hidden=True)
+    for ch in channels:
+        hint = EXE_HINTS[ch]
+        mains = [x for x in wins
+                 if hint.lower() in (x["exe"] or "").lower()
+                 and x["cls"] == "Chrome_WidgetWin_1"
+                 and x["rect"][2] >= 200 and x["rect"][3] >= 100]
+        # 可见的排前面：已经看得见就没必要动它
+        mains.sort(key=lambda x: (not x["visible"], -x["rect"][2] * x["rect"][3]))
+        print("=" * 78)
+        print("[%s] %s" % (ch, EXE_HINTS[ch]))
+        if not mains:
+            print("  没找到主窗口（客户端可能没在运行）")
+            continue
+        for x in mains:
+            print("  hwnd=%-8d vis=%-5s %dx%d @(%d,%d) title=%r"
+                  % (x["hwnd"], x["visible"], x["rect"][2], x["rect"][3],
+                     x["rect"][0], x["rect"][1], x["title"][:40]))
+        top = mains[0]
+        if top["visible"]:
+            print("  -> 窗口本来就看得见，无需唤出")
+            continue
+        cmd = 3 if top["show_cmd"] == 3 else 1   # SW_SHOWMAXIMIZED / SW_SHOWNORMAL
+        user32.ShowWindow(top["hwnd"], cmd)
+        # 前台切换可能被系统拒绝（前台锁定），失败不影响"看得见"
+        fg = user32.GetForegroundWindow()
+        tid_cur = kernel32.GetCurrentThreadId()
+        tid_fg = user32.GetWindowThreadProcessId(fg, 0) if fg else 0
+        attached = bool(tid_fg and tid_fg != tid_cur
+                        and user32.AttachThreadInput(tid_cur, tid_fg, True))
+        try:
+            ok = bool(user32.SetForegroundWindow(top["hwnd"]))
+        finally:
+            if attached:
+                user32.AttachThreadInput(tid_cur, tid_fg, False)
+        now_vis = bool(user32.IsWindowVisible(top["hwnd"]))
+        print("  -> ShowWindow(%d) 已执行；现在可见=%s，置前=%s"
+              % (cmd, now_vis, ok))
+    return 0
+
+
 def cmd_list(_args):
     wins = enum_windows()
     wins.sort(key=lambda x: (x["exe"].lower(), x["title"]))
@@ -406,7 +504,13 @@ def cmd_capture(args):
 
     b = tuple(win["normal"])
     maximized = win["show_cmd"] == 3
-    st = read_state(ch) or {}
+    st = read_state(ch)
+    # ⚠️ `read_state(ch) or {}` **兜不住损坏态**：状态文件坏掉时它返回字符串 "CORRUPT"，
+    #    而非空字符串是真值，`or {}` 不生效 → 下一行 st.get(...) 直接 AttributeError，
+    #    capture 崩掉而不是降级。同文件 :543/:617 都用 `in (None, "CORRUPT")` 判，
+    #    这里原先漏了 —— 见 AUDIT_2026-09-24.md P2-8。
+    if not isinstance(st, dict):
+        st = {}
     entry = _golden_entry(b, maximized, st.get("isFullScreen", False))
 
     golden = load_golden()
@@ -670,6 +774,11 @@ def build_parser():
     sp.add_argument("--fix", action="store_true", help="漂移时回写（先备份）")
     sp.add_argument("--live", action="store_true", help="配合 --fix：同时改运行中窗口")
     sp.set_defaults(func=cmd_check)
+
+    sp = sub.add_parser("revive",
+                        help="客户端只剩托盘图标时，把隐藏的主窗口唤出来（不改状态文件）")
+    add_channel(sp, required=False)
+    sp.set_defaults(func=cmd_revive)
 
     sp = sub.add_parser("watch", help="采样窗口几何变化")
     add_channel(sp)

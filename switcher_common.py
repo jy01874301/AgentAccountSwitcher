@@ -15,6 +15,7 @@ HTTP 骨架（此前已出现修复一处、漏掉另一处的漂移）。这里
 """
 import base64
 import contextlib
+import csv
 import datetime
 import json
 import os
@@ -22,6 +23,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -76,7 +78,9 @@ def replace_with_retry(src, dst, tries=6, delay=0.15):
     原先只在 account_migration 里有一份，切号那边没有 —— 现在提到这里共用。
     """
     last = None
-    for i in range(int(tries)):
+    # ⚠️ `tries<=0` 时 range 为空 → 直接 `raise last`，而 last 是 None →
+    #    抛的是 TypeError 而不是原始 OSError，把真正的失败原因吃掉。至少试一次。
+    for i in range(max(1, int(tries))):
         try:
             Path(src).replace(dst)
             return
@@ -91,6 +95,32 @@ def new_token():
     return secrets.token_urlsafe(24)
 
 
+def jwt_ttl_days(token):
+    """按 JWT 的 `exp - iat` 取**服务端签发的**有效天数；取不到返回 None。
+
+    `token_source` 只是个标签，`exp - iat` 才是权威时长 —— 前者缺失时用它兜底：
+      国服 account-e     token_source 为空，但 exp-iat = 55 天（与 oneid_login 一致）
+      国际服 两个   token_source 为空，exp-iat = 362 / 364 天（约 1 年，国服那套
+                   55/30 的二分法对它根本不适用）
+    """
+    seg = str(token or "").split(".")
+    if len(seg) < 2:
+        return None
+    p = seg[1]
+    p += "=" * (-len(p) % 4)
+    try:
+        pl = json.loads(base64.urlsafe_b64decode(p))
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        exp, iat = int(pl.get("exp")), int(pl.get("iat"))
+    except (TypeError, ValueError):
+        return None
+    if exp <= iat:
+        return None
+    return int(round((exp - iat) / 86400.0))
+
+
 def render_template(raw, ctx):
     """把 HTML 模板里的 {{KEY}} 替换成配置值（两个切换器共用同一份模板）。
 
@@ -103,7 +133,13 @@ def render_template(raw, ctx):
 
 
 def token_source(token):
-    """取 JWT payload 里的 token_source（决定有效期长短的签发通道）。"""
+    """取 JWT payload 里的 token_source（决定有效期长短的签发通道）。
+
+    ⚠️ **不是每个账号都有这个字段**。实测（2026-09-21）：国服 8 个账号里有 1 个
+    （account-e）、国际服 2 个账号全部，payload 里都没有 `token_source` —— 只靠它判断
+    「长期 55 天 / 短期 30 天」会让这些账号的标签直接消失。所以另有
+    `jwt_ttl_days()` 用 `exp - iat` 兜底（那是服务端签发的权威时长，一定有）。
+    """
     seg = str(token or "").split(".")
     if len(seg) < 2:
         return ""
@@ -148,6 +184,55 @@ def err_payload(exc):
             "message": "服务器错误（%s）：%s" % (type(exc).__name__, scrub(exc))}
 
 
+def print_json(obj, stream=None):
+    """CLI 的 JSON 输出统一出口 —— 兜住 GBK 控制台下的 UnicodeEncodeError。
+
+    为什么必须有这一层：打包成 windowed exe 后（或从计划任务里调用 exe 时），
+    `sys.stdout` 的编码是 **GBK** 而不是 UTF-8。此时
+    `print(json.dumps(..., ensure_ascii=False))` 只要遇到 BMP 以外的字符就直接抛
+    `UnicodeEncodeError`。2026-09-21 实测：本机 `wb_auth\\workbuddy-hlqin.info`
+    的昵称是 `丹怡Helia 🌱`，`wb_ui_server.py --list` / `--current` /
+    `--switch` / `--migrate-preview` 四条命令在 `PYTHONIOENCODING=gbk` 下全部
+    以退出码 1 崩溃（而 `--channel wbai --list` 正常，只因国际服昵称不含 emoji）。
+
+    这个坑在源码态**测不出来**：Git Bash 与 cmd 交互式的 stdout 都是 UTF-8，
+    只有 exe / 计划任务才暴露。
+
+    处理策略：先按原编码试写；失败就整体切到 UTF-8 重写一次。
+    切 UTF-8 而不是 `errors="replace"`：宁可让终端编码不匹配，
+    也不要静默把昵称换成 `?`，让用户以为账号名变了。
+    """
+    text = json.dumps(obj, ensure_ascii=False, indent=2)
+    out = stream if stream is not None else sys.stdout
+    if out is None:            # pythonw / 无控制台：没有可写目标，直接放弃
+        return
+    try:
+        out.write(text + "\n")
+        out.flush()
+        return
+    except UnicodeEncodeError:
+        pass
+    except ValueError:         # 流已关闭
+        return
+    except OSError:
+        return
+    try:
+        out.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        # 老版本 Python 或不可重配的流：退化成 ASCII 转义，至少不崩
+        try:
+            out.write(json.dumps(obj, ensure_ascii=True, indent=2) + "\n")
+            out.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    try:
+        out.write(text + "\n")
+        out.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def require_module(name, attrs=(), who=""):
     """导入被复用的模块并校验契约，失败时给出可读提示而不是裸 Traceback。
 
@@ -173,6 +258,18 @@ def require_module(name, attrs=(), who=""):
 
 # 仅允许回环地址访问（服务本身也只绑 127.0.0.1，这里是第二道防线）
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+# 请求体上限。本服务的写请求都是小 JSON（切号 / 增删 / 续期参数），
+# 1 MB 已经远远够用；设上限是为了不让一个畸形 Content-Length 把工作线程挂住。
+MAX_BODY_BYTES = 1 << 20
+
+
+class BadRequest(ValueError):
+    """请求本身不合法（Content-Length 非法 / 请求体过大）→ 回 400 而不是 500。
+
+    500 的语义是「服务端出错了」，而这类情况是**客户端发错了**，
+    混在一起会让排障时误以为服务有 bug。
+    """
 
 # 完整 accessToken 的最小长度（正常 JWT 都在 1000 字符以上）
 MIN_TOKEN_LEN = 200
@@ -415,28 +512,46 @@ MUTEX_NAME_TW = "Local\\TraeSwitcher-tw"
 OUR_APPS = ("wb_switcher", "tw_switcher")
 
 
-def source_version(path, tag):
+def source_version(path, tag, extra_paths=()):
     """用源文件 mtime 生成构建戳。
 
     用途只有一个：让第二个实例能看出"那个在跑的实例是不是旧代码"
     —— 本会话踩过：8765 上跑着 02:16 启动的旧实例，一直用旧模板服务，
     让人以为"改版没生效"。git 在打包态未必可用，mtime 最稳。
 
+    `extra_paths`：**一起参与取最大 mtime** 的兄弟文件。典型是启动器
+    （`ui_app.py`）—— 它们不 import 本模块的常量，但改动同样
+    影响行为。不传的话，"只改了启动器"时版本戳不变，`stale` 检测就失效
+    （实测：给启动器加一次性令牌，重启后 version 仍是旧值，只能靠行为验证 ——
+     见 AUDIT_2026-09-24.md 第二十章）。
+
     打包态下 `__file__` 指向 PyInstaller 的临时解包目录（每次启动路径都不同、
-    且不保证能 stat），所以再回退到 `sys.executable`（= exe 本身）——
-    否则 exe 的版本戳会退化成裸 tag，就失去了比对意义。
+    且不保证能 stat），此时所有候选都 stat 不到 → 回退到 `sys.executable`
+    （= exe 本身），否则 exe 的版本戳会退化成裸 tag，就失去了比对意义。
     """
     import sys as _sys
     import time as _t
-    for cand in (path, getattr(_sys, "executable", None)):
+    best = None
+    for cand in (path,) + tuple(extra_paths):
         if not cand:
             continue
         try:
-            st = Path(cand).stat()
+            mt = Path(cand).stat().st_mtime
         except OSError:
             continue
-        return "%s-%s" % (tag, _t.strftime("%Y%m%d-%H%M%S", _t.localtime(st.st_mtime)))
-    return tag
+        if best is None or mt > best:
+            best = mt
+    if best is None:
+        # 候选全都 stat 不到（打包态）→ 退到 exe 自身
+        exe = getattr(_sys, "executable", None)
+        if exe:
+            try:
+                best = Path(exe).stat().st_mtime
+            except OSError:
+                best = None
+    if best is None:
+        return tag
+    return "%s-%s" % (tag, _t.strftime("%Y%m%d-%H%M%S", _t.localtime(best)))
 
 
 def acquire_single_instance(name):
@@ -465,15 +580,77 @@ def acquire_single_instance(name):
         return None, False
 
 
+def _list_processes_native():
+    """用 `CreateToolhelp32Snapshot` 原生枚举进程；失败返回 None。
+
+    为什么不用 `tasklist`：**它要起一个子进程，实测 0.30 秒**（本机 95 个进程），
+    而原生 API 是 **~2 毫秒**，快 150 倍。`list_processes()` 是 `client_status()` /
+    `live_token.client_pids()` / 迁移前置检查等的必经之路，一次页面加载能调好几次，
+    这 0.3 秒是纯浪费。
+    附带好处：`Process32NextW` 给的是**真 Unicode 名**，不再有 tasklist 那个
+    「GBK 输出按 UTF-8 解码 → 非 ASCII 进程名变乱码键」的坑。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD),
+                        ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t),   # ULONG_PTR
+                        ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", ctypes.c_wchar * 260)]
+
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == INVALID_HANDLE_VALUE:
+            return None
+        out = {}
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                name = (entry.szExeFile or "").lower()
+                if name:
+                    out.setdefault(name, []).append(int(entry.th32ProcessID))
+                ok = k32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            k32.CloseHandle(snap)
+        return out or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def list_processes():
     """枚举当前进程，返回 {小写进程名: [pid, ...]}。
 
     **检测不出来返回 None**（≠ 没有进程）—— 调用方必须区分这两者，
     否则"枚举失败"会被当成"程序没在跑"（本会话踩过：tasklist 的 GBK 输出
     让 UTF-8 解码在读取线程里炸掉，stdout 变空，于是 12 个客户端进程被当成 0 个）。
+
+    主路径是原生 `CreateToolhelp32Snapshot`（~2ms）；`tasklist` 只作兜底
+    （0.30s，且非 ASCII 名会乱码）—— 两条路都失败才返回 None。
     """
     if os.name != "nt":
         return None
+    native = _list_processes_native()
+    if native:
+        return native
     try:
         # 不能用 text=True：tasklist 在中文 Windows 上输出 GBK，而本机 Python 处于
         # UTF-8 模式，解码会在**读取线程里**抛 UnicodeDecodeError（异常不冒到调用方）。
@@ -486,8 +663,11 @@ def list_processes():
     except Exception:  # noqa: BLE001
         return None
     out = {}
-    for line in text.splitlines():
-        parts = [c.strip().strip('"') for c in line.strip().split(",")]
+    # ⚠️ 用 csv.reader 而不是裸 split(",")：进程名理论上可以含逗号，tasklist 会用
+    #    引号把它包起来，裸 split 会把这一行拆错、于是整条记录被丢掉
+    #    （见 AUDIT_2026-09-24.md P3-5）。csv.reader 会自动去掉外层引号。
+    for row in csv.reader(text.splitlines()):
+        parts = [c.strip() for c in row]
         if len(parts) < 2 or not parts[0]:
             continue
         name = parts[0].lower()
@@ -534,11 +714,116 @@ def process_image_path(pid):
         return ""
 
 
-def focus_windows_of(pids, sw_restore=9):
-    """把指定 pid 的可见窗口切到前台。做不到返回 False（不抛异常）。
+def _win_placement_struct():
+    """`WINDOWPLACEMENT`（ctypes.wintypes 里没有，只能自己定义）。"""
+    import ctypes
+    from ctypes import wintypes
+    if os.name != "nt":
+        return None
 
-    Windows 有前台锁定：`SetForegroundWindow` 可能被系统拒绝（返回 0）。
-    这里尽力而为，失败时调用方应改为提示用户从任务栏切过去。
+    class _WP(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_uint), ("flags", ctypes.c_uint),
+                    ("showCmd", ctypes.c_uint), ("ptMinPosition", wintypes.POINT),
+                    ("ptMaxPosition", wintypes.POINT),
+                    ("rcNormalPosition", wintypes.RECT)]
+    return _WP
+
+
+_WINDOWPLACEMENT = _win_placement_struct() or type("_WP", (), {})  # 占位，非 Windows 不用
+
+
+# Electron 主窗口的类名。`Chrome_WidgetWin_0` / `IME` /
+# `Electron_NotifyIconHostWindow` / `crashpad_SessionEndWatcher` 等都是 helper，
+# 尺寸常常是 0x0 —— 拿它们去 ShowWindow 会显示出一个空的隐形窗口，
+# 用户观感就是"点了还是没反应"，所以主窗口必须按类名 + 面积认。
+ELECTRON_MAIN_CLASS = "Chrome_WidgetWin_1"
+_MIN_MAIN_W, _MIN_MAIN_H = 200, 100
+
+SW_SHOWNORMAL, SW_SHOWMAXIMIZED = 1, 3
+
+
+def client_main_windows(pids, include_hidden=True):
+    """挑出属于这些 pid 的 **客户端主窗口**，按可用性排序返回。
+
+    ⚠️ 2026-09-22：客户端「关闭到托盘」时，主窗口是 **隐藏** 的
+    （`IsWindowVisible=0`，但 `WINDOWPLACEMENT.showCmd` 仍是最大化）。
+    只按"可见"过滤会一条都选不出来 —— 本工具的「打开客户端」于是回
+    「系统不允许切到前台，请从任务栏点开」，用户点托盘图标也出不来。
+
+    返回 `[{hwnd, cls, title, visible, maximized, area}]`，顺序为：
+      1) 可见的主窗口（正常情况）  2) 隐藏的主窗口（收在托盘里）
+      3) 可见的其它窗口（兜底，按面积降序）
+    `include_hidden=False` 时只保留第 1 类。
+    非 Windows / ctypes 不可用 → 返回 []（不抛异常）。
+    """
+    if os.name != "nt" or not pids:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u32.IsWindowVisible.argtypes = [wintypes.HWND]
+        u32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        u32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        u32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(_WINDOWPLACEMENT)]
+        want = set(int(p) for p in pids)
+        rows = []
+        proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value not in want:
+                return True
+            cls = ctypes.create_unicode_buffer(256)
+            u32.GetClassNameW(hwnd, cls, 256)
+            n = u32.GetWindowTextLengthW(hwnd)
+            title = ctypes.create_unicode_buffer(n + 1)
+            u32.GetWindowTextW(hwnd, title, n + 1)
+            r = wintypes.RECT()
+            u32.GetWindowRect(hwnd, ctypes.byref(r))
+            wp = _WINDOWPLACEMENT()
+            wp.length = ctypes.sizeof(_WINDOWPLACEMENT)
+            u32.GetWindowPlacement(hwnd, ctypes.byref(wp))
+            rows.append({
+                "hwnd": hwnd, "cls": cls.value, "title": title.value,
+                "visible": bool(u32.IsWindowVisible(hwnd)),
+                "maximized": wp.showCmd == SW_SHOWMAXIMIZED,
+                "area": max(0, r.right - r.left) * max(0, r.bottom - r.top),
+                "w": max(0, r.right - r.left), "h": max(0, r.bottom - r.top),
+            })
+            return True
+
+        u32.EnumWindows(proc(_cb), 0)
+
+        def _is_main(x):
+            return x["cls"] == ELECTRON_MAIN_CLASS and \
+                x["w"] >= _MIN_MAIN_W and x["h"] >= _MIN_MAIN_H
+
+        mains = [x for x in rows if _is_main(x)]
+        vis_main = sorted([x for x in mains if x["visible"]],
+                          key=lambda x: -x["area"])
+        hid_main = sorted([x for x in mains if not x["visible"]],
+                          key=lambda x: -x["area"])
+        others = sorted([x for x in rows if x["visible"] and not _is_main(x)],
+                        key=lambda x: -x["area"])
+        out = vis_main + (hid_main if include_hidden else []) + others
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def focus_windows_of(pids, sw_restore=9):
+    """把指定 pid 的主窗口切到前台；**窗口被收进托盘时先把它唤出来**。
+
+    返回 True = 窗口现在**看得见**了（置前可能被 Windows 前台锁定拒绝，
+    但那不影响"看得见"，所以不算失败）。一个窗口都找不到才返回 False。
+
+    ⚠️ 早期版本只收 `IsWindowVisible` 为真的窗口，对"关到托盘"的客户端
+    恒返回 False —— 表现就是点了「打开客户端」没反应。
     """
     if os.name != "nt" or not pids:
         return False
@@ -546,33 +831,47 @@ def focus_windows_of(pids, sw_restore=9):
         import ctypes
         from ctypes import wintypes
         u32 = ctypes.WinDLL("user32", use_last_error=True)
-        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-        u32.IsWindowVisible.argtypes = [wintypes.HWND]
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         u32.SetForegroundWindow.argtypes = [wintypes.HWND]
-        want = set(int(p) for p in pids)
-        found = []
-        proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        u32.GetForegroundWindow.restype = wintypes.HWND
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        k32.GetCurrentThreadId.restype = wintypes.DWORD
 
-        def _cb(hwnd, _lparam):
-            pid = wintypes.DWORD()
-            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value in want and u32.IsWindowVisible(hwnd):
-                found.append(hwnd)
-            return True
-
-        u32.EnumWindows(proc(_cb), 0)
-        if not found:
+        cands = client_main_windows(pids)
+        if not cands:
             return False
-        u32.ShowWindow(found[0], sw_restore)
-        return bool(u32.SetForegroundWindow(found[0]))
+        win = cands[0]
+        # 隐藏的窗口要先 ShowWindow 现身；用 showCmd 对应的命令，
+        # 免得把"最大化后收进托盘"的窗口给还原成小窗。
+        cmd = (SW_SHOWMAXIMIZED if win["maximized"] else SW_SHOWNORMAL) \
+            if not win["visible"] else sw_restore
+        u32.ShowWindow(win["hwnd"], cmd)
+
+        # 前台切换：Windows 有前台锁定，尽了力仍可能被拒（返回 0）。
+        # 用 AttachThreadInput 解除"别的线程持有前台"这一常见拒绝原因。
+        fg = u32.GetForegroundWindow()
+        tid_cur = k32.GetCurrentThreadId()
+        tid_fg = u32.GetWindowThreadProcessId(fg, 0) if fg else 0
+        attached = bool(tid_fg and tid_fg != tid_cur and
+                        u32.AttachThreadInput(tid_cur, tid_fg, True))
+        try:
+            ok = bool(u32.SetForegroundWindow(win["hwnd"]))
+        finally:
+            if attached:
+                u32.AttachThreadInput(tid_cur, tid_fg, False)
+        # 只要窗口现身就算成功 —— 用户要的是"能看见"
+        return bool(u32.IsWindowVisible(win["hwnd"])) or ok
     except Exception:  # noqa: BLE001
         return False
 
 
 def close_windows_of(pids, wm_close=0x0010):
-    """给指定 pid 的可见窗口发 WM_CLOSE（礼貌关闭），返回发出的条数。
+    """给指定 pid 的**主窗口**发 WM_CLOSE（礼貌关闭），返回发出的条数。
 
+    包括被收进托盘的隐藏窗口 —— 以前只发给可见窗口，结果客户端藏在托盘时
+    一条都发不出去，`close_client` 只能白白等满 8 秒再强杀。
     优先用它而不是直接强杀：客户端能走正常退出流程，不会丢未落盘的状态。
     """
     if os.name != "nt" or not pids:
@@ -581,24 +880,20 @@ def close_windows_of(pids, wm_close=0x0010):
         import ctypes
         from ctypes import wintypes
         u32 = ctypes.WinDLL("user32", use_last_error=True)
-        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-        u32.IsWindowVisible.argtypes = [wintypes.HWND]
         u32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
                                      wintypes.WPARAM, wintypes.LPARAM]
-        want = set(int(p) for p in pids)
-        sent = []
-        proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-        def _cb(hwnd, _lparam):
-            pid = wintypes.DWORD()
-            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value in want and u32.IsWindowVisible(hwnd):
-                u32.PostMessageW(hwnd, wm_close, 0, 0)
-                sent.append(hwnd)
-            return True
-
-        u32.EnumWindows(proc(_cb), 0)
-        return len(sent)
+        cands = client_main_windows(pids)
+        if not cands:
+            return 0
+        mains = [w for w in cands if w["cls"] == ELECTRON_MAIN_CLASS]
+        # 万一直的不是 Electron（没有 Chrome_WidgetWin_1），退回"发给可见窗口"的老行为，
+        # 免得一条 WM_CLOSE 都发不出去、白等 8 秒再强杀。
+        targets = mains or [w for w in cands if w["visible"]]
+        sent = 0
+        for w in targets:
+            if u32.PostMessageW(w["hwnd"], wm_close, 0, 0):
+                sent += 1
+        return sent
     except Exception:  # noqa: BLE001
         return 0
 
@@ -654,39 +949,71 @@ def probe_instance(port, timeout=0.6, host="127.0.0.1"):
         return None
 
 
-def probe_instance_range(port, tries=10, timeout=0.3, host="127.0.0.1"):
-    """在 [port, port+tries) 里找我们的实例（第一个实例可能因端口占用顺延过）。
+def probe_instance_range(port, tries=10, timeout=0.3, host="127.0.0.1",
+                         extra_ports=(), exclude_pid=None):
+    """在候选端口里找我们的实例（第一个实例可能因端口占用顺延过）。
+
+    候选 = `[port, port+tries)` ∪ 每个 `extra_ports` 各自的 `tries` 个端口（去重）。
+    `extra_ports` 用于「请求端口区间 ∪ 默认端口区间」这种多起点场景 —— 互斥体是
+    **按工具全局**的、与端口无关，只探请求区间会在「已有实例在默认端口、这次又显式
+    传了别的 --port」时误报。
+
+    `exclude_pid`：跳过指定 pid 的实例（单实例守卫要排除**自己**）。
+
+    命中优先级：`port` > `extra_ports` 顺序 > 端口最小者，保证结果确定。
 
     ⚠️ **必须并发探**。串行探 10 个空端口时，每个都要等满超时（实测本机 0.42s/个 ——
     那些端口上没人应答，连接一直挂着而不是立刻 RST），单区间 4.1s，
     两个区间加起来启动要 **8.3 秒**，`.cmd` 会像卡死。
-    并发之后总耗时 ≈ 单次超时。
+    并发之后总耗时 ≈ 单次超时（所以超时必须短：真实实例 20ms 内就应答）。
+
+    本函数是**唯一**的端口区间探测实现 —— `single_instance_guard._probe_all` 直接
+    复用它（见 AUDIT_2026-09-24.md P3-3）。
     """
-    ports = list(range(int(port), int(port) + int(tries)))
-    if not ports:
+    starts = list(dict.fromkeys([int(port)] + [int(p) for p in extra_ports]))
+    cands = []
+    for s in starts:
+        cands.extend(range(s, s + int(tries)))
+    cands = list(dict.fromkeys(cands))
+    if not cands:
         return None
-    if len(ports) == 1:
-        return probe_instance(ports[0], timeout=timeout, host=host)
+
+    def _keep(info):
+        if not info:
+            return False
+        if exclude_pid is not None and str(info.get("pid")) == str(exclude_pid):
+            return False
+        return True
+
     found = {}
-    try:
-        import concurrent.futures as cf
-        with cf.ThreadPoolExecutor(max_workers=len(ports)) as ex:
-            futs = {ex.submit(probe_instance, p, timeout, host): p for p in ports}
-            for fut in cf.as_completed(futs):
-                try:
-                    info = fut.result()
-                except Exception:  # noqa: BLE001
-                    info = None
-                if info:
-                    found[futs[fut]] = info
-    except Exception:  # noqa: BLE001  并发不可用时退回串行，别因此起不来
-        for p in ports:
-            info = probe_instance(p, timeout=timeout, host=host)
-            if info:
-                found[p] = info
+    if len(cands) > 1:
+        try:
+            import concurrent.futures as cf
+            with cf.ThreadPoolExecutor(max_workers=len(cands)) as ex:
+                futs = {ex.submit(probe_instance, p, timeout, host): p for p in cands}
+                for fut in cf.as_completed(futs):
+                    try:
+                        info = fut.result()
+                    except Exception:  # noqa: BLE001
+                        info = None
+                    if _keep(info):
+                        found[futs[fut]] = info
+        except Exception:  # noqa: BLE001  并发不可用时退回串行，别因此起不来
+            for p in cands:
+                info = probe_instance(p, timeout=timeout, host=host)
+                if _keep(info):
+                    found[p] = info
+    else:
+        info = probe_instance(cands[0], timeout=timeout, host=host)
+        if _keep(info):
+            found[cands[0]] = info
+
     if not found:
         return None
-    return found[min(found)]          # 端口最小者优先，保证结果确定
+    for p in starts:                  # 起点顺序优先（请求端口 > 默认端口）
+        if p in found:
+            return found[p]
+    return found[min(found)]          # 否则端口最小者，保证结果确定
 
 
 def single_instance_guard(mutex_name, port, tries=PORT_TRIES, log=print, wait=5.0,
@@ -711,8 +1038,6 @@ def single_instance_guard(mutex_name, port, tries=PORT_TRIES, log=print, wait=5.
         **按工具全局**的、与端口无关，只探请求区间会在"已有实例在默认端口、
         这次显式传了别的 --port"时误报 abort（实测踩过）。
 
-        命中优先级：请求端口 > 默认端口 > 端口最小者，保证结果确定。
-
         ⚠️ 两点都是实测踩出来的：
         - **必须并发**：本机连一个没人监听的回环端口**不会立刻 RST，会一直挂到超时**
           （裸 socket 也要 2 秒），串行 10 个端口就是 10 倍（曾达 8.3s）。
@@ -720,37 +1045,15 @@ def single_instance_guard(mutex_name, port, tries=PORT_TRIES, log=print, wait=5.
           0.2s 有 10 倍余量。
         早先的写法是"先串行探两个优先端口、再串行扫两个区间"，冷启动要 0.86s ——
         优先端口没命中时那 0.4s 是白花的。合成一次并发后只剩 0.2s。
+
+        实现已下沉到 `probe_instance_range`（全仓**唯一**一份端口区间探测），
+        这里只负责传参 —— 原先两边各写一遍线程池 + 串行兜底 + 最小端口
+        （见 AUDIT_2026-09-24.md P3-3）。
         """
-        starts = list(dict.fromkeys([int(port)] + ([int(default_port)] if default_port else [])))
-        cands = []
-        for s in starts:
-            cands.extend(range(s, s + int(tries)))
-        cands = list(dict.fromkeys(cands))
-
-        found = {}
-        try:
-            import concurrent.futures as cf
-            with cf.ThreadPoolExecutor(max_workers=len(cands)) as ex:
-                futs = {ex.submit(probe_instance, p, timeout, "127.0.0.1"): p for p in cands}
-                for fut in cf.as_completed(futs):
-                    try:
-                        info = fut.result()
-                    except Exception:  # noqa: BLE001
-                        info = None
-                    if info and str(info.get("pid")) != str(os.getpid()):
-                        found[futs[fut]] = info
-        except Exception:  # noqa: BLE001  并发不可用时退回串行
-            for p in cands:
-                info = probe_instance(p, timeout=timeout)
-                if info and str(info.get("pid")) != str(os.getpid()):
-                    found[p] = info
-
-        if not found:
-            return None
-        for p in starts:
-            if p in found:
-                return found[p]
-        return found[min(found)]
+        return probe_instance_range(
+            port, tries=tries, timeout=timeout,
+            extra_ports=[int(default_port)] if default_port else (),
+            exclude_pid=os.getpid())
 
     # 1) 端口上已经有我们的实例？（含不持互斥体的旧版本）
     info = _probe_all()
@@ -834,14 +1137,17 @@ def open_page(url, log=print):
         log("       已有页面在运行，不再新开标签页；若那个标签页已关闭，"
             "请手动打开：%s" % url)
         return False
-    mark_page_opened()
     try:
         import webbrowser
         webbrowser.open(url)
-        log("       已打开页面：%s" % url)
-        return True
     except Exception:  # noqa: BLE001
         return False
+    # ⚠️ mark 必须在**确认打开没抛异常之后**：原先先 mark 再 open，一旦 open 失败，
+    #    30 秒宽限期照样被占住，这段时间内的调用会被误判成「已有页面在运行」而不开标签页
+    #    （见 AUDIT_2026-09-24.md P3-4）。
+    mark_page_opened()
+    log("       已打开页面：%s" % url)
+    return True
 
 
 def notify_user(title, message, log=print):
@@ -887,7 +1193,7 @@ def report_abort(port, tries=PORT_TRIES):
     print("[错误] 已有切换器实例在运行，但在 %d~%d 端口上都探测不到它。"
           % (port, int(port) + int(tries) - 1), flush=True)
     print("       可能原因：它启动后卡死；或它的端口被别的程序抢走了。", flush=True)
-    print("       请先结束已有的切换器进程（任务管理器里找 python.exe / WorkBuddySwitcher.exe）再重试。", flush=True)
+    print("       请先结束已有的切换器进程（任务管理器里找 python.exe / AgentAccountSwitcher.exe）再重试。", flush=True)
     return 1
 
 
@@ -941,11 +1247,26 @@ class BaseHandler(BaseHTTPRequestHandler):
         return True
 
     def _params(self):
-        """解析请求参数：query string 与 JSON body 合并（body 优先）。"""
+        """解析请求参数：query string 与 JSON body 合并（body 优先）。
+
+        ⚠️ Content-Length 必须**先校验再读**，三种坏值各有后果：
+          - 非数字 → `int()` 抛 ValueError → 500（其实是客户端发错了，该回 400）；
+          - 负数  → `self.rfile.read(-5)` 会**一直读到连接关闭**，把工作线程挂住；
+          - 超大  → 无上限地读进内存。
+        本机页面不会这么发，但任何能连到 87xx 的本地进程都可以。
+        """
         data = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
-        length = int(self.headers.get("Content-Length") or 0)
-        if not length:
+        raw_len = self.headers.get("Content-Length")
+        if not raw_len:
             return data
+        try:
+            length = int(raw_len)
+        except (TypeError, ValueError):
+            raise BadRequest("Content-Length 非法：%r" % (raw_len,))
+        if length < 0:
+            raise BadRequest("Content-Length 不能为负：%d" % length)
+        if length > MAX_BODY_BYTES:
+            raise BadRequest("请求体过大（%d 字节，上限 %d 字节）" % (length, MAX_BODY_BYTES))
         raw = self.rfile.read(length).decode("utf-8", "replace")
         try:
             obj = json.loads(raw)
@@ -986,12 +1307,19 @@ class BaseHandler(BaseHTTPRequestHandler):
             # 消息同样要脱敏：file_lock 的超时文案里带锁文件绝对路径
             code = 504
             message = "本地服务处理超时（可能被其它切换/续期占用，请稍后重试）：%s" % scrub(exc)
+        elif isinstance(exc, BadRequest):
+            # 客户端发错了（Content-Length 非法 / 请求体过大）→ 400，不是 500
+            code = 400
+            message = str(exc)
         else:
             code = 500
             message = err_payload(exc)["message"]
         payload = {"ok": False, "message": message, "error": type(exc).__name__}
         if self.AUDIT_DIR and path:
-            audit(self.AUDIT_DIR, self.SOURCE,
+            # 用 audit_source(path) 而不是 self.SOURCE：后者会把 /api/wbai/* 的出错
+            # 记成 [wb]。do_POST 的成功路径与令牌失败路径都用的 audit_source，这里原先漏了
+            # （见 AUDIT_2026-09-24.md P3-1）。
+            audit(self.AUDIT_DIR, self.audit_source(path),
                   self.AUDIT_ACTIONS.get(path, path), target, False, message)
         try:
             self._send_json(payload, code)
@@ -999,15 +1327,10 @@ class BaseHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def do_GET(self):
+        path = ""
         try:
             u = urlparse(self.path)
-            if u.path == "/":
-                self._serve_index()
-                return
-            if u.path in self.PAGES:
-                name, ctx = self.PAGES[u.path]
-                self._serve_page(name, ctx)
-                return
+            path = u.path
             if u.path == "/api/ping":
                 # 身份端点：让第二个实例能判断"这个端口上是不是我们自己"。
                 # 放在 _guard() 之前 —— 探测方只带 Host，不需要令牌，也不该被同源策略挡。
@@ -1029,6 +1352,21 @@ class BaseHandler(BaseHTTPRequestHandler):
                 return
             if not self._guard():
                 return
+            # ⚠️ 页面路由必须在 `_guard()` **之后**：`_serve_page` 会往页面里注入
+            #    `window.SWITCHER_TOKEN`（见下面 _serve_page），而 `_guard()` 含 Host 回环
+            #    校验。放在守卫之前等于「任何 Host 都能拿到带令牌的页面」，与 README
+            #    声明的「Host / Origin 都必须回环」不符。
+            #    （不构成直接可利用的漏洞：do_POST 的 Host+Origin 校验与令牌校验是
+            #    串联的两道，DNS rebinding 读到令牌也过不了 Host 校验。但这是纵深防御
+            #    该补齐的一环 —— 见 AUDIT_2026-09-24.md P2-2。）
+            #    只有 `/api/ping` 与 `/api/page-alive` 是**有意**豁免的（单实例探测）。
+            if u.path == "/":
+                self._serve_index()
+                return
+            if u.path in self.PAGES:
+                name, ctx = self.PAGES[u.path]
+                self._serve_page(name, ctx)
+                return
             if u.path in self.WRITE_ENDPOINTS:
                 self._send_json({"ok": False, "message": "该接口仅支持 POST"}, 405)
                 return
@@ -1037,7 +1375,10 @@ class BaseHandler(BaseHTTPRequestHandler):
         except KeyboardInterrupt:
             raise
         except BaseException as e:  # noqa: BLE001  含 SystemExit（见 _handle_request_error）
-            self._handle_request_error(e)
+            # 必须把 path 传进去：`_handle_request_error` 里 `if self.AUDIT_DIR and path`
+            # 就是审计的开关，不传 → GET 侧异常**零审计**（do_POST 一直传，这里原先漏了，
+            # 见 AUDIT_2026-09-24.md P3-2）。
+            self._handle_request_error(e, path)
 
     def do_POST(self):
         path, target = "", ""

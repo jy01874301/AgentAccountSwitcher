@@ -17,17 +17,17 @@ wb_switcher/
 ├── switcher_common.py     # 两个切换器共用的 HTTP 骨架 / 文件锁 / 备份裁剪 / 端口避让
 ├── ui_hub.html            # 统一入口页：左侧侧边导航栏，两个管理入口（国服 / 国际服）
 ├── ui_template.html       # 两个管理视图共用的前端模板（后端按通道渲染后返回）
-├── wb_ui_app.py           # 桌面版启动器（pywebview 窗口，可打包 exe）
+├── ui_app.py              # 桌面版启动器（**多产品**：--product wb|trae，可打包 exe）
 ├── workbuddy_switcher.cmd # Windows 启动脚本（双击即用）
 ├── wb_auth/               # 国服账号库，放置 *.info 登录态文件（唯一真源，见下）
-│   ├── workbuddy-jhan.info
-│   ├── workbuddy-Maggie ya.info
-│   ├── workbuddy-wtnong.info
-│   ├── workbuddy-wtnong1.info
-│   └── workbuddy-星空.info
+│   ├── workbuddy-account-a.info
+│   ├── workbuddy-account-b.info
+│   ├── workbuddy-account-c.info
+│   ├── workbuddy-account-d.info
+│   └── workbuddy-account-e.info
 ├── wbai_auth/             # 国际服（WorkBuddyAI）账号库，同样放 *.info
-├── tw_ui_server.py / tw_ui_app.py / trae_switcher.cmd  # Trae 姊妹工具，见 README_Trae.md
-├── WorkBuddySwitcher.spec / TraeSwitcher.spec  # 桌面版打包配置（pyinstaller <spec> --noconfirm）
+├── tw_ui_server.py / trae_switcher.cmd   # Trae 姊妹工具的后端与启动脚本，见 README_Trae.md
+├── AgentAccountSwitcher.spec # 桌面版打包配置（pyinstaller <spec> --noconfirm）
 ├── import_token.py        # Trae 凭据导入（别机 tokens / storage.json → config.json）
 ├── check_ttl.py           # 登录态体检：签发通道 / 剩余天数 / accessToken 完整性（只读）
 ├── check_exe_datadir.py   # 冻结态 exe 的数据目录基准自检（双探针法，重新打包后跑）
@@ -150,8 +150,8 @@ WorkBuddy 桌面端的本地登录态保存在：
 命令行等价入口：
 
 ```bash
-python wb_ui_server.py --migrate-preview workbuddy-jhan.info   # 只读扫描，看要迁多少
-python wb_ui_server.py --switch workbuddy-jhan.info --migrate  # 切号并迁移（默认 move）
+python wb_ui_server.py --migrate-preview workbuddy-account-a.info   # 只读扫描，看要迁多少
+python wb_ui_server.py --switch workbuddy-account-a.info --migrate  # 切号并迁移（默认 move）
 python wb_ui_server.py --switch x.info --migrate --migrate-mode share
 ```
 
@@ -496,7 +496,7 @@ python wb_ui_server.py --channel wbai --switch workbuddyai-xxx.info
 > 全都不可达。此时页面会**顶部弹出红色提示条**说明原因并给出正确地址
 > （`http://127.0.0.1:8765/`），侧边栏两个入口显示「未连接到本地服务」，
 > 内容区换成「视图不可用」占位 —— 而不是让浏览器甩出一个打不开的图标。
-> 正确入口：跑 `WorkBuddySwitcher.exe`（它自己会开窗口），或
+> 正确入口：跑 `AgentAccountSwitcher.exe`（它自己会开窗口），或
 > `python wb_ui_server.py --serve` 后访问打印出来的地址。
 - 两个视图页在 iframe 里会自己认出被嵌入（`window.self!==window.top`），
   隐藏自身的品牌与锚点导航（外层侧边栏已经有一份了），只保留右侧状态与工具按钮，
@@ -707,6 +707,14 @@ Windows 上**刚创建/刚写入的文件与目录**可能被杀软或索引器�
 
 > 所有会改动登录态 / 账号库的接口**只接受 POST**（参数放 JSON body，也兼容 query string），
 > 用 GET 调用会返回 405。服务还会校验 `Host` / `Origin` 必须是回环地址，阻断外部网页的跨站调用。
+>
+> **例外（有意豁免，不要"修"）**：`GET /api/ping` 与 `GET /api/page-alive` 位于
+> 同源守卫 `_guard()` **之前**，`Host` 不是回环时也会返回 200。
+> 原因是单实例探测要能在拿到互斥体之前确认「这个端口上跑的是不是我们自己」——
+> 探测请求未必带正确的 `Host` / `Origin`。这两个端点只回
+> `{ok, app, version, pid, port, page_open}`，不含任何账号数据，无泄密面。
+> 若把它们移到 `_guard()` 之后，跨源探测会拿到 403，`probe_instance` 就会
+> 把自己认成"别人的程序"，进而**重复启动第二个实例**。
 
 | 方法 | 路径 | 参数 | 说明 |
 |------|------|------|------|
@@ -748,13 +756,13 @@ Windows 上**刚创建/刚写入的文件与目录**可能被杀软或索引器�
 
 | 文件 | 昵称 | uid | uin | 手机号（尾号） | 签发通道 |
 |------|------|-----|-----|----------------|----------|
-| `workbuddy-jhan.info` | 13677759422 | c6297850-7a78-4ec5-b46a-8748ffd28a58 | 330119838223 | 9422 | `enterprise_switch`（短期 30 天） |
-| `workbuddy-Maggie ya.info` | Maggie ya | a2b31245-7d42-4207-af9b-8162fee183e3 | 330118970606 | 2679 | `enterprise_switch`（短期 30 天） |
-| `workbuddy-wtnong.info` | wtnong | b592a5dd-3f86-4360-b0cc-4df5b196098b | 330116013866 | 1461 | `oneid_login`（长期 55 天） |
-| `workbuddy-wtnong1.info` | wtnong1 | ae528206-0a31-494f-9a3a-4e19363edf55 | 330116014385 | 7608 | `oneid_login`（长期 55 天） |
-| `workbuddy-星空.info` | 星空 | ba575b06-7a96-46ff-b18f-d7f959c74f0f | 330107846428 | 7575 | 早期令牌（无 `token_source`，按 55 天） |
+| `workbuddy-account-a.info` | account-a | `11111111-1111-4111-8111-111111111111` | 900000000001 | `****` | `enterprise_switch`（短期 30 天） |
+| `workbuddy-account-b.info` | account-b | `22222222-2222-4222-8222-222222222222` | 900000000002 | `****` | `enterprise_switch`（短期 30 天） |
+| `workbuddy-account-c.info` | account-c | `33333333-3333-4333-8333-333333333333` | 900000000003 | `****` | `oneid_login`（长期 55 天） |
+| `workbuddy-account-d.info` | account-d | `44444444-4444-4444-8444-444444444444` | 900000000004 | `****` | `oneid_login`（长期 55 天） |
+| `workbuddy-account-e.info` | account-e | `55555555-5555-4555-8555-555555555555` | 900000000005 | `****` | 早期令牌（无 `token_source`，按 55 天） |
 
-> 其中 `jhan` 与 `Maggie ya` 是 30 天短期通道，靠下面的自动续期保持不掉线。
+> 其中 `account-a` 与 `account-b` 是 30 天短期通道，靠下面的自动续期保持不掉线。
 
 ### 唯一账号库约定（重要）
 
@@ -837,7 +845,7 @@ try {
 用户实测：退出登录 → 手机号验证码重新登录 → 仍然是 30 天。与代码一致。
 
 时间线也吻合：本机 14 份历史登录态快照里，`oneid_login` 的会话都建于 **08-20 ~ 09-02**，
-而 `enterprise_switch` 的两个建于 **09-14 00:46**（Maggie ya）和 **09-16 14:28**（jhan）。
+而 `enterprise_switch` 的两个建于 **09-14 00:46**（account-b）和 **09-16 14:28**（account-a）。
 旧会话靠"续期不换通道"一直保持 55 天，新登的一律 30 天 —— 是**登录页改版**的结果，
 不是账号属性，也不是操作失误。
 
@@ -944,18 +952,26 @@ C:\Users\Administrator\.workbuddy-ai\binaries\python\versions\3.13.12\python.exe
 $VENV = C:\Users\Administrator\.workbuddy-ai\binaries\python\envs\default
 & "$VENV\Scripts\python.exe" -m pip install pywebview pyinstaller
 
-# 打包
-& "$VENV\Scripts\python.exe" -m PyInstaller WorkBuddySwitcher.spec --noconfirm
-& "$VENV\Scripts\python.exe" -m PyInstaller TraeSwitcher.spec --noconfirm
+# 打包（**只有一个 spec** —— 它同时打 WorkBuddy 与 Trae 两个产品）
+& "$VENV\Scripts\python.exe" -m PyInstaller AgentAccountSwitcher.spec --noconfirm
 ```
 
-产物在 `dist\WorkBuddySwitcher\`、`dist\TraeSwitcher\`。把账号目录（`wb_auth\`、
+产物在 `dist\AgentAccountSwitcher\`。把账号目录（`wb_auth\`、
 `wbai_auth\`、`tw_auth\`）放到 exe 同级即可识别。验证 `webview` 确实打进去了：
-`dist\*\ _internal\` 下应能看到 `webview\`、`pythonnet\`、`clr_loader\` 三个目录。
+`dist\AgentAccountSwitcher\_internal\` 下应能看到 `webview\`、`pythonnet\`、`clr_loader\` 三个目录。
+
+> **账号目录不用手动建**：exe 一跑（`--list` 或开窗口都行）就会在同级把
+> `wb_auth\` / `wbai_auth\` / `tw_auth\` 建出来，空目录里还会写一份
+> `把账号文件放这里.txt` 说明该放什么文件。
+> 不靠打包带上是因为 `dist\` 每次重建都会整个重来，塞进去的空目录必然丢失；
+> 而部署时用户只拷 exe，不会手动建目录 —— 结果是页面显示「0 个账号」，
+> 用户不知道该往哪放，看着像工具坏了。
 
 > ⚠️ **exe 的数据目录基准是「exe 同级」，不是 cwd、也不是 `_internal\`。**
-> 实现方式是 `wb_ui_app` / `tw_ui_app` 在 `import` 之后把
+> 实现方式是 `ui_app` 在导入后端模块之后、通过它的 `rebind()` 把
 > `srv._BIN_DIR` 指到 `Path(sys.executable).parent`（冻结态才这么干）。
+> ⚠️ 只走 `rebind()` 这一个入口，启动器里**一行都不许**自己赋 `srv.X = ...` ——
+> 逐个赋正是"漏改一个"的来源。
 >
 > 因此**通道的账号库路径必须按 `_BIN_DIR` 现算**（`Channel.auth_dir` 是属性，
 > 不是 `__init__` 里存的快照），模块级路径常量一个都不能留 —— 它们全是导入时的快照，
@@ -964,7 +980,7 @@ $VENV = C:\Users\Administrator\.workbuddy-ai\binaries\python\envs\default
 > 「打包后的 exe 跑去 `_internal\wb_auth\` 找账号，页面恒显示 0 个，源码运行却完全正常」。
 >
 > 部署后自检：把账号目录放到 exe 同级，跑
-> `WorkBuddySwitcher.exe --serve --port <冷门端口>`，再请求 `/api/accounts`，
+> `AgentAccountSwitcher.exe --serve --port <冷门端口>`，再请求 `/api/accounts`，
 > 条数应与你放进去的文件数一致。
 > 或者直接跑 `python check_exe_datadir.py [exe 目录]`（双探针法，自动判两个通道
 > 读的是 exe 同级还是 `_internal\`，跑完自动清理探针）。
@@ -972,27 +988,27 @@ $VENV = C:\Users\Administrator\.workbuddy-ai\binaries\python\envs\default
 ### 桌面版 exe 的命令行开关
 
 ```bat
-WorkBuddySwitcher.exe                  :: 正常：开原生窗口
-WorkBuddySwitcher.exe --serve          :: 只跑本地 HTTP 服务，不开窗口（便于 curl 冒烟）
-WorkBuddySwitcher.exe --serve --port 8790
+AgentAccountSwitcher.exe                  :: 正常：开原生窗口
+AgentAccountSwitcher.exe --serve          :: 只跑本地 HTTP 服务，不开窗口（便于 curl 冒烟）
+AgentAccountSwitcher.exe --serve --port 8790
 
 :: 一次性动作会被转交后端（与 python wb_ui_server.py 同一套实现）
-WorkBuddySwitcher.exe --list
-WorkBuddySwitcher.exe --channel wbai --list
-WorkBuddySwitcher.exe --refresh-all [--force]
-WorkBuddySwitcher.exe --channel wbai --migrate-preview x.info
+AgentAccountSwitcher.exe --list
+AgentAccountSwitcher.exe --channel wbai --list
+AgentAccountSwitcher.exe --refresh-all [--force]
+AgentAccountSwitcher.exe --channel wbai --migrate-preview x.info
 ```
 
 > `--channel` / `--force` / `--migrate-mode` 是**修饰符**，单独出现不构成动作 ——
-> `WorkBuddySwitcher.exe --channel wbai` 仍然开原生窗口。
-> 以前这些动作被**静默忽略**：`WorkBuddySwitcher.exe --refresh-all` 不会续期，
+> `AgentAccountSwitcher.exe --channel wbai` 仍然开原生窗口。
+> 以前这些动作被**静默忽略**：`AgentAccountSwitcher.exe --refresh-all` 不会续期，
 > 而是弹出一个窗口，脚本看退出码 0 还以为成功了。
 
 窗口版没有控制台，出了问题看不到任何提示。所以：
 
 - `--serve` 是唯一的排障入口（能用 curl 直接打接口）。
 - 一次性动作在**终端或脚本里**能正常拿到 stdout 与退出码（实测
-  `WorkBuddySwitcher.exe --channel wbai --migrate-preview x.info` 会打印 JSON 并返回 1）。
+  `AgentAccountSwitcher.exe --channel wbai --migrate-preview x.info` 会打印 JSON 并返回 1）。
   只有**双击**运行时没有控制台、`print` 无处可去 —— 那种场景请用
   `python wb_ui_server.py ...`（`refresh_all.cmd` 走的就是那条路）。
 - 账号目录要放在 exe 同级，否则 `--list` 只会回 `{"accounts": []}`。

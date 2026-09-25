@@ -1,4 +1,6 @@
 @echo off
+REM 本文件是 UTF-8 无 BOM，中文提示在 GBK 代码页下会乱码 —— 先切到 UTF-8。
+chcp 65001 >nul
 title Trae - refresh all accounts
 cd /d "%~dp0"
 

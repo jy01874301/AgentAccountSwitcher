@@ -63,7 +63,7 @@ tw = common.require_module(
 AUTH_KEY = tw.AUTH_KEY  # "iCubeAuthInfo://icube.cloudide"
 
 # 三个数据目录都**按 _BIN_DIR 现算**，不存模块级常量。
-# 冻结态启动器（tw_ui_app）要在 import **之后**把 _BIN_DIR 改指到 exe 所在目录，
+# 冻结态启动器（ui_app）要在 import **之后**把 _BIN_DIR 改指到 exe 所在目录，
 # 好让「账号库与 exe 同级」这个部署约定成立；存成常量就收不到那次改写。
 # 这个坑在本项目已经踩过两次（见 MEMORY.md）：**改了不生效**的常量名比没有更坏，
 # 它会诱使下一个人去改一个已经没人读的名字。
@@ -204,6 +204,28 @@ def _asset_token_entries(data):
     return []
 
 
+def ensure_auth_dir():
+    """确保 tw_auth 存在，并在空目录里放一份说明文件（理由同 wb 侧）。"""
+    try:
+        auth_dir().mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    if not any(auth_dir().glob("*")):
+        try:
+            (auth_dir() / "把账号文件放这里.txt").write_text(
+                "把 Trae 账号的 storage.json 放进本目录。\n"
+                "\n"
+                "  文件名示例：trae-张三.json\n"
+                "\n"
+                "导出方式：在 Trae 客户端登录该账号后，把它的 storage.json\n"
+                "复制进本目录、改个名字即可。\n"
+                "\n"
+                "本文件只是占位提示，账号放进来之后可以删掉。\n",
+                encoding="utf-8")
+        except OSError:
+            pass
+
+
 def list_accounts():
     """列出 tw_auth 目录下所有账号素材。
 
@@ -214,6 +236,7 @@ def list_accounts():
     并且列表里还会和当前账号重复出现一条。
     """
     out = []
+    ensure_auth_dir()
     if not auth_dir().is_dir():
         return out
     for f in sorted(auth_dir().glob("*.json")):
@@ -295,20 +318,19 @@ def _trae_running():
     只用于给提示文案加一句「检测到客户端正在运行」，真正的判断靠写后自校验；
     所以这里宁可漏报也不误报，命令拿不到就返回空列表。
     """
+    # 复用 common.list_processes()：它是原生 CreateToolhelp32Snapshot 主路径，
+    # 拿到的就是**真 Unicode** 进程名，不必再跟 tasklist 的编码打架 ——
+    # 原先写 encoding="utf-8" 而中文 Windows 的 tasklist 实际输出是 GBK，
+    # 中文进程名会被解成替换字符（见 AUDIT_2026-09-24.md P3-10）。
     try:
-        import subprocess
-        # 中文 Windows 的 tasklist 输出是 GBK，不指定 errors 会在解码阶段直接炸，
-        # 而且 stdout 会变成 None，后续 splitlines() 再抛 AttributeError
-        res = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
-                             capture_output=True, timeout=10,
-                             encoding="utf-8", errors="replace")
-        out = res.stdout or ""
+        table = common.list_processes()
     except Exception:  # noqa: BLE001
         return []
+    if not table:          # None = 枚举失败；{} = 确实一个进程都没有
+        return []
     hits = []
-    for line in out.splitlines():
-        name = line.split(",")[0].strip('"')
-        low = name.lower()
+    for name in table:
+        low = str(name).lower()
         if "trae" in low and not any(x in low for x in _TRAE_EXCLUDE):
             hits.append(name)
     return hits
@@ -368,15 +390,26 @@ def switch_account(file_name):
         bdir = backup_dir()
         bdir.mkdir(parents=True, exist_ok=True)
         backup = bdir / ("storage.%s.%d.json" % (ts, os.getpid()))
-        raw = sp.read_bytes()
+        # ⚠️ read_bytes 也得在 try 里：文件被 Trae 占用时它会抛 OSError，
+        #    直接冒到 HTTP 层就是 500，而不是可读的错误提示（见 AUDIT_2026-09-24.md P3-12）。
+        try:
+            raw = sp.read_bytes()
+        except OSError as e:
+            return False, "读取本机登录态失败（可能被 Trae 占用）：%s" % common.scrub(e)
         try:
             backup.write_bytes(raw)
         except OSError as e:
             return False, "备份本机登录态失败：%s" % common.scrub(e)
         pruned = common.prune_backups(bdir, "storage.*.json", keep=TW_BACKUP_KEEP)
 
-        # 写入目标账号登录态 + 附属设备密钥（其余键保留本机的）
+        # 写入目标账号登录态 + 附属设备密钥（其余键保留本机的）。
+        # ⚠️ 必须**先清掉本机的旧设备键**再写目标键：素材里没有的 icube-dc* 键不会被
+        #    覆盖，于是上一任账号的设备凭据会原样残留 —— 结果是「登录态是新的、
+        #    设备凭据是旧的」，Trae 会判定 device not match（见 AUDIT_2026-09-24.md P1-5）。
+        #    用户决策：素材完全没有设备键时**照切**（清掉旧键即可），不报错。
         cur[AUTH_KEY] = target_enc
+        for k in [k for k in cur if str(k).startswith("iCubeAuthInfo://icube-dc")]:
+            del cur[k]
         for k, v in target_dc.items():
             cur[k] = v
         try:
@@ -395,7 +428,16 @@ def switch_account(file_name):
         after = _read_json(sp)
         a_info, _ = _parse_storage(after) if after else (None, "")
         a_uid = _uid_of(a_info)
-        if not a_uid or a_uid != target_uid:
+        if not target_uid:
+            # ⚠️ 素材里的 uid 解析不出来时（早期导出 / 结构变体），拿空值去比对
+            #    **必然假阴性** —— 会误报「未采纳」让用户反复重试，其实早就切好了。
+            #    降级为比对密文本身（见 AUDIT_2026-09-24.md P3-13）。
+            if (after or {}).get(AUTH_KEY) != target_enc:
+                return (False,
+                        "本机 storage.json 未采纳新登录态（密文不一致）%s。"
+                        "Trae 客户端正在运行并锁定了配置文件，已中止切换。"
+                        "请【完全退出 Trae 客户端】后重新点击切换。" % run_hint)
+        elif not a_uid or a_uid != target_uid:
             cur_nick = (a_info or {}).get("nickname") or "未知"
             return (False,
                     "本机 storage.json 未采纳新登录态（当前仍为 %s）%s。"
@@ -504,8 +546,16 @@ def refresh_account_file(file_name):
         return False, "素材缺少加密登录态，无法续期"
     # 复用自动签到脚本的账号发现逻辑构造 account 结构
     acc = tw.account_from_storage(target)
-    cfg = tw.load_config(Path(target.parent.parent) / "config.json") \
-        if (Path(target.parent.parent) / "config.json").is_file() else tw.load_config(PROJECT_ROOT / "config.json")
+    # ⚠️ load_config 必须在 try 里：两份 config.json 都不存在时它会抛异常，
+    #    直接冒到 HTTP 层变成 500，_refresh_all_collect 还会**整批中断**
+    #    （见 AUDIT_2026-09-24.md P3-11）。返回明确错误比 500 好，也不会拖垮整批。
+    try:
+        _cfg_path = Path(target.parent.parent) / "config.json"
+        if not _cfg_path.is_file():
+            _cfg_path = PROJECT_ROOT / "config.json"
+        cfg = tw.load_config(_cfg_path)
+    except Exception as e:  # noqa: BLE001
+        return False, "读取 config.json 失败，无法续期：%s" % common.scrub(e)
     # script_dir 必须用 PROJECT_ROOT（自动签到）：trae_work_checkin 会把轮换后的
     # refreshToken 写进 script_dir/token_cache.json，此前传素材目录的父级（wb_switcher）
     # 等于另起一份缓存，与签到脚本各持一代 refreshToken —— 一方轮换后另一方的旧凭据即失效。
@@ -560,17 +610,12 @@ class Handler(common.BaseHandler):
     UI_CONTEXT = {
         "TITLE": "Trae 账号切换器",
         "LOGO": "&#10022;",
-        "SUBTITLE": "一键切换桌面端登录账号 · 同机共用各账号 Trae 积分",
-        "TIP": ("账号素材存放在 <b>tw_auth\\</b> 目录，每个文件是一份 <b>storage.json</b>"
-                "（含该账号的加密登录态 <code>iCubeAuthInfo://icube.cloudide</code>）。"
-                "切换时替换登录态键与其附属设备密钥，其它 IDE 配置保持不变。"),
         "AUTH_DIR": "tw_auth",
         "ACCEPT": ".json,application/json",
         "FILE_LABEL": "账号的 storage.json（含该账号加密登录态）",
-        "ADD_HINT": "点击展开，选择文件或粘贴该账号的 storage.json 内容",
-        "EMPTY_HINT": ("请放入该账号的 <code>storage.json</code>。"
-                       "直接运行 exe 时，账号目录要放在 exe 同级（用 .cmd 启动就是本目录）。"),
         "CMD": "trae_switcher.cmd",
+        # Trae 侧两处「打开客户端」按钮都显示（导航栏 + 当前账号行），与国服/国际服不同
+        "OPEN_CLIENT_ROW": "1",
         # 接口前缀 / 视图标识：模板由两个切换器共用，这两个占位符必须两边都配
         "API_BASE": "/api/",
         "VIEW": "tw",
@@ -591,7 +636,11 @@ class Handler(common.BaseHandler):
                      "/api/refresh": "refresh", "/api/add": "add",
                      "/api/refresh-all": "refresh-all"}
     APP_NAME = "tw_switcher"
-    APP_VERSION = common.source_version(__file__, "tw")
+    # 同 wb：把启动器也算进版本戳，避免"只改启动器"时 stale 检测漏判
+    # （见 AUDIT_2026-09-24.md 第二十章）。
+    APP_VERSION = common.source_version(
+        __file__, "tw",
+        extra_paths=(str(Path(__file__).with_name("ui_app.py")),))
     STARTED_AT = int(time.time())
 
     def api_get(self, u):
@@ -623,7 +672,7 @@ def rebind(base_dir):
     ⚠️ 只能走这一个入口，不要在启动器里逐个写 `srv.X = ...`。
     漏一个就是「账号库在一个目录、锁和备份在另一个目录」这类静默分家，
     而冻结态 exe 恰恰是最难复现的场景（源码运行永远正常）。
-    以前 `tw_ui_app` 写了 4 行赋值，那 4 行就是漏改的来源。
+    以前启动器写了 4 行赋值，那 4 行就是漏改的来源。
 
     账号库 / 锁 / 备份目录本身已改成按 `_BIN_DIR` 现算（见 `auth_dir()` /
     `lock_dir()` / `backup_dir()`），这里只需管那些"必须落在类属性上"的名字。
@@ -635,6 +684,8 @@ def rebind(base_dir):
 
 
 def serve(port=DEFAULT_PORT, open_browser=True, use_token=True):
+    # 部署用：把 tw_auth 建出来（含占位提示），用户拷走 exe 双击就能看到该往哪放文件。
+    ensure_auth_dir()
     # 单实例保护：互斥体名带 tw，不会与 WorkBuddy 侧互相挤掉。见 DESIGN_single_instance.md。
     handle, action, info = common.single_instance_guard(
         common.MUTEX_NAME_TW, port, tries=common.PORT_TRIES, log=print,
@@ -693,15 +744,17 @@ def main():
         return refresh_all()
 
     if args.list:
-        print(json.dumps({"accounts": list_accounts()}, ensure_ascii=False, indent=2))
+        # 走 common.print_json：Trae 素材昵称现在没有 emoji 才恰好不崩，
+        # 用户随时可能导入带 emoji 的账号 —— 别靠运气。
+        common.print_json({"accounts": list_accounts()})
         return 0
     if args.current:
-        print(json.dumps({"current": current_account()}, ensure_ascii=False, indent=2))
+        common.print_json({"current": current_account()})
         return 0
     if args.switch:
         ok, msg = switch_account(args.switch)
         common.audit(Handler.AUDIT_DIR, Handler.SOURCE, "switch", args.switch, ok, msg)
-        print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False, indent=2))
+        common.print_json({"ok": ok, "message": msg})
         return 0 if ok else 1
     return serve(port=args.port, use_token=not args.no_auth,
                  open_browser=not args.no_open) or 0

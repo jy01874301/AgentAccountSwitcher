@@ -23,7 +23,7 @@
            return QuietHTTPServer((host, p), handler_cls), p
    ```
 
-   `wb_ui_server.py --serve` 与 `wb_ui_app.py` 都直接调它。于是第二次启动**不会报错**，
+   `wb_ui_server.py --serve` 与 `ui_app.py` 都直接调它。于是第二次启动**不会报错**，
    而是安静地占用 8766、再开一个浏览器标签。
 
 **实测复现**（2026-09-18 13:44）：
@@ -208,7 +208,7 @@ python wb_ui_server.py --serve
 | 1 | `acquire_single_instance(name)` | `switcher_common.py` | ctypes + `CreateMutexW`，返回 `(handle, already)`；非 Windows 返回 `(None, False)` |
 | 2 | `probe_instance(port)` | `switcher_common.py` | 打 `/api/ping`，区分"我们的实例 / 别人 / 空闲" |
 | 3 | `GET /api/ping` | `BaseHandler.api_get` | 返回 `app / source / pid / port / version` |
-| 4 | 启动流程接入 | `wb_ui_server.py --serve`、`wb_ui_app.py`、`tw_*` | 见 §1.3；互斥体句柄存到模块级变量防止被 GC 回收 |
+| 4 | 启动流程接入 | `wb_ui_server.py --serve`、`ui_app.py`、`tw_*` | 见 §1.3；互斥体句柄存到模块级变量防止被 GC 回收 |
 | 5 | 迁移前置检查加"无第二实例" | `account_migration.migrate` | 探测默认端口，`pid != 自己` 则拒绝 |
 | 6 | `.cmd` 三处改进 | `workbuddy_switcher.cmd` / `trae_switcher.cmd` | 校验 Python 可用性、打印实际端口、单实例提示 |
 | 7 | 回归断言 | `smoke_test.py` | 见下 |
@@ -236,7 +236,7 @@ python wb_ui_server.py --serve
 | `common.single_instance_guard(...)` | 统一入口，返回 `(handle, action, existing)`，action ∈ `start/reuse/abort` |
 | `common.report_reuse` / `report_abort` | 两种结局的提示文案（都带 `flush=True`） |
 | `GET /api/ping` | 在 `_guard()` **之前**处理，免令牌（探测方拿不到令牌） |
-| 启动流程接入 | `wb_ui_server.serve` / `tw_ui_server.serve` / `wb_ui_app.main` / `tw_ui_app.main` |
+| 启动流程接入 | `wb_ui_server.serve` / `tw_ui_server.serve` / `ui_app.main`（多产品统一入口） |
 | 迁移前置检查 | `account_migration.other_instance()`；被拒时**不创建任何备份目录** |
 | 两个 `.cmd` | 改成实跑 `python -c "import sys;assert ..."` 做版本校验；保留 ASCII + CRLF |
 | 回归自检 | 第 15 段 29 条断言；**当时总计 189 项全 PASS**（断言数会随迭代增长，当前值以 `README.md` 为准） |

@@ -61,6 +61,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(_BIN_DIR))
 import switcher_common as common  # 两个切换器共用的 HTTP 骨架 / 文件锁 / 备份裁剪
 import account_migration as migration  # 切号时把本地数据改归属到新账号（见 DESIGN_account_migration.md）
+import live_token  # 登录态文件被字段加密时，从客户端进程内存读取当前凭据（见 live_token.py）
 
 # 复用上级项目的解析/续期逻辑：先声明需要的成员，缺失时给出可读提示而不是裸 Traceback
 wb = common.require_module(
@@ -106,7 +107,8 @@ class Channel:
     """
 
     def __init__(self, key, title, server, domain, auth_dir, info_name,
-                 account_prefix, lock_key, source, features, endpoint=None):
+                 account_prefix, lock_key, source, features, endpoint=None,
+                 client_processes=(), client_exe="", client_dirs=()):
         self.key = key
         self.title = title            # 页面标题 / 侧边栏入口名
         self.server = server          # 服别文案：国服 / 国际服
@@ -117,6 +119,16 @@ class Channel:
         self.lock_key = lock_key      # 切号用的文件锁名（两个通道必须不同）
         self.source = source          # 审计日志来源标记
         self.features = features      # 能力开关：credits / checkin / migrate / refresh
+        # 客户端进程名 / 主 exe 名 / 常见安装目录名 —— **必须按通道给**。
+        # 两个客户端是**两个不同的程序**，本机都装着、都在跑：
+        #   国服  C:\Program Files\WorkBuddy\WorkBuddy.exe      (workbuddy.exe)
+        #   国际服 C:\Program Files\WorkBuddyAI\WorkBuddyAI.exe  (workbuddyai.exe)
+        # 早先这里是模块级单值常量 `CLIENT_PROCESS = "workbuddyai.exe"`，于是
+        # 国服的迁移流程会去关/开**国际服**客户端，而国服客户端全程没人管、
+        # 迁移时仍持有自己的 workbuddy.db —— 属于"看起来成功、实际动错程序"的一类。
+        self.client_processes = tuple(client_processes)   # 进程名（小写），可多个（含历史名）
+        self.client_exe = client_exe                      # 启动用的主 exe 名
+        self.client_dirs = tuple(client_dirs)             # 安装目录候选名
         # 计费/续期网关。None = 沿用上级 config.json 里的默认值（国服 copilot.tencent.com）。
         # **两个通道不是同一个网关**：拿国际服的 accessToken 去打国服网关会得到 HTTP 401
         # （实测），页面上就是每行「积分接口 HTTP 401」。见 channel_cfg()。
@@ -141,7 +153,7 @@ class Channel:
     def auth_dir(self):
         """账号库目录。**每次访问按模块级 `_BIN_DIR` 现算，不在这里存快照。**
 
-        冻结态（PyInstaller 打包）启动时，`wb_ui_app` 会把 `_BIN_DIR` 改指到
+        冻结态（PyInstaller 打包）启动时，`ui_app` 会把 `_BIN_DIR` 改指到
         exe 所在目录，好让「账号库与 exe 同级」这个部署约定成立。若在 `__init__`
         里把路径存成快照，那次改写就落不到已经建好的 Channel 上 ——
         表现是**打包后的 exe 跑去 `_internal\\wb_auth\\` 找账号，页面恒显示 0 个，
@@ -198,13 +210,19 @@ CHANNELS = {
         account_prefix="workbuddy-",
         lock_key="wb-desktop",
         source="wb",
-        # open_client 指的是**接口**是否可用（迁移流程内部会直接调 open_client() 函数）。
-        # 页面上那个按钮由 OPEN_CLIENT 占位符单独控制 —— 按用户要求国服侧已隐藏，
-        # 但接口保留，迁移流程还要用它自动关/开客户端。
+        # open_client 指的是 **/api/<key>/open-client 接口**与「打开客户端」按钮是否可用。
+        # 页面上有两处按钮，各自独立控制（见 build_ui_context）：
+        #   导航栏那个 → OPEN_CLIENT（国服/国际服按用户要求都不显示，Trae 显示）
+        #   当前账号行那个 → OPEN_CLIENT_ROW（2026-09-21 起两个通道都显示）
+        # 迁移流程内部直接调 open_client(ch) **函数**，不受这些开关影响。
         features={"credits": True, "checkin": True, "migrate": True, "refresh": True,
                   "open_client": True},
         # None = 沿用上级 config.json 的 endpoint（国服 copilot.tencent.com）
         endpoint=None,
+        # 国服客户端的进程/exe 名。codebuddy.exe 是它的历史进程名，一并认。
+        client_processes=("workbuddy.exe", "codebuddy.exe"),
+        client_exe="WorkBuddy.exe",
+        client_dirs=("WorkBuddy",),
     ),
     "wbai": Channel(
         key="wbai",
@@ -225,12 +243,19 @@ CHANNELS = {
         # credits / refresh：接口已验证可用，与国服一致。
         # checkin：接口**可达**但活动未开启（实测 active=false「签到活动未开启」），
         #   且用户明确要求不迁移签到 → 保持关闭，页面上不出现签到入口。
-        # migrate：本地数据改归属只认国服客户端的数据目录，国际服未验证 → 保持关闭。
-        # open_client：客户端进程是按国服 exe 名找的，放行等于用 /api/wbai/open-client
-        #   去开**国服**客户端 → 必须 False。
-        features={"credits": True, "checkin": False, "migrate": False, "refresh": True,
-                  "open_client": False},
+        # migrate：2026-09-21 起**开放**。数据目录不是障碍 ——
+        #   account_migration.find_data_root() 的候选里本就有 `.workbuddy-ai`，
+        #   且能按 uid 挑对；之前的障碍是客户端进程名不分通道（见上一条注释），
+        #   现在 client_processes 按通道给，国际服关/开的就是国际服客户端。
+        # open_client：2026-09-21 起**开放**。进程名已经按通道区分（client_processes），
+        #   /api/wbai/open-client 拉起来的就是 WorkBuddyAI.exe 自己，不会再误开国服客户端
+        #   —— 当初把它关掉的唯一理由已经不存在。当前账号行的「打开客户端」按钮靠它。
+        features={"credits": True, "checkin": False, "migrate": True, "refresh": True,
+                  "open_client": True},
         endpoint="https://www.workbuddy.ai",
+        client_processes=("workbuddyai.exe",),
+        client_exe="WorkBuddyAI.exe",
+        client_dirs=("WorkBuddyAI",),
     ),
 }
 
@@ -278,39 +303,112 @@ def _read_info(path):
         return None
 
 
+def ensure_auth_dirs():
+    """确保**每个通道**的账号目录都存在，并在空目录里放一份说明文件。
+
+    为什么要在代码里建目录而不是靠打包带上：`dist/` 是构建产物，每次重新打包都会
+    被整个重建，塞进去的空目录必然丢失；而部署时用户只拷 exe，不会手动建目录。
+    结果是页面显示「0 个账号」，用户不知道该往哪放文件 —— 看着像工具坏了。
+
+    放在 `list_accounts` / `serve` 的入口调用：只读命令（`--list`）也能顺手把
+    目录建出来，用户拷走 exe 跑一次就能看到该往哪放。
+    """
+    for key in CHANNELS:
+        ch = CHANNELS[key]
+        try:
+            ch.auth_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        hint = ch.auth_dir / "把账号文件放这里.txt"
+        if not any(ch.auth_dir.glob("*")):
+            try:
+                hint.write_text(
+                    "把 %s（%s）的账号登录态文件放进本目录。\n"
+                    "\n"
+                    "  文件名示例：%s张三.info\n"
+                    "\n"
+                    "导出方式：在客户端登录该账号后，把它的 %s\n"
+                    "复制进本目录、改个名字即可。\n"
+                    "\n"
+                    "本文件只是占位提示，账号放进来之后可以删掉。\n"
+                    % (ch.title, ch.server, ch.account_prefix, ch.info_name),
+                    encoding="utf-8")
+            except OSError:
+                pass
+
+
+# `list_accounts` 的进程内缓存：**签名 = 目录里所有 .info 的 (名, mtime_ns, 大小)**，
+# 签名没变就复用上次的解析结果。这是热路径 —— /api/accounts、credits_snapshot、
+# checkin_snapshot、uid_nickname_map 每一轮刷新都会调它，而每个账号要读盘 + 解析
+# **两次**（session_from_info_file + _read_info），N 个账号就是 2N 次
+# （见 AUDIT_2026-09-24.md P2-7）。
+_LIST_ACCOUNTS_CACHE = {}
+_LIST_ACCOUNTS_LOCK = threading.Lock()
+
+
+def _auth_dir_sig(d):
+    """目录签名：内容一变签名就不同。取不到（目录不存在 / 被占用）返回 None → 不走缓存。"""
+    try:
+        return tuple(sorted((f.name, f.stat().st_mtime_ns, f.stat().st_size)
+                            for f in d.glob("*.info")))
+    except OSError:
+        return None
+
+
 def list_accounts(ch=None):
     """列出该通道账号库目录下的所有可用账号。
 
     优先返回 .info 文件（含切号备份的文件）。每个条目带文件路径与令牌脱敏摘要；
     accessToken 不完整的（如粘贴时被截断）标记为不可用，避免切过去才发现是废凭据。
+
+    结果按「目录签名」在进程内复用（见上面的 _LIST_ACCOUNTS_CACHE）——
+    签名由文件名 + mtime_ns + 大小组成，账号库有任何增删改都会立刻失效。
     """
     ch = channel(ch) if not isinstance(ch, Channel) else ch
     out = []
+    ensure_auth_dirs()
     if not ch.auth_dir.is_dir():
         return out
+
+    sig = _auth_dir_sig(ch.auth_dir)
+    if sig is not None:
+        with _LIST_ACCOUNTS_LOCK:
+            hit = _LIST_ACCOUNTS_CACHE.get(ch.key)
+        if hit and hit["sig"] == sig:
+            return [dict(x) for x in hit["items"]]      # 浅拷贝：别让调用方改脏缓存
+
     for f in sorted(ch.auth_dir.glob("*.info")):
         acc = wb.session_from_info_file(f)
         raw = _read_info(f) or {}
         if not acc:
             # 无法解析的 .info 仍列出，标注不可用
-            name = raw.get("account", {}).get("nickname") if isinstance(raw, dict) else None
+            account = raw.get("account") if isinstance(raw, dict) else None
+            name = account.get("nickname") if isinstance(account, dict) else None
+            if not isinstance(name, str) or not name:
+                # 昵称本身也被加密了（5.6.2+ 字段保护）→ 退到明文 uid 的前 8 位
+                name = plain_uid(raw)[:8] or None
+            encrypted = info_is_encrypted(raw)
             out.append({
                 "file": f.name,
                 "path": str(f),
                 "ok": False,
+                "encrypted": bool(encrypted),
                 "label": name or f.stem,
                 "nickname": name or f.stem,
-                "uid": "",
+                "uid": plain_uid(raw),
                 "expires_at": None,
                 "refresh_expires_at": None,
                 "token_source": "",   # 字段必须齐：前端 ttlTag() 会读它
-                "reason": "登录态无法解析（内容可能不全或被加密）",
+                "ttl_days": None,    # 同上：token_source 缺失时用它兜底
+                "reason": ENCRYPTED_REASON if encrypted
+                          else "登录态无法解析（内容可能不全或被加密）",
             })
             continue
         entry = {
             "file": f.name,
             "path": str(f),
             "ok": True,
+            "encrypted": False,
             "label": acc["label"],
             "nickname": acc["nickname"],
             "uid": acc["uid"],
@@ -319,12 +417,18 @@ def list_accounts(ch=None):
             "auth_id": acc["auth_id"],
         }
         at = (raw.get("auth") or {}).get("accessToken")
-        # 签发通道决定有效期长短：oneid_login 60 天，enterprise_switch 只有 3 天
+        # 签发通道决定有效期长短：oneid_login 55 天，enterprise_switch 30 天
         entry["token_source"] = common.token_source(at)
+        # 兜底：签发方不打 token_source 标时（国服部分账号、国际服全部账号），
+        # 用 exp-iat 给前端一个真实的签发天数，否则那些账号的标签会整块消失。
+        entry["ttl_days"] = common.jwt_ttl_days(at)
         if not common.token_looks_complete(at):
             entry["ok"] = False
             entry["reason"] = "accessToken 不完整（疑似粘贴截断），切过去会 401，请重新导出该账号文件"
         out.append(entry)
+    if sig is not None:
+        with _LIST_ACCOUNTS_LOCK:
+            _LIST_ACCOUNTS_CACHE[ch.key] = {"sig": sig, "items": [dict(x) for x in out]}
     return out
 
 
@@ -344,6 +448,134 @@ def _mtime_with_retry(path, tries=3, delay=0.05):
     return None
 
 
+# --- 客户端「静态字段保护」兼容层（2026-09-23 新增） ------------------------
+# WorkBuddy 5.6.2 起启用了 at-rest 字段保护（ProtectedJsonFields），登录态文件里
+# accessToken / refreshToken / nickname / phoneNumber 等敏感字段不再是明文字符串，
+# 而是被替换成包装对象：
+#     {"$wbEncrypted": 1, "envelope": "<base64>"}
+# envelope 解开后是 {"suite":1,"keyId":...,"nonce":...,"authTag":...,"ciphertext":...}
+# 的 JSON，内容用 AES-256-GCM 加密。密钥（at-rest key）由客户端运行时注入：
+# app.asar 里只有算法和 keyblob 读写逻辑，**没有密钥载荷**，本地也没有第二份副本，
+# 所以本工具**无法解密这些字段**。
+#
+# 能做的两件事：
+#   1. account.uid / account.uin 仍是明文 → 可据此在账号库里反查昵称，
+#      让「当前账号」至少答得出"是谁"，而不是一句"未登录"（见 uid_nickname_map）。
+#   2. 客户端**读取时兼容明文**（明文只会被标记为待迁移并重新加密，不影响使用）
+#      → 本工具写回明文登录态来切号依然有效，切号功能不受影响。
+#
+# 症状背景：加密生效后，session_from_info_file() 因为 accessToken 不是 "eyJ" 开头的
+# 字符串而返回 None，页面就显示「桌面端当前未登录」，即使客户端明明登录着。
+
+def is_encrypted_field(value):
+    """是否为客户端字段保护包装（{"$wbEncrypted":1,"envelope":...}）。"""
+    return isinstance(value, dict) and value.get("$wbEncrypted") == 1
+
+
+def info_is_encrypted(raw):
+    """登录态里是否出现字段保护包装（说明凭据已无法直接读取）。"""
+    if not isinstance(raw, dict):
+        return False
+    checks = (((raw.get("auth") or {}), ("accessToken", "refreshToken")),
+              ((raw.get("account") or {}), ("nickname", "phoneNumber")))
+    for holder, keys in checks:
+        if isinstance(holder, dict):
+            for k in keys:
+                if is_encrypted_field(holder.get(k)):
+                    return True
+    return False
+
+
+def plain_uid(raw):
+    """取出登录态里的明文 uid（字段保护不覆盖 uid），取不到返回 ""。"""
+    account = raw.get("account") if isinstance(raw, dict) else None
+    uid = account.get("uid") if isinstance(account, dict) else None
+    return uid if isinstance(uid, str) else ""
+
+
+_UID_NICK_CACHE = {}          # ch.key -> {"sigs": (auth_sig, desktop_sig), "map": {...}}
+_UID_NICK_LOCK = threading.Lock()
+
+
+def uid_nickname_map(ch):
+    """建 uid -> 昵称 映射，供加密登录态降级显示用。
+
+    加密文件自身读不出昵称，只能反查。数据源按可信度排序：
+    账号库（本工具维护，明文）优先，桌面端目录里的明文备份兜底 ——
+    切号会留下明文备份，通常正好是被加密那一份的旧副本。
+
+    ⚠️ 它会把**两个目录的全部 .info 各读一遍**，而调用方是每次刷新都要跑的渲染路径，
+    所以结果同样按「两个目录的签名」在进程内复用（见 AUDIT_2026-09-24.md P2-7）。
+    """
+    sigs = (_auth_dir_sig(ch.auth_dir), _auth_dir_sig(ch.desktop_dir))
+    if all(s is not None for s in sigs):
+        with _UID_NICK_LOCK:
+            hit = _UID_NICK_CACHE.get(ch.key)
+        if hit and hit["sigs"] == sigs:
+            return dict(hit["map"])
+
+    mapping = {}
+    for src in (ch.auth_dir, ch.desktop_dir):
+        try:
+            files = sorted(src.glob("*.info"))
+        except OSError:
+            continue
+        for f in files:
+            raw = _read_info(f)
+            if not isinstance(raw, dict):
+                continue
+            uid = plain_uid(raw)
+            if not uid or uid in mapping:
+                continue
+            account = raw.get("account") or {}
+            nick = account.get("nickname") if isinstance(account, dict) else None
+            if isinstance(nick, str) and nick:
+                mapping[uid] = nick
+    if all(s is not None for s in sigs):
+        with _UID_NICK_LOCK:
+            _UID_NICK_CACHE[ch.key] = {"sigs": sigs, "map": dict(mapping)}
+    return mapping
+
+
+ENCRYPTED_REASON = "凭据已被客户端加密（WorkBuddy 5.6.2+ 字段保护），本工具读不到 token"
+LIVE_REASON = "凭据读自客户端进程内存（登录态文件已被加密，内存里有客户端在用的明文 token）"
+
+
+def live_session(ch, expect_uid=None, want_refresh=False):
+    """尝试从**客户端进程内存**读出当前登录凭据。
+
+    文件里的 token 被字段加密读不出来，但客户端自己要用明文 token 调接口 ——
+    所以进程内存里一定有一份（实测 accessToken 长度/payload 与账号库明文完全一致）。
+    只读、不落盘。任何失败（客户端没跑 / 权限不足 / 扫不到）都返回 None，调用方降级。
+
+    `want_refresh=False`（默认）时扫描**拿到 access 就停** —— 昵称/到期时间/签发天数/
+    积分/签到全都只需要 access，不必为 refresh 多扫几个进程。只有诊断接口
+    `/api/live-token` 与 CLI `--live-token` 传 True（它们要把 refresh 一并展示）。
+    """
+    try:
+        return live_token.read_live_session(ch, expect_uid=expect_uid or None,
+                                           want_refresh=want_refresh)
+    except Exception:
+        # 内存扫描全是 Win32 调用，绝不让它冒到 HTTP 层
+        return None
+
+
+def redact_session(session):
+    """把 live session 的 token 换成摘要，供 CLI / HTTP 返回（别把凭据写进日志）。"""
+    if not session:
+        return None
+    out = {k: v for k, v in session.items()
+           if k not in ("access_token", "refresh_token")}
+    for k in ("access_token", "refresh_token"):
+        t = session.get(k) or ""
+        out[k] = ("%s…（%d 字符）" % (t[:16], len(t))) if t else ""
+    for k in ("expires_at", "refresh_expires_at"):
+        v = session.get(k)
+        if v is not None:
+            out[k] = v.isoformat()
+    return out
+
+
 def current_account(ch=None):
     """识别该通道客户端当前使用的账号。
 
@@ -353,6 +585,7 @@ def current_account(ch=None):
     """
     ch = channel(ch)
     entries = []
+    nick_map = None   # 惰性构建：只有真的遇到加密登录态才去扫账号库
     for f in ch.desktop_dir.glob("*.info"):
       # 整个条目包在 try 里：一个文件读不到（被杀软/索引器/客户端 watcher 占用）
       # 不该让整张表、乃至整个切号流程 500。以前 f.stat() 是裸的，
@@ -372,8 +605,20 @@ def current_account(ch=None):
         if (ch.desktop_dir / ch.logout_marker_name).exists():
             continue  # 该 id 会话已登出
         acc = wb.session_from_info_file(f)
+        raw = _read_info(f) or {}
+        # 加密登录态（5.6.2+ 字段保护）：凭据读不出来，但 uid 还是明文，
+        # 拿它在账号库里反查昵称 —— 否则这一行会退化成文件名。
+        encrypted = acc is None and info_is_encrypted(raw)
+        live = None
+        if encrypted:
+            if nick_map is None:
+                nick_map = uid_nickname_map(ch)
+            # 文件里读不出 token，但客户端自己要用明文 token 调接口，
+            # 进程内存里必然有一份 —— 只读地取来，好让这一行仍有昵称与剩余天数。
+            # （live_token 内部有 60 秒缓存，不会每次轮询都扫一遍内存。）
+            live = live_session(ch, plain_uid(raw))
         # token_source 让「当前账号」也能显示通道标签，和账号列表里的一致
-        raw_at = ((_read_info(f) or {}).get("auth") or {}).get("accessToken")
+        raw_at = (raw.get("auth") or {}).get("accessToken")
         mtime = _mtime_with_retry(f)
         if mtime is None:
             # 一直被占用。**不能直接丢掉**：正式文件正常情况下就是最新的那个，
@@ -383,16 +628,36 @@ def current_account(ch=None):
             # 注意不能用 float("inf")：mtime 会进 JSON，Infinity 不是合法 JSON，
             # 浏览器 JSON.parse 会直接抛错。
             mtime = time.time() if f.name == ch.info_name else 0.0
+        at = raw_at if acc else ((live or {}).get("access_token") or "")
+        if acc:
+            nick, uid_val, exp = acc["nickname"], acc["uid"], acc["expires_at"]
+        elif encrypted and live:
+            # 内存里读到了明文凭据：昵称、有效期都能给全，只差"文件本身读不出来"这件事
+            uid_val = live.get("uid") or plain_uid(raw)
+            nick = (live.get("nickname") or (nick_map or {}).get(uid_val)
+                    or (uid_val[:8] if uid_val else root_id))
+            exp = live.get("expires_at")
+        elif encrypted:
+            uid_val = plain_uid(raw)
+            nick = (nick_map or {}).get(uid_val) or (uid_val[:8] if uid_val else root_id)
+            exp = None
+        else:
+            nick, uid_val, exp = root_id, "", None
         entries.append({
             "file": f.name,
             "ok": bool(acc),
-            "nickname": acc["nickname"] if acc else (root_id),
-            "uid": acc["uid"] if acc else "",
-            "expires_at": acc["expires_at"].isoformat() if acc and acc["expires_at"] else None,
-            "token_source": common.token_source(raw_at) if acc else "",
+            "encrypted": bool(encrypted),
+            "live": bool(live),
+            "nickname": nick,
+            "uid": uid_val,
+            "expires_at": exp.isoformat() if exp else None,
+            "token_source": common.token_source(at) if at else "",
+            "ttl_days": common.jwt_ttl_days(at) if at else None,
             "is_backup": bool(is_backup),
             "mtime": mtime,
         })
+        if encrypted:
+            entries[-1]["reason"] = LIVE_REASON if live else ENCRYPTED_REASON
       except OSError:
         # 任何一步的文件层失败都只跳过这一个条目，绝不冒到 HTTP 层
         continue
@@ -465,7 +730,9 @@ def migrate_preview(target_name, ch=None):
     if not new_uid:
         return {"ok": False, "message": "目标账号文件解析不出 uid，无法迁移"}
     old_uid = current_uid(ch)
-    data = migration.preview(old_uid, new_uid)
+    # 只报本通道那个客户端：提示里写的是"迁移前会自动关闭它"，
+    # 把另一个通道（本次不会去关）的客户端列进来就是假话。
+    data = migration.preview(old_uid, new_uid, client_names=ch.client_processes)
     data["target_file"] = norm
     data["target_nickname"] = (wb.session_from_info_file(src) or {}).get("nickname") or norm
     # needed 由 migration.preview() 给出（见那边的注释），这里不再重算 ——
@@ -473,34 +740,44 @@ def migrate_preview(target_name, ch=None):
     return data
 
 
-CLIENT_PROCESS = "workbuddyai.exe"        # 桌面客户端进程名（小写）
-CLIENT_EXE_NAME = "WorkBuddyAI.exe"
+def find_client_exe(ch, procs=None):
+    """定位**该通道的**客户端可执行文件；找不到返回 None。
 
-
-def find_client_exe():
-    """定位 WorkBuddy 客户端可执行文件；找不到返回 None。
+    ⚠️ `ch` 是必填的：国服与国际服是两个不同的程序（WorkBuddy.exe /
+    WorkBuddyAI.exe），早先这里用模块级单值常量，国服的迁移流程会去关/开
+    **国际服**客户端 —— 进程名必须跟着通道走。
 
     只从**固定候选位置**和**正在运行的进程路径**里找，不接受任何外部输入 ——
     这个结果会被拿去启动程序。
+
+    `procs` 允许调用方传入已经枚举好的进程表：`list_processes()` 内部要起一次
+    `tasklist` 子进程（本机实测 **284 ms**），`client_status()` 原本因为它和
+    `find_client_exe()` **各跑一次**而白花一倍时间。传进来即可复用。
     """
+    ch = channel(ch)
     cands = []
 
     # 1) 正在运行的进程：最可靠，那就是用户实际在用的那一份
-    procs = common.list_processes() or {}
-    for pid in procs.get(CLIENT_PROCESS, []):
-        p = common.process_image_path(pid)
-        if p and os.path.basename(p).lower() == CLIENT_EXE_NAME.lower():
-            cands.append(Path(p))
+    if procs is None:
+        procs = common.list_processes() or {}
+    for name in ch.client_processes:
+        for pid in procs.get(name, []):
+            p = common.process_image_path(pid)
+            if p and os.path.basename(p).lower() == ch.client_exe.lower():
+                cands.append(Path(p))
 
     # 2) 常见安装位置
     for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
         base = os.environ.get(env)
         if not base:
             continue
-        cands.append(Path(base) / "WorkBuddyAI" / CLIENT_EXE_NAME)
-        cands.append(Path(base) / "Programs" / "WorkBuddyAI" / CLIENT_EXE_NAME)
+        for d in ch.client_dirs:
+            cands.append(Path(base) / d / ch.client_exe)
+            cands.append(Path(base) / "Programs" / d / ch.client_exe)
 
     # 3) 注册表卸载项里的 DisplayIcon / InstallLocation（尽力而为，失败不影响）
+    # ⚠️ 每个 OpenKey 都必须 CloseKey：`find_client_exe` 会被反复调用（/api/client-status
+    #    的 TTL 一过就走一次），句柄只开不关会一直累积（见 AUDIT_2026-09-24.md P3-7）。
     try:
         import winreg
         for hive, sub in ((winreg.HKEY_LOCAL_MACHINE,
@@ -511,25 +788,44 @@ def find_client_exe():
                 root = winreg.OpenKey(hive, sub)
             except OSError:
                 continue
-            n = winreg.QueryInfoKey(root)[0]
-            for i in range(n):
-                try:
-                    name = winreg.EnumKey(root, i)
-                    sk = winreg.OpenKey(root, name)
-                    disp = str(winreg.QueryValueEx(sk, "DisplayName")[0] or "")
-                except OSError:
-                    continue
-                if "workbuddy" not in disp.lower():
-                    continue
-                for val in ("DisplayIcon", "InstallLocation"):
+            try:
+                n = winreg.QueryInfoKey(root)[0]
+                for i in range(n):
                     try:
-                        raw = str(winreg.QueryValueEx(sk, val)[0] or "").strip('"')
+                        name = winreg.EnumKey(root, i)
                     except OSError:
                         continue
-                    if not raw:
+                    sk = None
+                    try:
+                        sk = winreg.OpenKey(root, name)
+                        disp = str(winreg.QueryValueEx(sk, "DisplayName")[0] or "")
+                        if "workbuddy" not in disp.lower():
+                            continue
+                        for val in ("DisplayIcon", "InstallLocation"):
+                            try:
+                                raw = str(winreg.QueryValueEx(sk, val)[0] or "").strip('"')
+                            except OSError:
+                                continue
+                            if not raw:
+                                continue
+                            p = Path(raw)
+                            # 注册表里可能同时有国服/国际服两条卸载项，只收本通道那个 exe 名
+                            cand = p if p.suffix.lower() == ".exe" else p / ch.client_exe
+                            if cand.name.lower() == ch.client_exe.lower():
+                                cands.append(cand)
+                    except OSError:
                         continue
-                    p = Path(raw)
-                    cands.append(p if p.suffix.lower() == ".exe" else p / CLIENT_EXE_NAME)
+                    finally:
+                        if sk is not None:
+                            try:
+                                winreg.CloseKey(sk)
+                            except OSError:
+                                pass
+            finally:
+                try:
+                    winreg.CloseKey(root)
+                except OSError:
+                    pass
     except Exception:  # noqa: BLE001
         pass
 
@@ -542,40 +838,105 @@ def find_client_exe():
     return None
 
 
-def client_status():
-    """客户端状态。**返回 dict 而不是 tuple** —— 这个结果会直接进 JSON 响应，
-    tuple 里的 Path 序列化不了（会 500）。路径统一转成字符串。"""
+# ---------------------------------------------------------------------------
+# 客户端状态缓存
+#
+# `client_status()` 要枚举进程（内部起 `tasklist` 子进程，本机实测 284 ms）
+# 并调用 `find_client_exe()`（304 ms），合计 ≈ 600 ms。而 `/api/client-status`
+# 会被前端反复轮询、`/api/open-client` 也要先查一遍状态，每次都重跑全量枚举纯属浪费。
+#
+# 缓存 4 秒：足够覆盖一轮页面交互，又短到用户手动启停客户端后不会看到过时状态。
+# ⚠️ 只给**只读**的 `/api/client-status` 吃缓存；`open_client()` 是动作接口，
+#    用户点「打开客户端」时就是要看当下的真实状态，必须传 `fresh=True` 绕过。
+# ⚠️ **按通道分区**：两个通道查的是两个不同程序，共用单槽缓存会让国际服
+#    拿到国服那份结果（与 credits / checkin 缓存同款坑）。
+# ---------------------------------------------------------------------------
+_CLIENT_STATUS_CACHE = {}      # {通道 key: {"ts": float, "payload": dict}}
+CLIENT_STATUS_TTL = 4.0
+
+
+def invalidate_client_status(ch=None):
+    """丢掉客户端状态缓存。`ch=None` 表示全部通道。
+
+    任何会改变客户端进程状态的操作（启停、切号时的关闭）都要调一次，
+    否则后续几秒内读到的还是动作之前的快照。
+    """
+    if ch is None:
+        _CLIENT_STATUS_CACHE.clear()
+        return
+    _CLIENT_STATUS_CACHE.pop(channel(ch).key, None)
+
+
+def _client_pids(procs, ch):
+    """从**已枚举好的**进程表里取出该通道客户端的 pid。
+
+    进程名可能有历史别名（国服的 `codebuddy.exe`），所以是遍历而不是单次 get。
+    传已枚举的表进来，调用方就不必为取 pid 再跑一次 `tasklist`（+284 ms）。
+    """
+    if not procs:
+        return []
+    out = []
+    for name in ch.client_processes:
+        out.extend(procs.get(name, []))
+    return sorted(set(out))
+
+
+def client_status(ch, fresh=False):
+    """**该通道**客户端的状态。返回 dict 而不是 tuple —— 这个结果会直接进
+    JSON 响应，tuple 里的 Path 序列化不了（会 500）。路径统一转成字符串。
+
+    `fresh=True` 跳过缓存（动作接口用）。
+    """
+    ch = channel(ch)
+    now = time.time()
+    cached = _CLIENT_STATUS_CACHE.get(ch.key)
+    if not fresh and cached and cached.get("payload") is not None:
+        if now - cached["ts"] < CLIENT_STATUS_TTL:
+            return cached["payload"]
     procs = common.list_processes()
-    exe = find_client_exe()
-    return {
-        "running": bool(procs and procs.get(CLIENT_PROCESS)),
-        "pids": [] if procs is None else list(procs.get(CLIENT_PROCESS, [])),
+    pids = _client_pids(procs, ch)
+    # 把已枚举的进程表传下去，避免 find_client_exe 内部再跑一次 tasklist
+    exe = find_client_exe(ch, procs)
+    out = {
+        "running": bool(pids),
+        "pids": pids,
         "exe": str(exe) if exe else "",
         "detectable": procs is not None,
     }
+    _CLIENT_STATUS_CACHE[ch.key] = {"ts": now, "payload": out}
+    return out
 
 
-def open_client():
-    """打开 WorkBuddy 客户端；已在运行则把它切到前台，不重复启动。
+def open_client(ch):
+    """打开**该通道的**客户端；已在运行则把它切到前台，不重复启动。
 
     切号之后客户端需要重新读取登录态 —— 但它自己不一定在跑，
     所以这里给一个一键入口，而不是让用户去开始菜单找。
     返回 (ok, message)。
     """
+    ch = channel(ch)
+    label = "%s客户端" % ch.server
     procs = common.list_processes()
     if procs is None:
-        return False, "无法枚举进程（tasklist 不可用），请手动打开 WorkBuddy 客户端"
-    pids = list(procs.get(CLIENT_PROCESS, []))
+        return False, "无法枚举进程（tasklist 不可用），请手动打开%s" % label
+    pids = _client_pids(procs, ch)
     if pids:
+        # 客户端「关闭到托盘」时主窗口是隐藏的（进程在、图标在、窗口看不见）。
+        # 这种情况必须走"唤出"而不是"切前台"，否则点了没反应。
+        hidden = [w for w in common.client_main_windows(pids)
+                  if not w["visible"]]
         if common.focus_windows_of(pids):
-            return True, "WorkBuddy 客户端已在运行，已切到前台（pid %s）" % pids[0]
-        return True, ("WorkBuddy 客户端已在运行（pid %s），但系统不允许本程序把它切到前台，"
-                      "请从任务栏点开" % pids[0])
+            how = "窗口原先收在系统托盘里，已把它显示出来" if hidden \
+                else "已切到前台"
+            return True, "%s已在运行（pid %s），%s" % (label, pids[0], how)
+        return True, ("%s已在运行（pid %s），但没找到它的主窗口，"
+                      "请从任务栏/托盘点开" % (label, pids[0]))
 
-    exe = find_client_exe()
+    # 复用上面已枚举的 procs：否则 find_client_exe 内部会再跑一次 tasklist（+284 ms）
+    exe = find_client_exe(ch, procs)
     if not exe:
-        return False, ("找不到 WorkBuddy 客户端（%s）。"
-                       "如果你装在了非标准位置，请手动启动一次。" % CLIENT_EXE_NAME)
+        return False, ("找不到%s（%s）。"
+                       "如果你装在了非标准位置，请手动启动一次。" % (label, ch.client_exe))
     try:
         # DETACHED_PROCESS：客户端不随本工具退出而结束，也不继承控制台
         flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
@@ -584,21 +945,31 @@ def open_client():
                          creationflags=flags)
     except OSError as e:
         return False, "启动客户端失败：%s" % common.scrub(e)
-    return True, "已启动 WorkBuddy 客户端：%s" % exe
+    invalidate_client_status(ch)
+    return True, "已启动%s：%s" % (label, exe)
 
 
-def close_client(graceful_wait=8.0, total_wait=25.0, log=None):
-    """关闭 WorkBuddy 客户端。**先礼后兵**：先发 WM_CLOSE 让它正常退出，
+def close_client(ch, graceful_wait=8.0, total_wait=25.0, log=None):
+    """关闭**该通道的**客户端。**先礼后兵**：先发 WM_CLOSE 让它正常退出，
     超时再强杀。返回 (ok, message, was_running)。
+
+    ⚠️ 只关本通道那一个程序：国服与世界服是两个不同的 exe，切号时把对方关掉
+    既没用（对方不持有这次要动的库）又打扰用户。
 
     - `was_running` 供调用方在流程结束后**恢复原状**（原来在跑就重新打开）。
     - 检测不出进程时返回 ok=False —— 不能把"不知道"当成"已经关掉了"。
     """
+    ch = channel(ch)
     log = log or (lambda *a: None)
-    procs = common.list_processes()
-    if procs is None:
+
+    def _pids():
+        return _client_pids(common.list_processes(), ch)
+
+    # 只枚举一次：tasklist 一次约 284 ms，重复枚举是白花一倍时间
+    procs0 = common.list_processes()
+    if procs0 is None:
         return False, "无法枚举进程（tasklist 不可用），请手动退出客户端", False
-    pids = list(procs.get(CLIENT_PROCESS, []))
+    pids = _client_pids(procs0, ch)
     if not pids:
         return True, "客户端本来就没在运行", False
 
@@ -607,20 +978,22 @@ def close_client(graceful_wait=8.0, total_wait=25.0, log=None):
     deadline = time.time() + graceful_wait
     while time.time() < deadline:
         time.sleep(0.4)
-        now = common.list_processes() or {}
-        if not now.get(CLIENT_PROCESS):
+        if not _pids():
+            invalidate_client_status(ch)
             return True, "客户端已正常退出", True
 
-    left = (common.list_processes() or {}).get(CLIENT_PROCESS) or []
+    left = _pids()
     log("       正常退出超时，强制结束 %d 个进程…" % len(left))
     common.terminate_processes(left)
     deadline = time.time() + max(0.0, total_wait - graceful_wait)
     while time.time() < deadline:
         time.sleep(0.4)
-        if not (common.list_processes() or {}).get(CLIENT_PROCESS):
+        if not _pids():
+            invalidate_client_status(ch)
             return True, "客户端已强制关闭", True
 
-    still = (common.list_processes() or {}).get(CLIENT_PROCESS) or []
+    still = _pids()
+    invalidate_client_status(ch)
     return (False,
             "无法关闭客户端（仍有 %d 个进程：%s）。可能被其它用户会话占用或权限不足，"
             "请手动退出后重试" % (len(still), ", ".join(str(p) for p in still[:3])),
@@ -669,8 +1042,38 @@ def switch_account(target_name, migrate=None, ch=None):
     # 带迁移时放宽锁超时：迁移要做 db 快照（本机 WAL 有 4 MB），15s 可能不够，
     # 而超时会让并发的续期任务直接失败。
     lock_timeout = 120.0 if migrate else 15.0
-    with common.file_lock(ch.lock_key, LOCK_DIR, timeout=lock_timeout):
-        acc = wb.session_from_info_file(src)
+    # ⚠️ 锁必须**两把**。以前只加通道锁，而续期 / 签到 / 删除 / 新增用的是
+    #    `<通道>-auth-<文件名>`（见 refresh_account_file / checkin_account_file /
+    #    remove_account / add_account）—— 两把锁不同名，上面注释宣称的「与续期互斥」
+    #    实际不成立：切号读 src 的同时，续期可以写同一个文件、删除可以把它删掉。
+    #    加锁顺序恒为 **通道 → 账号**（其它路径只拿账号锁，不会反向），所以不会死锁。
+    account_lock_key = ch.key + "-auth-" + norm
+
+    # ⚠️ 客户端恢复状态必须提到锁外：只要 close_client 成功关掉了它，
+    #    之后**任何**退出路径（下面 4 条失败早退、以及 migrate 抛异常）都得把它放回去。
+    #    以前重开代码只写在函数末尾的成功路径上（注释却自称「无论迁移成败都恢复」），
+    #    于是那 4 条早退路径全部走不到 —— 客户端被静默关掉，用户得自己手动开回来。
+    client_was_running = False
+    _reopen_done = [False]
+
+    def _restore_client():
+        """把被我们关掉的客户端放回去；幂等，返回可拼接进消息的提示串。"""
+        if _reopen_done[0] or not client_was_running:
+            return ""
+        if not (migrate and migrate.get("reopen_client", True)):
+            return ""
+        _reopen_done[0] = True
+        try:
+            _ok, _msg = open_client(ch)
+        except BaseException as e:  # noqa: BLE001  含 SystemExit（安全删除 shim）
+            return "；重新打开%s客户端失败：%s" % (ch.server, common.scrub(e))
+        return "；%s" % _msg
+
+    switched_ok = False
+    try:
+        with common.file_lock(ch.lock_key, LOCK_DIR, timeout=lock_timeout), \
+                common.file_lock(account_lock_key, LOCK_DIR, timeout=lock_timeout):
+            acc = wb.session_from_info_file(src)
         if not acc:
             return False, "目标账号文件无法解析（内容可能不全或被加密）：%s" % target_name, None
         data = _read_info(src)
@@ -686,9 +1089,9 @@ def switch_account(target_name, migrate=None, ch=None):
         #    只切一半会让人以为迁移成功了。
         client_was_running = False
         if migrate and migrate.get("enabled", True) and migrate.get("close_client", True):
-            ok_c, msg_c, client_was_running = close_client()
+            ok_c, msg_c, client_was_running = close_client(ch)
             if not ok_c:
-                return False, "迁移前无法关闭 WorkBuddy 客户端：%s" % msg_c, None
+                return False, "迁移前无法关闭%s客户端：%s" % (ch.server, msg_c), None
             if client_was_running:
                 print("[提示] %s" % msg_c, flush=True)
 
@@ -769,6 +1172,13 @@ def switch_account(target_name, migrate=None, ch=None):
                              "%s -> %s" % (from_uid[:8], acc["uid"][:8]),
                              bool(mig_result.get("ok")), mig_result.get("message"))
 
+        switched_ok = True      # 走到这里 = 切换 + 迁移全部完成，客户端留给成功路径重开
+    finally:
+        # 失败 / 异常路径：把被我们关掉的客户端放回去。
+        # 成功路径不会走到这里生效（switched_ok 为真），它自己在下面拼提示。
+        if not switched_ok:
+            _restore_client()
+
     msg = "已切换为 %s（%s），桌面端将自动采纳新会话" % (acc["nickname"], target_name)
     if pruned:
         msg += "；已清理 %d 份旧备份（保留最近 %d 份）" % (pruned, DESKTOP_BACKUP_KEEP)
@@ -783,10 +1193,8 @@ def switch_account(target_name, migrate=None, ch=None):
             msg += "；⚠️ 但数据迁移失败：%s" % mig_result.get("message", "")
 
     # 恢复客户端原状：原来在跑就重新打开（迁移成功时它会直接读新账号的登录态）。
-    # 无论迁移成败都恢复 —— 是我们把它关掉的，就该由我们把它放回去。
-    if client_was_running and migrate and migrate.get("reopen_client", True):
-        ok_o, msg_o = open_client()
-        msg += "；%s" % msg_o
+    # 失败/异常路径由上面的 finally 兜底；这里只负责把重开提示拼进成功消息。
+    msg += _restore_client()
     return True, msg, mig_result
 
 
@@ -865,15 +1273,13 @@ def remove_account(file_name, ch=None):
 
 
 class _NullLog:
-    """极简日志壳：续期日志不进配置文件目录，避免污染签到日志。"""
-    def __init__(self):
-        self._buf = []
+    """极简日志壳：续期日志不进配置文件目录，避免污染签到日志。
 
+    ⚠️ 只**丢弃**，不缓存 —— 原先把每条都 append 到 `self._buf` 且从不清空，
+    常驻服务 + 每次续期若干条，内存只增不减（见 AUDIT_2026-09-24.md P3-8）。
+    """
     def __call__(self, msg):
-        try:
-            self._buf.append(str(msg))
-        except Exception:
-            pass
+        return None
 
 
 _NULLLOG = _NullLog()
@@ -885,14 +1291,17 @@ def _recalc_expiry(path):
     workbuddy_checkin.merge_auth_token 只在 expiresAt 缺失时才重算，旧值存在时不覆盖，
     导致续期后 wb_auth 文件里 expiresAt 仍为旧值、剩余天数不更新。
     JWT 的 exp 是服务端设置的权威到期时间，比 lastRefreshTime+expiresIn 更准确。
+
+    返回 True = 有效期已是正确的（含"本来就无需改"）；False = 没能写回。
+    调用方据此如实提示 —— 续期本身早已成功，不该因为这一步失败就报"续期失败"。
     """
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return
+        return False
     auth = data.get("auth")
     if not isinstance(auth, dict):
-        return
+        return False
     changed = False
     atoken = str(auth.get("accessToken") or "")
     if atoken:
@@ -911,11 +1320,25 @@ def _recalc_expiry(path):
                 auth["refreshExpiresAt"] = new_rexp
                 changed = True
     if not changed:
-        return
+        return True          # 值本来就是对的，无需写盘
     data["auth"] = auth
     tmp = Path(path).with_suffix(".info.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 同文件其它写盘点都走 replace_with_retry —— rename 会被杀软/客户端间歇性拒绝，
+        # 这里原先用的是裸 `tmp.replace(path)`，见 AUDIT_2026-09-24.md P2-5。
+        common.replace_with_retry(tmp, path)
+    except OSError as e:
+        # 续期**已经成功**（调用方已判 kind=="refreshed" and ok），这里只是把新有效期写回素材。
+        # 写不进去不该让整个请求变 500 —— 否则用户看到"续期失败"，其实已经续上了。
+        # 降级为返回 False，由调用方如实提示"有效期显示未刷新"。
+        try:
+            common.safe_unlink(str(tmp))
+        except BaseException as e2:  # noqa: BLE001  含 SystemExit（安全删除 shim 会抛）
+            print("[警告] 清理 %s 失败：%s" % (tmp.name, common.scrub(e2)))
+        print("[警告] 写回 %s 的到期时间失败：%s" % (Path(path).name, common.scrub(e)))
+        return False
+    return True
 
 
 def refresh_account_file(file_name, force=True, ch=None):
@@ -953,8 +1376,10 @@ def refresh_account_file(file_name, force=True, ch=None):
     with common.file_lock(ch.key + "-auth-" + base, LOCK_DIR):
         ok, msg, kind = wb.refresh_account(acc, SCRIPT_DIR, cfg, _NULLLOG, force=force)
         if kind == "refreshed" and ok:
-            _recalc_expiry(target)
-            return True, "已续期并更新 %s 的到期时间" % base
+            # 续期本身已成功 —— 写回有效期失败只降级提示，不能报成"续期失败"。
+            if _recalc_expiry(target):
+                return True, "已续期并更新 %s 的到期时间" % base
+            return True, "已续期 %s（有效期显示没能写回，下次刷新会重算）" % base
     return ok, msg
 
 
@@ -1021,6 +1446,30 @@ def refresh_all(force=False, ch=None):
 CHECKIN_STATUS_PATH = getattr(wb, "STATUS_PATH", "/v2/billing/meter/checkin-activity-status")
 CHECKIN_TTL = 300.0       # 缓存秒数：和积分一样，一次查询要按账号数发请求
 
+# 每通道一把「回源锁」：同一通道的并发请求只让一个真去扇出，其余等它把缓存填好后
+# 直接命中（double-checked）。否则「启动预热线程 vs 首个请求」、或「多个 ?force=1」
+# 会各自跑完整扇出 —— 每账号一次外部请求，页面卡顿 + 网关限流风险
+# （见 AUDIT_2026-09-24.md P2-6）。
+_FETCH_LOCKS = {}
+_FETCH_LOCKS_GUARD = threading.Lock()
+
+# 等锁上限（秒）。**必须有上限**：锁的持有者在扇出时可能卡在慢网关上
+# （`_billing_post` 单账号 timeout=20 × retries=2 → 最坏 40s/账号；
+#   20 个账号 6 并发最坏可达 ~160s）。没有上限的话，后来的请求会被一直挂住，
+# 直到前端 fetch 超时。等不到就**退化为自己扇出**（即改造前的并发行为）——
+# 宁可多打一次网关，也不把用户卡死（见 AUDIT_2026-09-24.md P2-6）。
+FETCH_LOCK_TIMEOUT = 30.0
+
+
+def _fetch_lock(kind, key):
+    """按「用途 + 通道」取回源锁。kind 取 'checkin' / 'credits'。"""
+    with _FETCH_LOCKS_GUARD:
+        lk = _FETCH_LOCKS.get((kind, key))
+        if lk is None:
+            lk = _FETCH_LOCKS[(kind, key)] = threading.Lock()
+        return lk
+
+
 _CHECKIN_LOCK = threading.Lock()
 # 缓存**按通道分区**：`{通道 key: {"ts": ..., "payload": ...}}`。
 # 不分区的话，两个通道会共用同一份结果 —— 两个通道的账号列表与网关都不同，
@@ -1073,50 +1522,66 @@ def checkin_snapshot(force=False, ch=None):
     两个通道的账号库与网关都不同，读错通道会静默把国服的签到状态显示到国际服视图上。
     """
     ch = channel(ch)
-    now = time.time()
+    t0 = time.time()
     with _CHECKIN_LOCK:
         _c = _CHECKIN_CACHE.get(ch.key) or {}
         cached, ts = _c.get("payload"), _c.get("ts", 0.0)
-        if not force and cached and now - ts < CHECKIN_TTL:
+        if not force and cached and t0 - ts < CHECKIN_TTL:
             return dict(cached, cached=True)
 
-    cfg = channel_cfg(ch)
-    accounts = list_accounts(ch)
+    # 回源串行化（见 _fetch_lock）：拿到锁后再查一次缓存 —— 等锁期间可能已经有别的
+    # 请求把结果填好了，那就直接复用，别再扇一遍。`ts >= t0` 说明就是**本次等待期间**
+    # 别人刚填的，所以即便 force=True 也可以安全复用（避免并发 force 重复扇出）。
+    _lk = _fetch_lock("checkin", ch.key)
+    _got = _lk.acquire(timeout=FETCH_LOCK_TIMEOUT)
+    try:
+        now = time.time()
+        with _CHECKIN_LOCK:
+            _c = _CHECKIN_CACHE.get(ch.key) or {}
+            cached, ts = _c.get("payload"), _c.get("ts", 0.0)
+            if cached and (ts >= t0 or (not force and now - ts < CHECKIN_TTL)):
+                return dict(cached, cached=True)
 
-    def _one(a):
-        entry = {"file": a["file"], "uid": a.get("uid") or "",
-                 "nickname": a.get("nickname") or a["file"], "ok": False}
-        if not a.get("ok"):
-            entry["reason"] = a.get("reason") or "账号不可用"
-            return entry
-        acc = wb.session_from_info_file(ch.auth_dir / a["file"])
-        if not acc:
-            entry["reason"] = "登录态无法解析"
-            return entry
-        try:
-            entry.update(query_checkin(acc, cfg))
-        except Exception as e:  # noqa: BLE001  单个账号失败不能拖垮整张表
-            entry["reason"] = "签到查询异常：%s" % common.scrub(e, 80)
-        return entry
+        cfg = channel_cfg(ch)
+        accounts = list_accounts(ch)
 
-    workers = min(6, max(1, len(accounts)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        items = list(pool.map(_one, accounts))
-    payload = {
-        "ok": True,
-        "accounts": items,
-        # checked = 今日**已签到**数；queried = **成功查询**数。
-        # 两者语义不同，都要有。补 queried 是为了与 credits_snapshot 对齐
-        # —— 那个接口一直有 queried，checkin 缺了它（见 AUDIT_2026-09-19.md 建议 3）。
-        "checked": sum(1 for i in items if i.get("checked_in")),
-        "queried": sum(1 for i in items if i.get("ok")),
-        "total": len(items),
-        "ts": datetime.datetime.now().strftime("%H:%M:%S"),
-        "cached": False,
-    }
-    with _CHECKIN_LOCK:
-        _CHECKIN_CACHE[ch.key] = {"ts": time.time(), "payload": payload}
-    return payload
+        def _one(a):
+            entry = {"file": a["file"], "uid": a.get("uid") or "",
+                     "nickname": a.get("nickname") or a["file"], "ok": False}
+            if not a.get("ok"):
+                entry["reason"] = a.get("reason") or "账号不可用"
+                return entry
+            acc = wb.session_from_info_file(ch.auth_dir / a["file"])
+            if not acc:
+                entry["reason"] = "登录态无法解析"
+                return entry
+            try:
+                entry.update(query_checkin(acc, cfg))
+            except Exception as e:  # noqa: BLE001  单个账号失败不能拖垮整张表
+                entry["reason"] = "签到查询异常：%s" % common.scrub(e, 80)
+            return entry
+
+        workers = min(6, max(1, len(accounts)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            items = list(pool.map(_one, accounts))
+        payload = {
+            "ok": True,
+            "accounts": items,
+            # checked = 今日**已签到**数；queried = **成功查询**数。
+            # 两者语义不同，都要有。补 queried 是为了与 credits_snapshot 对齐
+            # —— 那个接口一直有 queried，checkin 缺了它（见 AUDIT_2026-09-19.md 建议 3）。
+            "checked": sum(1 for i in items if i.get("checked_in")),
+            "queried": sum(1 for i in items if i.get("ok")),
+            "total": len(items),
+            "ts": datetime.datetime.now().strftime("%H:%M:%S"),
+            "cached": False,
+        }
+        with _CHECKIN_LOCK:
+            _CHECKIN_CACHE[ch.key] = {"ts": time.time(), "payload": payload}
+        return payload
+    finally:
+        if _got:
+            _lk.release()
 
 
 def checkin_account_file(file_name, ch=None):
@@ -1363,53 +1828,68 @@ def credits_snapshot(force=False, ch=None):
     原来内部写死 `list_accounts()` + `channel(DEFAULT_CHANNEL).auth_dir`。
     """
     ch = channel(ch)
-    now = time.time()
+    t0 = time.time()
     with _CREDITS_LOCK:
         _c = _CREDITS_CACHE.get(ch.key) or {}
         cached, ts = _c.get("payload"), _c.get("ts", 0.0)
-        if not force and cached and now - ts < CREDITS_TTL:
+        if not force and cached and t0 - ts < CREDITS_TTL:
             return dict(cached, cached=True)
 
-    cfg = channel_cfg(ch)
-    accounts = list_accounts(ch)
+    # 回源串行化（同 checkin_snapshot，见 _fetch_lock）。等锁同样**有上限**，
+    # 超时就退化为自己扇出，不把用户挂死。
+    _lk = _fetch_lock("credits", ch.key)
+    _got = _lk.acquire(timeout=FETCH_LOCK_TIMEOUT)
+    try:
+        now = time.time()
+        with _CREDITS_LOCK:
+            _c = _CREDITS_CACHE.get(ch.key) or {}
+            cached, ts = _c.get("payload"), _c.get("ts", 0.0)
+            if cached and (ts >= t0 or (not force and now - ts < CREDITS_TTL)):
+                return dict(cached, cached=True)
 
-    def _one(a):
-        # uid 是前端把「当前桌面端账号」映射到这条积分记录的唯一键：
-        # 当前账号可能不在账号库里（手动登录的），只有 uid 能对上。
-        entry = {"file": a["file"], "uid": a.get("uid") or "",
-                 "nickname": a.get("nickname") or a["file"], "ok": False}
-        if not a.get("ok"):
-            entry["reason"] = a.get("reason") or "账号不可用"
+        cfg = channel_cfg(ch)
+        accounts = list_accounts(ch)
+
+        def _one(a):
+            # uid 是前端把「当前桌面端账号」映射到这条积分记录的唯一键：
+            # 当前账号可能不在账号库里（手动登录的），只有 uid 能对上。
+            entry = {"file": a["file"], "uid": a.get("uid") or "",
+                     "nickname": a.get("nickname") or a["file"], "ok": False}
+            if not a.get("ok"):
+                entry["reason"] = a.get("reason") or "账号不可用"
+                return entry
+            acc = wb.session_from_info_file(ch.auth_dir / a["file"])
+            if not acc:
+                entry["reason"] = "登录态无法解析"
+                return entry
+            try:
+                entry.update(query_credits(acc, cfg))
+            except Exception as e:  # noqa: BLE001  单个账号失败不能拖垮整张表
+                entry["reason"] = "积分查询异常：%s" % common.scrub(e, 80)
             return entry
-        acc = wb.session_from_info_file(ch.auth_dir / a["file"])
-        if not acc:
-            entry["reason"] = "登录态无法解析"
-            return entry
-        try:
-            entry.update(query_credits(acc, cfg))
-        except Exception as e:  # noqa: BLE001  单个账号失败不能拖垮整张表
-            entry["reason"] = "积分查询异常：%s" % common.scrub(e, 80)
-        return entry
 
-    # 并发查询：每账号一次外部请求，串行累加会让页面等好几秒，等待期间用户一刷新
-    # 就取消请求（服务端表现为连接中止）。并发后总耗时约等于最慢的单个账号。
-    workers = min(6, max(1, len(accounts)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        items = list(pool.map(_one, accounts))
+        # 并发查询：每账号一次外部请求，串行累加会让页面等好几秒，等待期间用户一刷新
+        # 就取消请求（服务端表现为连接中止）。并发后总耗时约等于最慢的单个账号。
+        workers = min(6, max(1, len(accounts)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            items = list(pool.map(_one, accounts))
 
-    ok_items = [i for i in items if i.get("ok")]
-    payload = {
-        "ok": True,
-        "total_remain": round(sum(_num(i.get("total_remain")) for i in ok_items), 2),
-        "accounts": items,
-        "queried": len(ok_items),
-        "total": len(items),
-        "ts": datetime.datetime.now().strftime("%H:%M:%S"),
-        "cached": False,
-    }
-    with _CREDITS_LOCK:
-        _CREDITS_CACHE[ch.key] = {"ts": time.time(), "payload": payload}
-    return payload
+        ok_items = [i for i in items if i.get("ok")]
+        payload = {
+            "ok": True,
+            "total_remain": round(sum(_num(i.get("total_remain")) for i in ok_items), 2),
+            "accounts": items,
+            "queried": len(ok_items),
+            "total": len(items),
+            "ts": datetime.datetime.now().strftime("%H:%M:%S"),
+            "cached": False,
+        }
+        with _CREDITS_LOCK:
+            _CREDITS_CACHE[ch.key] = {"ts": time.time(), "payload": payload}
+        return payload
+    finally:
+        if _got:
+            _lk.release()
 
 
 def build_ui_context(ch):
@@ -1430,44 +1910,27 @@ def build_ui_context(ch):
         "CMD": "workbuddy_switcher.cmd",
         "API_BASE": ch.api_base,
         "VIEW": ch.key,
-        # 四个能力开关，按通道的 features 逐项映射到前端。
-        # 国际服现在 credits / refresh 都开着（接口已验证走 www.workbuddy.ai）；
-        # checkin / migrate 仍为空 —— 签到活动未开启、迁移只认国服数据目录。
+        # 能力开关，按通道的 features 逐项映射到前端（置空即隐藏对应入口）。
+        # 国际服现在 credits / refresh / migrate / open_client 都开着；
+        # checkin 仍为空 —— 签到活动未开启（接口 active=false）。
         "CREDITS": "1" if ch.supports("credits") else "",
         "CHECKIN": "1" if ch.supports("checkin") else "",
         "MIGRATE": "1" if ch.supports("migrate") else "",
         "REFRESH": "1" if ch.supports("refresh") else "",
-        # 「打开客户端」两个通道都隐藏（国服按用户要求去掉；国际服不代管客户端进程）
+        # 「打开客户端」有**两处**按钮，分别控制：
+        #   OPEN_CLIENT     = 导航栏那个。国服/国际服按用户要求**不显示**（Trae 侧显示），
+        #                     所以这里恒空，不看 features。
+        #   OPEN_CLIENT_ROW = 「当前账号行」那个。2026-09-21 起两个通道都要显示 ——
+        #                     进程名已按通道区分，点了开的就是自己那个客户端。
         "OPEN_CLIENT": "",
+        "OPEN_CLIENT_ROW": "1" if ch.supports("open_client") else "",
     }
-    if ch.key == "wb":
-        common_ctx.update({
-            "TITLE": "WorkBuddy 账号管理",
-            "LOGO": "&#128172;",
-            "SUBTITLE": "国服 · 一键切换 WorkBuddy 桌面端登录账号 · 免手机验证码 · 同机共用各账号积分",
-            "TIP": ("账号配置存放在 <b>wb_auth\\</b> 目录，每个文件是一份 <b>.info</b> 登录态"
-                    "（<code>%LOCALAPPDATA%\\CodeBuddyExtension\\Data\\Public\\auth\\</code> 下导出的那种）。"
-                    "切换即替换桌面端的 <code>workbuddy-desktop.info</code>（国服 <code>www.workbuddy.cn</code>），"
-                    "旧会话会自动备份。"),
-            "ADD_HINT": "点击展开，选择文件或粘贴该账号的 .info 登录态",
-            "EMPTY_HINT": ("请把 WorkBuddy 账号登录态文件（<code>workbuddy-*.info</code>）放进去。"
-                           "直接运行 exe 时，账号目录要放在 exe 同级（用 .cmd 启动就是本目录）。"),
-        })
-    else:
-        common_ctx.update({
-            "TITLE": "WorkBuddyAI 账号管理",
-            "LOGO": "&#127760;",
-            "SUBTITLE": "国际服 · 一键切换 WorkBuddyAI 桌面端登录账号 · 独立账号库 wbai_auth\\ · 积分与续期走国际服网关",
-            "TIP": ("账号配置存放在 <b>wbai_auth\\</b> 目录，每个文件是一份 <b>.info</b> 登录态。"
-                    "切换即替换桌面端的 <code>workbuddy-desktop-ai.info</code>"
-                    "（国际服 <code>www.workbuddy.ai</code>，与国服的 <code>workbuddy-desktop.info</code>"
-                    "互不影响），旧会话会自动备份。"
-                    "积分与续期走国际服自己的网关，与国服的积分互不相通；"
-                    "国际服的签到活动未开启（接口实测 <code>active=false</code>），因此本视图不显示签到。"),
-            "ADD_HINT": "点击展开，选择文件或粘贴该账号的 .info 登录态",
-            "EMPTY_HINT": ("请把 WorkBuddyAI 账号登录态文件（<code>workbuddyai-*.info</code>）放进去。"
-                           "也可以直接「添加账号」，把 <code>workbuddy-desktop-ai.info</code> 的内容粘进来。"),
-        })
+    # TITLE 直接用通道自己的 `title` —— 原先在这里又硬编码一份 if/else，
+    # 与 `Channel(title=...)` 重复维护，改一处漏一处（见 AUDIT_2026-09-24.md P3-9）。
+    # LOGO 只在模板里有意义、Channel 不持有它，所以按通道映射；
+    # 用 dict.get 而不是 if/else，将来加通道时不会悄悄落进"else = 国际服"那个坑。
+    common_ctx["TITLE"] = ch.title
+    common_ctx["LOGO"] = {"wb": "&#128172;", "wbai": "&#127760;"}.get(ch.key, "&#128172;")
     return common_ctx
 
 
@@ -1500,7 +1963,14 @@ class Handler(common.BaseHandler):
     AUDIT_ACTIONS = dict(_BASE_ACTIONS)
     AUDIT_ACTIONS.update({"/api/wbai" + p[len("/api"):]: a for p, a in _BASE_ACTIONS.items()})
     APP_NAME = "wb_switcher"
-    APP_VERSION = common.source_version(__file__, "wb")
+    # 把启动器也算进版本戳：它不 import 本模块，但改动同样影响行为 ——
+    # 只改启动器时版本戳不变的话，stale 检测（"在跑的实例是不是旧代码"）会漏判
+    # （实测：给启动器加一次性令牌，重启后 version 仍是旧值，只能靠行为验证 ——
+    #  见 AUDIT_2026-09-24.md 第二十章）。打包态下这个路径 stat 不到，
+    # source_version 会自己回退到 exe 自身。
+    APP_VERSION = common.source_version(
+        __file__, "wb",
+        extra_paths=(str(Path(__file__).with_name("ui_app.py")),))
     STARTED_AT = int(time.time())
 
     # --- 通道路由 -------------------------------------------------------
@@ -1525,6 +1995,18 @@ class Handler(common.BaseHandler):
             return 200, {"ok": True, "accounts": list_accounts(ch)}
         if path == "/api/current":
             return 200, {"ok": True, "current": current_account(ch)}
+        if path == "/api/live-token":
+            # 登录态文件被字段加密（5.6.2+）时的降级读取：从客户端进程内存里取
+            # 当前凭据。只读、不落盘；返回**脱敏**摘要（token 只给前缀和长度），
+            # 免得凭据进了前端状态或审计日志。
+            # want_refresh=True：这是诊断接口，用户要看 refresh 的签发/到期情况，
+            # 所以扫到 access + refresh 都拿到为止（功能路径不这么做，见 live_session 注释）。
+            session = live_session(ch, want_refresh=True)
+            if not session:
+                return 200, {"ok": False,
+                             "reason": "读不到客户端进程里的凭据"
+                                       "（客户端没在跑，或它以更高权限运行）"}
+            return 200, {"ok": True, "session": redact_session(session)}
         if path == "/api/credits":
             # ?force=1 强制回源，否则走 CREDITS_TTL 秒的进程内缓存
             if not ch.supports("credits"):
@@ -1542,7 +2024,7 @@ class Handler(common.BaseHandler):
             # 国际服不代管客户端进程 → 不能把国服的进程状态当成它的返回（与 credits 同款处理）。
             if not ch.supports("open_client"):
                 return 200, {"ok": True, "client": None, "unsupported": True}
-            return 200, {"ok": True, "client": client_status()}
+            return 200, {"ok": True, "client": client_status(ch)}
         if path == "/api/migrate-preview":
             # 只读扫描：切到这个账号需要迁移多少数据（供弹框展示）。
             # 国际服的拒绝由 migrate_preview() 自己给出 —— 守卫写在函数里，
@@ -1553,13 +2035,14 @@ class Handler(common.BaseHandler):
     def api_post(self, u, p):
         ch, path = self._route(u.path)
         if path == "/api/open-client":
-            # 客户端进程是按国服 exe 名枚举的，两个通道没有区分手段 ——
-            # 国际服必须在这里拒掉，否则 /api/wbai/open-client 会把**国服**客户端拉起来。
-            # （迁移流程内部直接调 open_client() 函数，不走这个接口，不受影响。）
+            # 进程名已按通道区分（Channel.client_processes），这里不会再拉错程序。
+            # 国际服仍拒：页面上的「打开客户端」按钮两个通道都不显示，接口没必要对外。
+            # （迁移流程内部直接调 open_client(ch) 函数，不走这个接口，不受影响。）
             if not ch.supports("open_client"):
                 return 400, {"ok": False, "message": "%s不代管客户端进程" % ch.server}
-            ok, msg = open_client()
-            return 200, {"ok": ok, "message": msg, "client": client_status()}
+            ok, msg = open_client(ch)
+            # fresh=True：这是动作接口，用户刚点过「打开客户端」，必须给当下真实状态
+            return 200, {"ok": ok, "message": msg, "client": client_status(ch, fresh=True)}
         if path == "/api/switch":
             mig = p.get("migrate")
             if not isinstance(mig, dict):
@@ -1597,7 +2080,7 @@ def rebind(base_dir, script_dir=None):
     `Handler.BASE_DIR` / `Handler.AUDIT_DIR`），逐个赋值的写法漏一个就是
     「账号库在一个地方、锁和备份在另一个地方」这类**静默分家** ——
     而冻结态 exe 恰恰是最难复现的场景（源码运行永远正常）。
-    以前 `wb_ui_app` / `tw_ui_app` 各写 5 行赋值，那 5 行就是漏改的来源。
+    以前启动器各写 5 行赋值，那 5 行就是漏改的来源。
 
     账号库/桌面端登录态本身已改成按 `_BIN_DIR` 现算（`Channel.auth_dir` 属性），
     这里只需管那些"必须落在模块/类属性上"的名字。
@@ -1651,6 +2134,8 @@ def warmup_async():
 
 
 def serve(port=DEFAULT_PORT, open_browser=True, use_token=True):
+    # 部署用：把账号目录建出来（含占位提示），用户拷走 exe 双击就能看到该往哪放文件。
+    ensure_auth_dirs()
     # 单实例保护：拿到互斥体才允许启动；已有实例则复用或报错退出，**绝不静默另起一个**。
     # 见 DESIGN_single_instance.md。
     handle, action, info = common.single_instance_guard(
@@ -1686,12 +2171,24 @@ def serve(port=DEFAULT_PORT, open_browser=True, use_token=True):
 
 
 
+def _print_json(obj):
+    """CLI 的 JSON 输出统一出口；实现在 switcher_common，两个切换器共用。
+
+    GBK 控制台下 emoji 昵称会让裸 `print(json.dumps(..., ensure_ascii=False))`
+    直接抛 UnicodeEncodeError（详见 common.print_json 的注释）。
+    """
+    common.print_json(obj)
+
+
 def main():
     ap = argparse.ArgumentParser(description="WorkBuddy 账号切换器后端")
     ap.add_argument("--channel", choices=sorted(CHANNELS), default=DEFAULT_CHANNEL,
                     help="目标通道：wb=WorkBuddy 国服（默认），wbai=WorkBuddyAI 国际服")
     ap.add_argument("--list", action="store_true", help="列出账号库可用账号")
     ap.add_argument("--current", action="store_true", help="查看桌面端当前账号")
+    ap.add_argument("--live-token", action="store_true",
+                    help="从客户端进程内存读取当前凭据（登录态文件被字段加密时的降级路径；"
+                         "输出已脱敏，只给前缀与长度）")
     ap.add_argument("--switch", metavar="NAME", help="切换为该通道账号库里的 NAME.info")
     ap.add_argument("--migrate", action="store_true",
                     help="配合 --switch：切换后把旧账号的本地数据改归属到新账号（仅国服）")
@@ -1728,21 +2225,28 @@ def main():
         return refresh_all(force=args.force, ch=ch)
 
     if args.list:
-        print(json.dumps({"accounts": list_accounts(ch)}, ensure_ascii=False, indent=2))
+        _print_json({"accounts": list_accounts(ch)})
         return 0
     if args.current:
-        print(json.dumps({"current": current_account(ch)}, ensure_ascii=False, indent=2))
+        _print_json({"current": current_account(ch)})
+        return 0
+    if args.live_token:
+        session = live_session(ch, want_refresh=True)
+        if not session:
+            _print_json({"ok": False,
+                         "reason": "读不到客户端进程里的凭据（客户端没在跑，或它以更高权限运行）"})
+            return 1
+        _print_json({"ok": True, "session": redact_session(session)})
         return 0
     if args.switch:
         mig = {"enabled": True, "mode": args.migrate_mode} if args.migrate else None
         ok, msg, mig_result = switch_account(args.switch, mig, ch)
         common.audit(Handler.AUDIT_DIR, ch.source, "switch", args.switch, ok, msg)
-        print(json.dumps({"ok": ok, "message": msg, "migration": mig_result},
-                         ensure_ascii=False, indent=2))
+        _print_json({"ok": ok, "message": msg, "migration": mig_result})
         return 0 if ok else 1
     if args.migrate_preview:
         out = migrate_preview(args.migrate_preview, ch)
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        _print_json(out)
         # 能力不支持 = **命令级失败**（与 --refresh-all 同款），必须给出非零退出码：
         # 以前这里恒 return 0，脚本用 `$?` 判断时会以为这次扫描成功。
         # 账号不存在 / 新旧账号相同这类仍回 0 —— JSON 里的 ok/message 已足够表达，

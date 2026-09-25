@@ -19,14 +19,14 @@ wb_switcher/（switcher 系列工具所在目录）
 ├── ui_template.html       # 前端模板（与 WorkBuddy 切换器共用，后端按 UI_CONTEXT 渲染）
 ├── trae_switcher.cmd      # Trae 启动脚本（双击即用）
 ├── tw_auth/               # 切换用账号素材库，每账号放一份 storage.json
-│   ├── trae-wtnong.json
-│   ├── trae-wtnong1.json
-│   ├── trae-星空880.json
+│   ├── trae-account-c.json
+│   ├── trae-account-d.json
+│   ├── trae-account-e.json
 │   └── _trae_tokens.json  # import_token.py 产出的明文凭据（可读、不可切换）
 ├── tw_backups/            # 切号时自动备份的登录态（gitignore 排除，超 10 份自动裁剪）
 ├── TraeSwitcher.spec      # 桌面版打包配置：pyinstaller TraeSwitcher.spec
 ├── import_token.py        # 凭据导入（别机 tokens / storage.json → config.json）
-└── wb_ui_server.py / wb_ui_app.py / workbuddy_switcher.cmd  # 同目录下的 WorkBuddy 切换器（姊妹工具）
+└── wb_ui_server.py / ui_app.py / workbuddy_switcher.cmd  # 同目录下的 WorkBuddy 切换器（姊妹工具）
 ```
 
 ---

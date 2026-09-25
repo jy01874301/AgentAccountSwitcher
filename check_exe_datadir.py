@@ -15,7 +15,7 @@ r"""check_exe_datadir.py —— 冻结态 exe 的数据目录基准自检（双�
 
 用法：
     python check_exe_datadir.py [exe 目录]
-    # 默认 dist\WorkBuddySwitcher
+    # 默认 dist\AgentAccountSwitcher
 
 退出码 0 = 两个通道都读 exe 同级；1 = 有失败项（会打印原因）。
 探针文件跑完即删，不碰真实账号库。
@@ -29,8 +29,8 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-EXE_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "dist" / "WorkBuddySwitcher"
-EXE = EXE_DIR / "WorkBuddySwitcher.exe"
+EXE_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "dist" / "AgentAccountSwitcher"
+EXE = EXE_DIR / "AgentAccountSwitcher.exe"
 
 GOOD = json.dumps({
     "account": {"uid": "probe-uid", "nickname": "探针账号"},
@@ -70,8 +70,12 @@ def main():
         with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, path), timeout=5) as r:
             return json.loads(r.read().decode("utf-8"))
 
-    # exe 是 windowed 构建，起服务靠 --serve（见 README 的「桌面版 exe 的命令行开关」）
-    proc = subprocess.Popen([str(EXE), "--serve", "--port", str(port)],
+    # exe 是 windowed 构建，起服务靠 --serve（见 README 的「桌面版 exe 的命令行开关」）。
+    # ⚠️ 必须带 `--no-single-instance`：单实例守卫探的是「请求端口区间 ∪ **默认端口区间**」，
+    #    所以只要用户正开着切换器（它是常驻服务，很常见），这个随机端口的探针实例就会被
+    #    判成 reuse 直接退出，表现为"服务没起来"（实测踩到）。
+    proc = subprocess.Popen([str(EXE), "--serve", "--port", str(port),
+                             "--no-single-instance"],
                             cwd=str(EXE_DIR), stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
     fails = []
@@ -101,9 +105,12 @@ def main():
                              % (ch, "读到了" if got else "没读到", name,
                                 "读到" if want else "不该读到"))
     finally:
-        # ⚠️ 必须 taskkill：PyInstaller 的引导器会另起子进程，proc.terminate() 杀不掉它，
-        #    残留的实例会占着端口，下次跑就"服务没起来"。
-        subprocess.run(["taskkill", "/IM", "WorkBuddySwitcher.exe", "/F"],
+        # ⚠️ 不要用 `taskkill /IM AgentAccountSwitcher.exe /F` —— 那是**按镜像名全杀**，
+        #    会把用户自己正在用的实例一并干掉（本工具是常驻服务，用户很可能同时开着）。
+        #    这里只结束**本次 Popen 的那棵树**：PyInstaller 的引导器会另起子进程，
+        #    所以光 terminate() 不够，要 `/PID <pid> /T` 连子树一起收
+        #    （见 AUDIT_2026-09-24.md P3-15）。
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                        capture_output=True)
         try:
             proc.wait(timeout=10)

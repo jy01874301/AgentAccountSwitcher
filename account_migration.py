@@ -34,8 +34,8 @@ import switcher_common as common
 # ---------------------------------------------------------------------------
 # ⚠️ 这是本模块最容易搞错的地方。本机实测存在两个结构完全相同的客户端数据目录：
 #
-#   ~/.workbuddy/      account-snapshot.uid = b592a5dd…（= workbuddy-desktop.info 的账号）
-#   ~/.workbuddy-ai/   account-snapshot.uid = 7aac45de…（= workbuddy-desktop-ai.info，AI 端）
+#   ~/.workbuddy/      account-snapshot.uid = 33333333…（= workbuddy-desktop.info 的账号）
+#   ~/.workbuddy-ai/   account-snapshot.uid = 66666666…（= workbuddy-desktop-ai.info，AI 端）
 #
 # 切换器管的是 `workbuddy-desktop.info`，所以**该迁的是 ~/.workbuddy/**。
 # 而 `WORKBUDDY_CONFIG_DIR` 在切换器进程里未必存在、在别的进程里可能是 `-ai`，
@@ -141,17 +141,22 @@ def other_instance():
     return None
 
 
-def running_clients():
+def running_clients(names=None):
     """返回正在运行的客户端进程名列表。
+
+    `names` 用来**按通道限定**要查哪些进程名：国服与国际服是两个不同的程序，
+    提示里点名一个本次根本不会去关的客户端（"迁移前会自动关闭它"）是假话。
+    不传 = 沿用 CLIENT_PROCESS_NAMES 全量（老行为）。
 
     返回 None 表示**检测不出来**（tasklist 不可用等），调用方应据此提示用户
     自行确认，而不是当成"没在跑"。实现已抽到 `common.list_process_names()`
     —— 那里集中处理了"GBK 输出 + UTF-8 解码会在读取线程里炸"这个坑。
     """
-    names = common.list_process_names()
-    if names is None:
+    running = common.list_process_names()
+    if running is None:
         return None
-    return sorted(n for n in CLIENT_PROCESS_NAMES if n in names)
+    return sorted(n for n in (CLIENT_PROCESS_NAMES if names is None else names)
+                  if n in running)
 
 
 # ---------------------------------------------------------------------------
@@ -245,8 +250,12 @@ def _fix_connector_states(path, new_uid):
 # ---------------------------------------------------------------------------
 # 扫描（只读）
 # ---------------------------------------------------------------------------
-def scan(old_uid, new_uid):
-    """扫描旧账号名下待迁数据。返回 dict，供弹框展示与冲突提示。"""
+def scan(old_uid, new_uid, client_names=None):
+    """扫描旧账号名下待迁数据。返回 dict，供弹框展示与冲突提示。
+
+    `client_names` 透传给 running_clients()：只报**本次会去关的那个**客户端，
+    别把另一个通道的客户端算进来（它在跑也跟这次迁移无关）。
+    """
     r = find_data_root(old_uid)
     out = {
         "ok": True, "old_uid": old_uid or "", "new_uid": new_uid or "",
@@ -254,7 +263,7 @@ def scan(old_uid, new_uid):
         "sessions": 0, "running_sessions": 0, "automations": 0,
         "has_memory": False, "storage_dirs": [], "has_connectors": False,
         "snapshot_is_old": False, "settings_key": False,
-        "projects": 0, "client_running": running_clients(),
+        "projects": 0, "client_running": running_clients(client_names),
         "conflicts": [], "warnings": [], "client_note": "",
     }
     if not old_uid or not new_uid:
@@ -371,12 +380,32 @@ class _Journal:
         self.backup = Path(backup_dir)
         self.renames = []        # (from, to) 目录改名，回滚 = 反向
         self.restore = []        # (backup_file, target_file) 文件还原
+        self.merged_files = []   # 合并 storage 时**新建**的目标文件，回滚 = 删除
         self.db_backup = None
         self.steps = []
         self.notes = []
 
     def add_step(self, name, ok, detail=""):
         self.steps.append({"name": name, "ok": bool(ok), "detail": str(detail)[:300]})
+        # 每记一步就刷一次盘 —— 比在每个调用点手动 flush 更不容易漏，
+        # 代价是一次 1KB 级的小文件写。见 flush() 的说明。
+        self.flush()
+
+    def flush(self):
+        """把当前进度增量落盘到 manifest.json。
+
+        ⚠️ 以前 manifest 只在**全部成功之后**（第 9 步）写一次，而文件头宣称
+        「每一步都记进 manifest，失败可按 manifest 反向回滚」—— 正常失败还能靠
+        内存里的 journal 回滚，但**进程被杀 / 断电 / 被强杀**时磁盘上没有任何
+        恢复依据，只剩一份被改了一半的账号数据，比「失败并回滚」更难排查。
+        现在每个关键步之后都刷一次。
+        """
+        try:
+            self.backup.mkdir(parents=True, exist_ok=True)
+            (self.backup / "manifest.json").write_text(
+                json.dumps(self.manifest(), ensure_ascii=False, indent=2), encoding="utf-8")
+        except BaseException:  # noqa: BLE001  含 SystemExit（安全删除 shim）
+            pass
 
     def manifest(self):
         return {
@@ -384,6 +413,7 @@ class _Journal:
             "db_backup": self.db_backup,
             "renames": [[str(a), str(b)] for a, b in self.renames],
             "restore": [[str(a), str(b)] for a, b in self.restore],
+            "merged_files": [str(p) for p in self.merged_files],
             "steps": self.steps,
             "notes": self.notes,
         }
@@ -602,9 +632,22 @@ def migrate(old_uid, new_uid, opts=None):
                                           "user-%s-" % _safe(new_uid), 1)
                 dst = r / "storage" / new_name
                 if dst.exists():
-                    _merge_storage_dir(d, dst)
                     moved.append("%s → %s（合并）" % (d.name, new_name))
-                    common.safe_unlink_tree(d)
+                    # ⚠️ 合并分支**不能只把旧目录删掉**。两处都踩过：
+                    #   ① 以前写的是 `common.safe_unlink_tree` —— **那个函数全仓不存在**
+                    #      （只有 safe_unlink / safe_rmtree），于是「新账号已有同名 storage
+                    #      目录」这条分支（来回切号必现）在 _merge_storage_dir 已经复制完
+                    #      之后必抛 AttributeError → 回滚、报「迁移 storage 失败」，
+                    #      而内容其实已经并进新目录了。
+                    #   ② 就算改成 safe_rmtree 也不够：回滚只认 journal.renames，
+                    #      直接删掉等于旧目录永久消失。
+                    #    改成**移进备份目录**并登记 renames，回滚就能靠已有的反向改名逻辑
+                    #    把它放回去；合并时新建的文件另记一份，回滚时删掉。
+                    parked = journal.backup / "storage-merged" / d.name
+                    parked.parent.mkdir(parents=True, exist_ok=True)
+                    journal.merged_files.extend(_merge_storage_dir(d, dst))
+                    _replace(d, parked)
+                    journal.renames.append((d, parked))
                 else:
                     journal.renames.append((d, dst))
                     _replace(d, dst)
@@ -706,7 +749,15 @@ def migrate(old_uid, new_uid, opts=None):
             result["warnings"].append(
                 "%d 个会话在 projects/ 下找不到正文（cwd 可能变过）：%s"
                 % (len(missing), ", ".join(missing[:3])))
-        journal.add_step("校验", not missing, detail)
+        # ⚠️ 正文缺失**只算警告，不算失败**：本步真正要验的是「归属有没有改对」，
+        # `_verify_db` 已经给出结论；「projects/ 下有没有对应 jsonl」是另一件事
+        # —— cwd 变过、对话正文被清理过都会让正文不在，但归属迁移本身是成功的。
+        # 历史上这里写的是 `not missing`，后果有两层（2026-09-21 实测确认）：
+        #   1) 所有写操作都已落地且**未回滚**，却对外报 ok=False，
+        #      切号 UI 渲染成「但数据迁移失败」，与实际状态相反；
+        #   2) 下面 `if result["ok"]` 的裁剪被绕过 → `.migration-backup/` 无限堆积
+        #      （每份含**完整对话库快照**），来回切 8 轮就到了 14 份。
+        journal.add_step("校验", True, detail)
     except Exception as e:  # noqa: BLE001
         journal.add_step("校验", False, e)
         result["warnings"].append("校验阶段异常：%s" % common.scrub(e))
@@ -722,8 +773,11 @@ def migrate(old_uid, new_uid, opts=None):
     result["steps"] = journal.steps
     result["message"] = "迁移完成：%s" % "；".join(
         s["name"] + ("✓" if s["ok"] else "✗") for s in journal.steps)
-    if result["ok"]:
-        # 只在成功时裁剪：失败要保留现场供恢复
+    # 裁剪的唯一条件是「**没有回滚**」——即当前状态就是迁移后的状态。
+    # 不能用 `result["ok"]`：ok 会被纯警告类步骤拉低（见上面「校验」那段），
+    # 一旦被拉低就永远不裁剪，每一轮切号都新增一份完整对话库快照。
+    # 回滚过了才需要保留现场供恢复；未回滚时备份没有留着的意义。
+    if not result.get("rolled_back"):
         try:
             prune_migration_backups(r)
         except BaseException:  # noqa: BLE001
@@ -732,7 +786,14 @@ def migrate(old_uid, new_uid, opts=None):
 
 
 def _merge_storage_dir(src, dst):
-    """把 src 里的文件按 key 粒度补进 dst（目标已有的不动）。"""
+    """把 src 里的文件按 key 粒度补进 dst（目标已有的不动）。
+
+    **返回本次新建的目标文件列表** —— 合并是「复制」而不是「移动」，回滚时
+    光把旧目录放回去还不够，这些多出来的副本也得删掉，否则新账号目录里会残留
+    旧账号的设置。目标已存在的文件不动，所以返回的每一项都是「本来不存在」的，
+    回滚删掉它们是安全的。
+    """
+    created = []
     for f in Path(src).rglob("*"):
         if f.is_dir():
             continue
@@ -742,6 +803,8 @@ def _merge_storage_dir(src, dst):
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, target)
+        created.append(target)
+    return created
 
 
 def _rollback(r, journal, result, message):
@@ -769,6 +832,15 @@ def _rollback(r, journal, result, message):
                 shutil.copy2(src, dst)
         except OSError as e:
             problems.append("还原 %s：%s" % (Path(dst).name, common.scrub(e)))
+    # 合并 storage 时新建的副本要删掉：合并是「复制」不是「移动」，
+    # 只把旧目录（renames 里那条）放回去的话，新账号目录里还会残留旧账号的设置。
+    # 这些文件在合并时就是「目标本来不存在」的，删除是安全的。
+    for p in getattr(journal, "merged_files", []):
+        try:
+            if Path(p).is_file():
+                common.safe_unlink(str(p))
+        except BaseException as e:  # noqa: BLE001  含 SystemExit（安全删除 shim）
+            problems.append("清理合并残留 %s：%s" % (Path(p).name, common.scrub(e)))
 
     result["ok"] = False
     result["steps"] = journal.steps
@@ -785,7 +857,13 @@ def prune_migration_backups(r, keep=3):
     """只保留最近 keep 份迁移备份。
 
     `.migration-backup/<时间戳>/workbuddy.db` 是**完整对话库快照**，
-    成功迁移后没有必要长期堆积。失败时**不要调用本函数** —— 现场要留着给用户恢复。
+    迁移后没有必要长期堆积。
+
+    调用时机：**只要这一轮没有回滚**就应该调用（见 `migrate()` 末尾）——
+    此时磁盘状态就是迁移后的状态，备份不含"待恢复现场"的语义。
+    注意判据是 `rolled_back`，**不是** `result["ok"]`：`ok` 会被纯警告类步骤
+    （例如"个别会话找不到正文 jsonl"）拉低，用 ok 当门会导致备份永不裁剪。
+    真正回滚过的那一轮才会 `return` 前保留现场、不走到这里。
     """
     base = Path(r) / ".migration-backup"
     if not base.is_dir():
@@ -798,9 +876,9 @@ def prune_migration_backups(r, keep=3):
     return removed
 
 
-def preview(old_uid, new_uid):
-    """给弹框用的精简预览。"""
-    s = scan(old_uid, new_uid)
+def preview(old_uid, new_uid, client_names=None):
+    """给弹框用的精简预览。`client_names` 透传给 scan()，见那里的说明。"""
+    s = scan(old_uid, new_uid, client_names)
     items = []
     if s.get("sessions"):
         items.append({"key": "sessions", "label": "会话与任务",

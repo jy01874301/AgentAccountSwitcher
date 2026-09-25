@@ -43,7 +43,6 @@
   .status-dot.off { background:var(--red); }
   .status-text { font-size:13px; color:var(--dim); }
 
-  .tip-lead { font-weight:600; color:var(--text); font-size:13px; margin-bottom:5px; }
   .section-title { display:flex; align-items:center; gap:8px; margin:18px 0 9px; flex-wrap:wrap; }
   .section-title .bar { width:4px; height:18px; background:var(--accent); border-radius:2px; }
   .section-title h2 { font-size:16px; font-weight:600; }
@@ -159,10 +158,6 @@
   .modal-title { font-size:17px; font-weight:700; margin-bottom:10px; }
   .modal-body { color:var(--dim); font-size:14px; line-height:1.7; }
   .modal-body b { color:var(--text); }
-
-  .tip { background:rgba(79,140,255,.08); border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:10px; padding:12px 16px; font-size:12.5px; color:var(--dim); line-height:1.7; margin-bottom:16px; }
-  .tip b { color:var(--accent); }
-  .tip code { background:var(--card-2); padding:1px 6px; border-radius:5px; font-size:12px; }
 
   .mini-btn { background:transparent; border:1px solid var(--border); color:var(--dim); border-radius:9px; padding:6px 11px; font-size:12.5px; cursor:pointer; flex-shrink:0; white-space:nowrap; }
   .mini-btn:hover { border-color:var(--accent); color:var(--text); }
@@ -286,8 +281,6 @@
     </div>
   </nav>
 
-  <div class="tip"><div class="tip-lead">{{SUBTITLE}}</div>{{TIP}}</div>
-
   <div class="section-title" id="secCurrent">
     <div class="bar"></div>
     <h2>当前桌面端账号</h2>
@@ -309,7 +302,6 @@
   <div class="add-card" id="secAdd">
     <div class="add-head" onclick="toggleAdd()">
       <span class="add-title">＋ 添加账号</span>
-      <span class="hint" id="addState">{{ADD_HINT}}</span>
     </div>
     <div class="add-body" id="addBody" style="display:none;">
       <label class="add-label">{{FILE_LABEL}}</label>
@@ -377,8 +369,10 @@
 <script>
 const UI = { authDir: "{{AUTH_DIR}}", cmd: "{{CMD}}", credits: "{{CREDITS}}", checkin: "{{CHECKIN}}",
              migrate: "{{MIGRATE}}", openClient: "{{OPEN_CLIENT}}", refresh: "{{REFRESH}}",
-             view: "{{VIEW}}" };
-// 「打开客户端」只在 Trae 侧显示（WorkBuddy 侧按用户要求去掉）
+             openClientRow: "{{OPEN_CLIENT_ROW}}", view: "{{VIEW}}" };
+// 导航栏的「打开客户端」：由 OPEN_CLIENT 单独控制。
+// 2026-09-21 起它与「当前账号行」那个按钮**分开控制** —— 国服/国际服只显示行内那个，
+// 导航栏的仍不显示（用户此前明确要求去掉），Trae 侧两个都在。
 if(UI.openClient!=='1'){
   var _ob=document.getElementById('openClientBtn');
   if(_ob) _ob.style.display='none';
@@ -476,8 +470,11 @@ function closeThisTab(){
 
 // ---- 打开 WorkBuddy 客户端 ------------------------------------------------
 async function doOpenClient(){
+  // 只挑**可见**的按钮：导航栏那个在国服/国际服从不显示，把"打开中…"写到一个
+  // display:none 的按钮上，用户什么反馈都看不到（2026-09-21）。
   var btns=[document.getElementById('openClientBtn')].concat(
-    [].slice.call(document.querySelectorAll('.acts .btn[onclick*="doOpenClient"]')));
+    [].slice.call(document.querySelectorAll('.acts .btn[onclick*="doOpenClient"]')))
+    .filter(function(b){ return b && b.style.display!=='none'; });
   btns.forEach(function(b){ if(b){ b.disabled=true; } });
   var old=btns[0]?btns[0].textContent:null;
   if(btns[0]) btns[0].textContent='打开中…';
@@ -492,13 +489,26 @@ async function doOpenClient(){
   }
 }
 
+// 2026-09-22：fetch 在网络层失败时抛的是浏览器原生 TypeError("Failed to fetch") ——
+// 真实含义是「本地服务没起 / 端口变了 / 服务进程卡死」，但用户看到这四个英文单词
+// 只会以为功能坏了。统一翻译成人话，省得再来回问一次。
+function netFail(e){
+  const raw=(e && e.message)||String(e);
+  if(/failed to fetch|networkerror|load failed/i.test(raw))
+    return new Error('连不上本地服务（它可能没在跑，或端口变了）');
+  return (e instanceof Error) ? e : new Error(raw);
+}
 async function req(path){
-  const r = await fetch(path);
+  let r;
+  try{ r = await fetch(path); }catch(e){ throw netFail(e); }
   if(!r.ok) throw new Error('HTTP '+r.status);
   return r.json();
 }
 async function post(path, data){
-  const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Switcher-Token':(window.SWITCHER_TOKEN||'')},body:JSON.stringify(data||{})});
+  let r;
+  try{
+    r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Switcher-Token':(window.SWITCHER_TOKEN||'')},body:JSON.stringify(data||{})});
+  }catch(e){ throw netFail(e); }
   if(!r.ok) throw new Error('HTTP '+r.status);
   return r.json();
 }
@@ -540,16 +550,27 @@ function fmtNum(v){
 // 所以删掉「登录态 剩余 X 天」之后它仍然有意义、继续显示。
 // 但"快过期"这个安全信号不能跟着一起丢：剩余不足 3 天时把标签标成红色，
 // 具体天数放进 title，不占版面。
-function ttlTag(src, expiresAt, rd){
+function ttlTag(src, expiresAt, rd, ttlDays){
   src = src||'';
-  if(!src) return '';
-  const short = src!=='oneid_login';
+  // 2026-09-21：签发方不一定给 token_source（国服部分账号、国际服全部账号都没有）。
+  // 那种情况用后端算好的 ttl_days（= JWT 的 exp-iat，服务端签发的权威时长）兜底，
+  // 否则这些账号的「长期/短期」标签会整块消失。
+  const byDays = !src && ttlDays!=null && ttlDays>0;
+  if(!src && !byDays) return '';
+  // 长/短的分界取 50 天：国服是 55（oneid_login）/ 30（enterprise_switch），
+  // 国际服实际签发约 362 天，也落在"长期"这一侧。
+  const short = src ? src!=='oneid_login' : ttlDays<50;
   if(rd===undefined) rd = remainDays(expiresAt);
   const days=(rd!=null&&rd>=0)?Math.round(rd):0;
   // rd<3 包含已过期（负数）—— 原来 .exp.warn 的判定就是 rd<3
   const soon = rd!=null && rd<3;
-  const text = short ? '短期 '+(days?days+'天':'通道') : '长期 '+(days?days+'天':'55天');
-  const tip = '签发通道 token_source=' + src
+  // ⚠️ 兜底别再写死 '55天'：国服部分账号、国际服**全部**账号都没有 token_source，
+  //    天数要靠 ttl_days；两者都拿不到时说「长期」即可 —— 写死一个数字会误导
+  //    （国际服实际签发约 362 天，见 AUDIT_2026-09-24.md P3-17）。
+  const tail = days ? days+'天' : (byDays ? ttlDays+'天' : '');
+  const text = short ? ('短期 '+(tail||'通道')) : ('长期'+(tail?' '+tail:''));
+  const tip = (byDays ? '签发时长 '+ttlDays+' 天（按 JWT exp-iat 推算，该账号无 token_source 字段）'
+                      : '签发通道 token_source=' + src)
             + (soon ? (rd>=0 ? '；登录态剩余 ' + rd.toFixed(1) + ' 天，建议尽快续期'
                              : '；登录态已过期，请重新登录该账号') : '');
   return `<span class="tag-ttl${short?' short':''}${soon?' soon':''}" title="${esc(tip)}">${esc(text)}</span>`;
@@ -575,7 +596,10 @@ function totalRemainHtml(file){
 
 function creditsBlock(file){
   if(UI.credits!=='1') return '';
-  if(!file) return '<div class="credits"><div class="credits-msg">该账号不在账号库中，无积分数据</div></div>';
+  // 本次刷新失败时，下面渲染出来的都是**上一轮**的数据 —— 必须说出来，
+  // 否则用户以为看到的是最新的（见 AUDIT_2026-09-24.md P3-21）。
+  const stale=creditsStale?'<div class="credits-msg err">积分刷新失败，以下为上次查询结果</div>':'';
+  if(!file) return stale+'<div class="credits"><div class="credits-msg">该账号不在账号库中，无积分数据</div></div>';
   const c=creditsMap[file];
   if(!c) return '<div class="credits"><div class="credits-pending">积分读取中…</div></div>';
   if(!c.ok){
@@ -584,7 +608,7 @@ function creditsBlock(file){
   // 标题行整行删掉：总剩余积分已移到左侧身份列，原来的小标题文字按用户要求去掉
   const items=c.items||[];
   if(!items.length){
-    return '<div class="credits"><div class="credits-msg">暂无可用积分包</div></div>';
+    return stale+'<div class="credits"><div class="credits-msg">暂无可用积分包</div></div>';
   }
   let h='<div class="credits">';
   items.forEach(function(it){
@@ -604,7 +628,7 @@ function creditsBlock(file){
       +' 剩余'+esc(it.remain_percent)+'%</span></div>'
       +'</div>';
   });
-  return h+'</div>';
+  return stale+h+'</div>';
 }
 
 function checkinBlock(file){
@@ -618,6 +642,9 @@ function checkinBlock(file){
   return '<div class="ck '+cls+'"><span class="dot"></span>'+esc(c.msg||(c.checked_in?'今日已签到':'今日未签到'))+'</div>';
 }
 
+// 上一轮积分查询是否失败：失败时 creditsMap 里还是**旧数据**，必须标记出来，
+// 否则旧积分会继续被当成最新值渲染（见 AUDIT_2026-09-24.md P3-21）。
+let creditsStale=false;
 async function loadCredits(force){
   if(UI.credits!=='1') return;
   const btn=document.getElementById('credBtn');
@@ -628,8 +655,12 @@ async function loadCredits(force){
     (d.accounts||[]).forEach(function(a){ map[a.file]=a; });
     creditsMap=map;
     creditsTs=d.ts||'';
+    creditsStale=false;
     if(btn) btn.textContent='↻ 刷新积分';
   }catch(err){
+    // ⚠️ 原先这里只改按钮文案、不动 creditsMap —— 旧积分继续当最新值显示，
+    //    用户以为刷新成功了。标记陈旧，由 creditsBlock 显式提示。
+    creditsStale=true;
     if(btn) btn.textContent='积分查询失败，点击重试';
   }finally{
     if(btn) btn.disabled=false;
@@ -679,7 +710,11 @@ async function doRefreshAll(){
 let lastCurrent=null, lastList=[];
 function currentFile(){
   const c=lastCurrent && lastCurrent[0];
-  if(!c || c.ok===false || !c.uid) return '';
+  // ⚠️ **不能因为 ok===false 就返回 ''**：加密登录态（客户端 5.6.2+ 字段保护）下 ok 恒为
+  // false，但 uid 仍是明文 —— 用它照样能在账号库里定位到对应文件。返回 '' 有两个后果：
+  //   ①「当前账号」行拿不到积分（totalRemainHtml(file) 拿空串）
+  //   ② 列表里当前账号**重复出现一条**（filter 失效），且提示不显示"账号库中：xxx"
+  if(!c || !c.uid) return '';
   return fileForUid(c.uid);
 }
 async function load(){
@@ -704,7 +739,7 @@ function rowHtml(o){
   if(o.isCurrent) tags.push('<span class="tag-active">当前</span>');
   else if(!o.ok) tags.push('<span class="tag-unsafe">不可用</span>');
   const rd = o.ok ? remainDays(o.expires_at) : null;
-  const ttl = o.ok ? ttlTag(o.token_source, o.expires_at, rd) : '';
+  const ttl = o.ok ? ttlTag(o.token_source, o.expires_at, rd, o.ttl_days) : '';
   if(ttl) tags.push(ttl);
 
   // 「登录态 剩余 X 天」按用户要求删除（标签和天数都不再显示）。
@@ -714,10 +749,12 @@ function rowHtml(o){
     ? '<div class="exp">' + totalRemainHtml(o.file) + '</div>'
     : '<div class="reason">'+esc(o.reason||'不可用')+'</div>';
 
-  // 「打开客户端」只在 Trae 侧显示（WorkBuddy 侧按用户要求去掉），
-  // 由 UI.openClient 开关控制；列表行则只有切换/删除。
+  // 「当前账号行」的「打开客户端」：由 UI.openClientRow 单独控制（与导航栏那个分开）。
+  // 2026-09-21 起国服/国际服都要显示它 —— 切号后客户端需要重新读登录态，
+  // 而这个按钮开的就是**本通道**那个客户端（进程名按通道区分，不会开错）。
+  // 列表行（非当前账号）则只有切换/删除。
   const acts = o.isCurrent
-    ? (UI.openClient==='1'
+    ? (UI.openClientRow==='1'
        ? '<div class="acts">'
          + '<button class="btn ghost" onclick="doOpenClient()" '
          + 'title="启动客户端（切号后需要它重新读取登录态）">&#9654; 打开客户端</button>'
@@ -746,7 +783,25 @@ function rowHtml(o){
     + '</div>';
 }
 
-function renderAll(){ renderCurrent(); renderAccounts(); }
+let _renderPending=false;
+function renderAll(){
+  // ⚠️ 首屏三个请求（load / loadCredits / loadCheckin）并行发出，谁先回来谁先调这里。
+  //    服务端启动会预热积分缓存 → credits 常先返回，此时 lastCurrent 仍是 null、
+  //    lastList 仍是空数组，于是 renderCurrent / renderAccounts 会渲染
+  //    「无法获取桌面端当前账号。」「wb_auth\ 目录下没有账号文件。」——
+  //    用户每次打开页面先看到一段**假故障**。数据还没到就什么都不画，
+  //    等真正到货的那次调用再渲染（见 AUDIT_2026-09-24.md P2-10）。
+  if(!lastCurrent && !(lastList && lastList.length)) return;
+  // 同一帧内的多次调用合并成一次：renderAll 会全量重建 #curList + #acctList，
+  // 而「首屏三请求 + settleAfterSwitch 最多 6 次轮询」会连着触发，全量重排可达 8 次
+  // （见 AUDIT_2026-09-24.md P3-20）。
+  if(_renderPending) return;
+  _renderPending=true;
+  requestAnimationFrame(function(){
+    _renderPending=false;
+    renderCurrent(); renderAccounts();
+  });
+}
 
 function renderCurrent(){
   const box=document.getElementById('curList');
@@ -758,9 +813,23 @@ function renderCurrent(){
   }
   const file=currentFile();
   if(c.ok===false){
-    document.getElementById('curHint').textContent='';
-    box.innerHTML='<div class="empty">'+esc(c.reason||'桌面端当前未登录')+'</div>';
-    return;
+    // 加密登录态（客户端 5.6.2+ 字段保护）：登录态文件里的 token 读不出来。
+    //   ① c.live=true —— 已从客户端进程内存读到明文凭据，昵称/通道标签/剩余天数/积分
+    //      全都能给，与明文登录态**没有任何可见差别**。加密只是"本工具怎么拿到凭据"的
+    //      实现细节，不该出现在界面上 → 不返回，直接走下面正常的渲染路径。
+    //   ② c.live=false —— 内存也读不到（客户端没在跑 / 权限不足），只剩明文 uid 能反查
+    //      昵称，这时才需要把降级原因说出来。
+    if(!c.live){
+      document.getElementById('curHint').textContent='';
+      if(c.encrypted){
+        box.innerHTML='<div class="empty">当前账号：<b>'+esc(c.nickname||'未知')+'</b>'
+          +'<div class="meta">'
+          +esc(c.reason||'凭据已被客户端加密，本工具读不到 token')+'</div></div>';
+        return;
+      }
+      box.innerHTML='<div class="empty">'+esc(c.reason||'桌面端当前未登录')+'</div>';
+      return;
+    }
   }
   // 逐项判断缺哪些能力：国际服现在**有积分、没签到**，写死"积分与签到"
   // 会把它的正常状态说成缺陷。
@@ -770,11 +839,14 @@ function renderCurrent(){
   document.getElementById('curHint').textContent = file
     ? '（账号库中：'+file+'）'
     : (lack.length ? '（不在账号库中，无法显示'+lack.join('与')+'）' : '（不在账号库中）');
-  box.innerHTML = rowHtml({
+  // 2026-09-21：这里原来是手写白名单，漏了 ttl_days —— 结果「当前账号」行永远
+  // 拿不到后端算好的签发时长，token_source 为空的账号（国服account-e、国际服全部）
+  // 就整块掉标签。改成以接口对象为底、只覆盖差异项，以后再加字段也不会漏。
+  box.innerHTML = rowHtml(Object.assign({}, c, {
     isCurrent:true, ok:true, file:file,
     nickname:c.nickname||c.file||'未知',
     token_source:c.token_source||'', expires_at:c.expires_at,
-  });
+  }));
 }
 
 function renderAccounts(){
@@ -788,13 +860,14 @@ function renderAccounts(){
     const onlyCurrent = (lastList||[]).length > 0;
     box.innerHTML='<div class="empty">' + (onlyCurrent
       ? '账号库里只有当前正在使用的这个账号。'
-      : UI.authDir+'\\ 目录下没有账号文件。{{EMPTY_HINT}}') + '</div>';
+      : UI.authDir+'\\ 目录下没有账号文件。') + '</div>';
     return;
   }
-  box.innerHTML = list.map(a=>rowHtml({
+  // 同 renderCurrent：以接口对象为底透传，别再手写白名单（ttl_days 就是这么丢的）。
+  box.innerHTML = list.map(a=>rowHtml(Object.assign({}, a, {
     isCurrent:false, ok:!!a.ok, file:a.file, nickname:a.nickname,
     token_source:a.token_source||'', expires_at:a.expires_at, reason:a.reason,
-  })).join('');
+  }))).join('');
 }
 
 let pendingDeleteFile=null, pendingDeleteNick='';
@@ -802,7 +875,9 @@ function toggleAdd(force){
   const body=document.getElementById('addBody');
   const show = force===undefined ? (body.style.display==='none') : force;
   body.style.display = show?'flex':'none';
-  document.getElementById('addState').textContent = show ? '导入后点击保存，内容会写入 '+UI.authDir+'\\' : "{{ADD_HINT}}";
+  // addState 占位元素已移除（2026-09-21 清理 tip 区块），仅在元素存在时更新。
+  const hint=document.getElementById('addState');
+  if(hint){ hint.textContent = show ? '导入后点击保存，内容会写入 '+UI.authDir+'\\' : ''; }
 }
 function confirmDelete(file, nick){
   pendingDeleteFile=file; pendingDeleteNick=nick;
@@ -895,7 +970,9 @@ async function startSwitch(file, nick, btn){
   catch(e){ /* 预览失败不该阻断切换 */ }
   if(btn){ btn.disabled=false; btn.textContent='切换到该账号'; }
   if(!pv || pv.ok===false || !pv.needed){
-    if(pv && pv.ok===false) toast('迁移预览不可用，将只切换账号：'+esc(pv.message||''),'err');
+    // ⚠️ 这里**不要** esc()：toast 内部用的是 el.textContent（见 :518），
+    //    再转义一次会把 `&` 之类显示成 `&amp;`（见 AUDIT_2026-09-24.md P3-17）。
+    if(pv && pv.ok===false) toast('迁移预览不可用，将只切换账号：'+(pv.message||''),'err');
     return doSwitch(file, nick, btn, null);
   }
   migCtx={file:file, nick:nick, preview:pv};
@@ -992,7 +1069,11 @@ async function doSwitch(file, nick, btn, mig){
 function currentMatches(nick){
   const c = lastCurrent && lastCurrent[0];
   if(!c) return false;
-  return !!nick && c.ok!==false && c.nickname===nick;
+  // ⚠️ 必须带 `|| c.live`，与 renderCurrent()（上面）和 ui_hub.loadCurrent() 保持一致。
+  //    客户端 5.6.2+ 的静态字段保护下 `ok` 恒为 false，凭据是读客户端进程内存拿到的
+  //    （`live: true`）。这里漏判会让切号后的 settleAfterSwitch 轮询全部判不匹配 ——
+  //    白打 12 个请求、还不给任何提示，用户以为切号没生效。
+  return !!nick && (c.ok!==false || c.live) && c.nickname===nick;
 }
 async function settleAfterSwitch(nick, tries=6, gap=500){
   for(let i=0;i<tries;i++){

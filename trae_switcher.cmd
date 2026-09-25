@@ -28,10 +28,15 @@ REM Single instance is enforced inside the service (named mutex, see
 REM DESIGN_single_instance.md). The mutex name carries the "tw" suffix, so this
 REM switcher and the WorkBuddy one can run side by side.
 python tw_ui_server.py --serve
-if "%ERRORLEVEL%"=="1" (
+set RC=%ERRORLEVEL%
+if "%RC%"=="1" (
     echo.
     echo [ERROR] Could not start the service ^(see the message above^).
     pause
 )
 echo.
 echo Service stopped.
+REM Must exit with an explicit code: without it the script's exit status comes
+REM from the LAST command (echo), which is always 0 -- scheduled tasks and any
+REM caller checking %ERRORLEVEL% would treat a failed start as success.
+exit /b %RC%

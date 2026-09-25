@@ -1,4 +1,4 @@
-# install_refresh_task.ps1 —— 注册「账号自动续期」计划任务
+﻿# install_refresh_task.ps1 —— 注册「账号自动续期」计划任务
 #
 # 用法（PowerShell，无需管理员，仅当前用户）：
 #   powershell -ExecutionPolicy Bypass -File install_refresh_task.ps1

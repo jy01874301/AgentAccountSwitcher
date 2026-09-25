@@ -32,8 +32,8 @@
 `user_id` 就是登录态里的 `account.uid`（OneID 账号 uuid）。本机实测：
 
 ```
-workbuddy-desktop-ai.info  -> account.uid = 7aac45de-1d55-436c-b779-0317b093c580  (本次对话所在)
-workbuddy-desktop.info     -> account.uid = b592a5dd-3f86-4360-b0cc-4df5b196098b  (切换器管的那个)
+workbuddy-desktop-ai.info  -> account.uid = 66666666-6666-4666-8666-666666666666  (本次对话所在)
+workbuddy-desktop.info     -> account.uid = 33333333-3333-4333-8333-333333333333  (切换器管的那个)
 ```
 
 ### 结论
@@ -61,9 +61,9 @@ workbuddy-desktop.info     -> account.uid = b592a5dd-3f86-4360-b0cc-4df5b196098b
 ### 1.2 弹框内容
 
 ```
-┌─ 切换到 wtnong ──────────────────────────────────────────┐
+┌─ 切换到 account-c ──────────────────────────────────────────┐
 │                                                          │
-│  当前账号 jaynong 下的本地数据                            │
+│  当前账号 account-f 下的本地数据                            │
 │                                                          │
 │    会话      7 个（其中 2 个属于本项目 wb_switcher）       │
 │    账号记忆  1 份（254 B）                                │
@@ -113,7 +113,7 @@ workbuddy-desktop.info     -> account.uid = b592a5dd-3f86-4360-b0cc-4df5b196098b
    ↓  失败 → 反向恢复 db 快照与目录，报错并保留现场
 ⑤ 校验（以新 uid 查 sessions；抽查每个会话的 jsonl 首行/末行可读）
    ↓
-toast：已切换到 wtnong，并迁移 6 个会话 / 1 份记忆 / 4 项设置
+toast：已切换到 account-c，并迁移 6 个会话 / 1 份记忆 / 4 项设置
        （1 个运行中的会话已跳过）
 ```
 
@@ -152,7 +152,7 @@ toast：已切换到 wtnong，并迁移 6 个会话 / 1 份记忆 / 4 项设置
 
 ```
 会话 ID 974defc8-…  出现在 93 个文件
-账号 uid 7aac45de-… 出现在 37 个文件
+账号 uid 66666666-… 出现在 37 个文件
 ```
 
 按「是不是权威源」重新分档：
@@ -432,7 +432,7 @@ function createHeader(userId, masterKey) {
 computeCheck(uid, salt) = base64( sha256(uid_bytes + salt)[:16] )
 
 1271b467-…  stored=AVRScY1lp7vfqZ0HkFEK/Q==  计算=AVRScY1lp7vfqZ0HkFEK/Q==  ✅
-7aac45de-…  stored=Faap1plU32jEc9jp7xOWGQ==  计算=Faap1plU32jEc9jp7xOWGQ==  ✅
+66666666-…  stored=Faap1plU32jEc9jp7xOWGQ==  计算=Faap1plU32jEc9jp7xOWGQ==  ✅
 b0ca8ca7-…  stored=N/NNGfLGPk9Zp7PHR3stDA==  计算=N/NNGfLGPk9Zp7PHR3stDA==  ✅
 f19b102d-…  stored=/HUVOJpdLaGijnZPZ2ikZw==  计算=/HUVOJpdLaGijnZPZ2ikZw==  ✅
 ```
@@ -614,7 +614,7 @@ if (computeCheck(Buffer.from(userId,"utf8"), salt) !== header.userIdCheck)
 ### 8.4 `account-snapshot.json` 不改会"认错人"
 
 ```json
-{ "primary": { "uid": "7aac45de-…", "nickname": "jaynong", "type": "personal",
+{ "primary": { "uid": "66666666-…", "nickname": "account-f", "type": "personal",
                "editionType": "free", "isPro": false, "savedAt": 1789668359625 } }
 ```
 
