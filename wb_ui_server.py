@@ -907,14 +907,59 @@ def client_status(ch, fresh=False):
     return out
 
 
-def open_client(ch):
-    """打开**该通道的**客户端；已在运行则把它切到前台，不重复启动。
+def _spawn_client(ch, procs=None):
+    """启动该通道的客户端。返回 (ok, exe_or_None, message)。"""
+    label = "%s客户端" % ch.server
+    # 复用调用方已枚举的 procs：否则 find_client_exe 内部会再跑一次 tasklist（+284 ms）
+    exe = find_client_exe(ch, procs if procs is not None else common.list_processes())
+    if not exe:
+        return False, None, ("找不到%s（%s）。"
+                             "如果你装在了非标准位置，请手动启动一次。" % (label, ch.client_exe))
+    try:
+        # DETACHED_PROCESS：客户端不随本工具退出而结束，也不继承控制台
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen([str(exe)], cwd=str(exe.parent), close_fds=True,
+                         creationflags=flags)
+    except OSError as e:
+        return False, None, "启动客户端失败：%s" % common.scrub(e)
+    invalidate_client_status(ch)
+    return True, exe, "已启动%s：%s" % (label, exe)
+
+
+def _wait_client_window(ch, log=None, timeout=8.0):
+    """等客户端主窗口出现（最多 timeout 秒），出现就置前。返回是否等到。
+
+    启动后立刻抢前台是没用的 —— 那时窗口还没建出来。早先 `open_client` 启动完直接
+    返回，用户若在这几秒里再点一次按钮，就会插进窗口初始化中途去
+    ShowWindow / SetForegroundWindow，把窗口状态搅乱。
+    """
+    log = log or (lambda *a: None)
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        time.sleep(0.3)
+        pids = _client_pids(common.list_processes(), ch)
+        if pids and common.client_main_windows(pids, include_hidden=False):
+            common.activate_windows_of(pids)
+            log("       客户端窗口已出现，已置前")
+            return True
+    log("       等待客户端窗口超时（%gs），跳过置前" % timeout)
+    return False
+
+
+def open_client(ch, log=None, restart_on_failure=True):
+    """打开**该通道的**客户端；已在运行则把它唤到前台，不重复启动。
 
     切号之后客户端需要重新读取登录态 —— 但它自己不一定在跑，
     所以这里给一个一键入口，而不是让用户去开始菜单找。
     返回 (ok, message)。
+
+    `restart_on_failure`：客户端窗口**原本收在系统托盘里**、唤出后又确认没拿到前台时，
+    是否自动重启客户端（重开的窗口一定可交互）。自检里传 False，免得真去重启
+    用户正在用的客户端。
     """
     ch = channel(ch)
+    log = log or (lambda *a: None)
     label = "%s客户端" % ch.server
     procs = common.list_processes()
     if procs is None:
@@ -925,28 +970,39 @@ def open_client(ch):
         # 这种情况必须走"唤出"而不是"切前台"，否则点了没反应。
         hidden = [w for w in common.client_main_windows(pids)
                   if not w["visible"]]
-        if common.focus_windows_of(pids):
-            how = "窗口原先收在系统托盘里，已把它显示出来" if hidden \
-                else "已切到前台"
-            return True, "%s已在运行（pid %s），%s" % (label, pids[0], how)
-        return True, ("%s已在运行（pid %s），但没找到它的主窗口，"
-                      "请从任务栏/托盘点开" % (label, pids[0]))
+        # ⚠️ 这里用 activate_windows_of 而不是 focus_windows_of：后者把"看得见"当成功，
+        #    而托盘里的窗口被外部 ShowWindow 唤出后**可能看得见却收不到输入**
+        #    （Chromium 内部仍认为窗口隐藏/被遮挡，输入事件进不了渲染进程）——
+        #    用户实测表现就是「内容正常但完全点不动」。
+        found, fg_ok, _hwnd = common.activate_windows_of(pids)
+        if not found:
+            return True, ("%s已在运行（pid %s），但没找到它的主窗口，"
+                          "请从任务栏/托盘点开" % (label, pids[0]))
+        if fg_ok is False and hidden and restart_on_failure:
+            # 「唤出隐藏窗口」这条路不可靠 → 重启客户端，重开的窗口一定可交互
+            log("       窗口收在托盘且唤出后未拿到前台 → 重启客户端")
+            ok_c, msg_c, _was = close_client(ch, log=log)
+            if not ok_c:
+                return True, ("%s窗口唤出后可能无法操作，自动重启也失败（%s）；"
+                              "请手动结束它再重开" % (label, msg_c))
+            invalidate_client_status(ch)
+            ok_l, _exe, msg_l = _spawn_client(ch)
+            if not ok_l:
+                return False, msg_l
+            _wait_client_window(ch, log)
+            return True, ("%s的窗口原先收在系统托盘里、唤出后无法操作，"
+                          "已自动重启客户端" % label)
+        how = "窗口原先收在系统托盘里，已把它显示出来" if hidden \
+            else "已切到前台"
+        if fg_ok is False:
+            how += "；但它没能抢到前台，若点不动请右键托盘图标选择打开"
+        return True, "%s已在运行（pid %s），%s" % (label, pids[0], how)
 
-    # 复用上面已枚举的 procs：否则 find_client_exe 内部会再跑一次 tasklist（+284 ms）
-    exe = find_client_exe(ch, procs)
-    if not exe:
-        return False, ("找不到%s（%s）。"
-                       "如果你装在了非标准位置，请手动启动一次。" % (label, ch.client_exe))
-    try:
-        # DETACHED_PROCESS：客户端不随本工具退出而结束，也不继承控制台
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        subprocess.Popen([str(exe)], cwd=str(exe.parent), close_fds=True,
-                         creationflags=flags)
-    except OSError as e:
-        return False, "启动客户端失败：%s" % common.scrub(e)
-    invalidate_client_status(ch)
-    return True, "已启动%s：%s" % (label, exe)
+    ok_l, _exe, msg_l = _spawn_client(ch, procs)
+    if not ok_l:
+        return False, msg_l
+    _wait_client_window(ch, log)
+    return True, msg_l
 
 
 def close_client(ch, graceful_wait=8.0, total_wait=25.0, log=None):

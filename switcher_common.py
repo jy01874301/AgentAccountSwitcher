@@ -741,6 +741,11 @@ _MIN_MAIN_W, _MIN_MAIN_H = 200, 100
 
 SW_SHOWNORMAL, SW_SHOWMAXIMIZED = 1, 3
 
+# activate_windows_of 用到的常量（抢前台 / SetWindowPos）
+ASFW_ANY = 0xFFFFFFFF          # AllowSetForegroundWindow：允许任意进程抢前台
+VK_MENU, KEYEVENTF_KEYUP = 0x12, 0x2
+SWP_NOSIZE, SWP_NOMOVE, SWP_SHOWWINDOW = 0x0001, 0x0002, 0x0040
+
 
 def client_main_windows(pids, include_hidden=True):
     """挑出属于这些 pid 的 **客户端主窗口**，按可用性排序返回。
@@ -865,6 +870,84 @@ def focus_windows_of(pids, sw_restore=9):
         return bool(u32.IsWindowVisible(win["hwnd"])) or ok
     except Exception:  # noqa: BLE001
         return False
+
+
+def activate_windows_of(pids, sw_restore=9):
+    """唤出客户端主窗口，并**尽量确认它真的被激活**。返回 `(found, fg_ok, hwnd)`。
+
+    - `found` —— 找到了主窗口（含"收在托盘里、已被唤出来"的情况）
+    - `fg_ok` —— `True`=确认已拿到前台；`False`=明确没拿到；
+                 `None`=读不到前台状态（非交互桌面 / 权限受限），**无法判定**
+    - `hwnd`  —— 主窗口句柄（`found=False` 时是 `None`）
+
+    ⚠️ 与 `focus_windows_of` 的分工：那个把「窗口看得见」当成功（调用方要的是"能看见"），
+    本函数额外确认「拿到前台」—— 因为 Electron 客户端被**外部** `ShowWindow` 从托盘
+    唤出后，窗口可能看得见却收不到输入（Chromium 内部仍认为窗口隐藏/被遮挡，输入事件
+    进不了渲染进程），表现正是"内容正常但完全点不动"。
+
+    抢前台顺序：`SetForegroundWindow` → 失败则模拟一次 Alt 键（Windows 认可的
+    "用户正在操作"信号，用来解除前台锁）再重试，最多两轮。
+    """
+    if os.name != "nt" or not pids:
+        return False, None, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u32.SetForegroundWindow.restype = wintypes.BOOL
+        u32.GetForegroundWindow.restype = wintypes.HWND
+        u32.BringWindowToTop.argtypes = [wintypes.HWND]
+        u32.SetActiveWindow.argtypes = [wintypes.HWND]
+        u32.SetFocus.argtypes = [wintypes.HWND]
+        u32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                     wintypes.UINT]
+        u32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
+        u32.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, wintypes.DWORD,
+                                    ctypes.c_void_p]
+
+        cands = client_main_windows(pids)
+        if not cands:
+            return False, None, None
+        win = cands[0]
+        hwnd = win["hwnd"]
+        # 隐藏的窗口要先 ShowWindow 现身；用 showCmd 对应的命令，
+        # 免得把"最大化后收进托盘"的窗口给还原成小窗。
+        cmd = (SW_SHOWMAXIMIZED if win["maximized"] else SW_SHOWNORMAL) \
+            if not win["visible"] else sw_restore
+        u32.ShowWindow(hwnd, cmd)
+        u32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                         SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW)
+
+        u32.AllowSetForegroundWindow(ASFW_ANY)
+        ok = bool(u32.SetForegroundWindow(hwnd))
+        fg = u32.GetForegroundWindow()
+        tries = 0
+        while fg != hwnd and tries < 2:
+            # 前台锁：先模拟一次 Alt 按下/抬起，系统才认可这次抢前台
+            u32.keybd_event(VK_MENU, 0, 0, None)
+            time.sleep(0.03)
+            u32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, None)
+            time.sleep(0.03)
+            ok = bool(u32.SetForegroundWindow(hwnd))
+            u32.BringWindowToTop(hwnd)
+            u32.SetActiveWindow(hwnd)
+            u32.SetFocus(hwnd)
+            time.sleep(0.15)
+            fg = u32.GetForegroundWindow()
+            tries += 1
+
+        if fg == hwnd:
+            fg_ok = True
+        elif fg == 0:
+            fg_ok = None      # 读不到前台状态 → 不判定为失败（避免误触发重启）
+        else:
+            fg_ok = False
+        return (bool(u32.IsWindowVisible(hwnd)) or ok), fg_ok, hwnd
+    except Exception:  # noqa: BLE001
+        return False, None, None
 
 
 def close_windows_of(pids, wm_close=0x0010):

@@ -521,10 +521,19 @@ python wb_ui_server.py --channel wbai --switch workbuddyai-xxx.info
 切号之后客户端需要重新读取登录态，但它不一定在跑 —— 所以给一个一键入口，
 而不是让用户去开始菜单找。
 
-- **已在运行** → 尝试把它的窗口切到前台（`EnumWindows` + `SetForegroundWindow`）。
-  ⚠️ Windows 有**前台锁定**，`SetForegroundWindow` 可能被系统拒绝；
-  这时消息会如实说"系统不允许本程序把它切到前台，请从任务栏点开"，不会假装成功。
-- **没在运行** → 定位 exe 并 `DETACHED_PROCESS` 启动（不随本工具退出而结束）。
+- **已在运行、窗口可见** → 把它切到前台（`EnumWindows` + `SetForegroundWindow`）。
+  ⚠️ Windows 有**前台锁定**：抢前台先试 `SetForegroundWindow`，失败则模拟一次 Alt 键
+  （系统认可的"用户正在操作"信号）解除锁定后重试，**确认真的拿到前台**才算成功。
+- **已在运行、窗口收在系统托盘** → 先唤出窗口，再确认是否真的拿到前台。
+  ⚠️ Electron 客户端被**外部** `ShowWindow` 唤出后，Chromium 内部仍认为窗口隐藏/被遮挡，
+  **输入事件进不了渲染进程** —— 表现为「窗口有内容、鼠标键盘全无反应」。
+  所以这种情况下若确认没抢到前台，会**自动重启客户端**（重开的窗口一定可交互），
+  而不是把一个点不动的窗口留给用户。
+- **没在运行** → 定位 exe 并 `DETACHED_PROCESS` 启动（不随本工具退出而结束），
+  然后轮询等主窗口出现（最多 8 秒）再置前 —— 避免用户在这几秒里二次点击、插进初始化中途。
+
+> 自检里用 `open_client(..., restart_on_failure=False)` 关掉"自动重启"这个副作用，
+> 免得跑一次 `smoke_test.py` 就把用户正在用的客户端重启掉。
 
 exe 定位只从**固定候选位置**和**正在运行的进程路径**里找，不接受任何外部输入：
 运行中进程的镜像路径 → `%ProgramFiles%` / `%ProgramFiles(x86)%` / `%LOCALAPPDATA%`
