@@ -1,2 +1,2 @@
-# Agent_Switcher
+# AgentAccountSwitcher
 WorkBuddy Trae Work Account Switcher
