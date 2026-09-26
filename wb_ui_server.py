@@ -947,6 +947,26 @@ def _wait_client_window(ch, log=None, timeout=8.0):
     return False
 
 
+def _wait_client_shown(old_pids, log=None, timeout=4.0):
+    """等**已在运行**的那个客户端把托盘窗口显示出来（即单实例唤醒是否生效）。
+
+    判据是「窗口从**隐藏**变成**可见**」—— 这是 Electron 自己 `win.show()` 的结果，
+    只有它真的响应了唤醒请求才会发生。（窗口属性在故障时也可能全是正常值，
+    所以不能拿"当前状态好不好"当判据，必须看"状态有没有发生期望的变化"。）
+
+    `old_pids` 传唤醒前那批 pid —— 第二个实例启动后会自己退出，窗口属于老实例。
+    """
+    log = log or (lambda *a: None)
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        time.sleep(0.3)
+        if any(w["visible"] for w in common.client_main_windows(old_pids)):
+            log("       客户端自己把窗口显示出来了（单实例唤醒生效）")
+            return True
+    log("       等待唤醒超时（%gs），窗口仍隐藏" % timeout)
+    return False
+
+
 def open_client(ch, log=None, allow_restart=True):
     """打开**该通道的**客户端；已在运行则把它唤到前台，不重复启动。
 
@@ -969,32 +989,36 @@ def open_client(ch, log=None, allow_restart=True):
         hidden = [w for w in common.client_main_windows(pids)
                   if not w["visible"]]
         if hidden:
-            # ⚠️ **不要用外部 ShowWindow 唤出隐藏的 Electron 窗口**（2026-09-26 实测）：
-            #    这样唤出来的窗口，Win32 层**一切正常** —— visible / enabled /
-            #    不 IsHungAppWindow / DWMWA_CLOAKED=0 / showCmd 正常 /
-            #    甚至 GetGUIThreadInfo 显示 hwndActive = hwndFocus = 它自己，
-            #    但**输入事件进不了渲染进程**，表现就是「能显示但完全点不动」。
-            #    而且这个故障态**从外部观测不到**（所有窗口属性都是正常值），
-            #    拿任何一项做判据都会把它误判成"成功"（上一版就栽在这里）。
-            #    用户实测：手动右键托盘图标 → 打开 是正常的 → 所以这里直接重启客户端，
-            #    新进程的新窗口一定可交互。
+            # ⚠️ 不要用外部 ShowWindow 唤出隐藏的 Electron 窗口（2026-09-26 实测）：
+            #    这样唤出来的窗口 Win32 层**一切正常**（visible / enabled /
+            #    不 IsHungAppWindow / DWMWA_CLOAKED=0 / 甚至 hwndActive = hwndFocus = 它自己），
+            #    但**输入事件进不了渲染进程** —— 表现就是「能显示但完全点不动」。
+            #    更麻烦的是这个故障态**从外部观测不到**，拿任何窗口属性做判据都会误判成成功。
+            # 正路：**再启动一次客户端**，让它走自己的单实例唤醒（第二个实例把请求交给
+            #    已运行的实例，由它自己 win.show()）—— 不重启、1~2 秒，窗口状态完全同步。
+            #    判据用「窗口从隐藏变成可见」：这是 Electron 自己做的动作，故障时不会误判。
+            #    （用户实测：从桌面快捷方式启动 WorkBuddy 就能唤出托盘窗口。）
             if not allow_restart:
                 common.activate_windows_of(pids)
                 return True, ("%s的窗口收在系统托盘里，已把它显示出来；"
                               "若点不动请右键托盘图标选择打开" % label)
-            log("       窗口收在系统托盘 → 重启客户端（外部唤出不可靠，见 09-26 记录）")
+            log("       窗口收在系统托盘 → 启动一次客户端，等它自己把窗口唤出来")
+            _spawn_client(ch)
+            if _wait_client_shown(pids, log):
+                return True, "%s的窗口原先收在系统托盘里，已唤出（未重启）" % label
+            # 唤醒无效 → 退回重启（重开的窗口一定可交互）
+            log("       唤醒无效 → 重启客户端")
             ok_c, msg_c, _was = close_client(ch, graceful_wait=4.0, log=log)
             if not ok_c:
                 common.activate_windows_of(pids)
-                return True, ("%s窗口收在托盘里，自动重启失败（%s）；已尝试唤出，"
-                              "若点不动请右键托盘图标选择打开" % (label, msg_c))
+                return True, ("%s窗口收在托盘里，唤醒和自动重启都没成功（%s）；"
+                              "请右键托盘图标选择打开" % (label, msg_c))
             invalidate_client_status(ch)
             ok_l, _exe, msg_l = _spawn_client(ch)
             if not ok_l:
                 return False, msg_l
             _wait_client_window(ch, log)
-            return True, ("%s的窗口原先收在系统托盘里（外部唤出后无法操作），"
-                          "已重启客户端，新窗口可正常操作" % label)
+            return True, ("%s的窗口原先收在系统托盘里，已重启客户端，新窗口可正常操作" % label)
         # 窗口本来可见 → 只置前，不重启
         found, fg_ok, _hwnd = common.activate_windows_of(pids)
         if not found:

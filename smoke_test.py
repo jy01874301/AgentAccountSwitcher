@@ -2248,9 +2248,15 @@ def main():
     check("⑤f open_client 改用 activate_windows_of（不再用只看可见的 focus_windows_of）",
           "activate_windows_of(pids)" in _src_oc2
           and "focus_windows_of(pids)" not in _src_oc2, "")
-    check("⑤f 窗口收在托盘 → 直接重启客户端（不依赖任何外部'可交互'判据）",
-          "close_client(ch, graceful_wait=4.0, log=log)" in _src_oc2
-          and "_spawn_client(ch)" in _src_oc2, "")
+    check("⑤f 窗口收在托盘 → 先「再启动一次客户端」唤醒（不重启）",
+          "_spawn_client(ch)" in _src_oc2
+          and "_wait_client_shown(pids, log)" in _src_oc2, "")
+    check("⑤f 唤醒无效才回退重启客户端",
+          "close_client(ch, graceful_wait=4.0, log=log)" in _src_oc2, "")
+    check("⑤f _wait_client_shown 判据是「窗口从隐藏变可见」（不靠窗口属性）",
+          hasattr(wb, "_wait_client_shown")
+          and 'w["visible"]' in _ins.getsource(wb._wait_client_shown)
+          and "client_main_windows" in _ins.getsource(wb._wait_client_shown), "")
     check("⑤f 自检可关掉重启副作用（allow_restart 参数）",
           "allow_restart" in _ins.signature(wb.open_client).parameters
           and "allow_restart" in _src_oc2, "")
