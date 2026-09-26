@@ -1716,9 +1716,9 @@ def main():
           and isinstance(cs.get("exe"), str) and isinstance(cs.get("running"), bool), cs)
     check("当前用户有客户端在运行时应能检出", cs["running"] is True, cs["pids"])
     before = len(cs["pids"])
-    # restart_on_failure=False：自检不去重启用户正在用的客户端（唤出失败时的兜底重启
+    # allow_restart=False：自检不去重启用户正在用的客户端（窗口收在托盘时的重启
     # 是给用户点按钮用的，见 ⑤f）；这里只验证"客户端在跑时不重复启动"这条路径。
-    ok, msg = wb.open_client(_CH_WB, restart_on_failure=False)
+    ok, msg = wb.open_client(_CH_WB, allow_restart=False)
     pids2 = wb.client_status(_CH_WB)["pids"]
     check("客户端已在运行时 open_client 不会重复启动", ok is True and len(pids2) <= before,
           "%d -> %d" % (before, len(pids2)))
@@ -2242,18 +2242,18 @@ def main():
     check("⑤f 抢前台带 Alt 键解锁（解除 Windows 前台锁的常规手法）",
           "keybd_event" in _src_act and "VK_MENU" in _src_act
           and "AllowSetForegroundWindow" in _src_act, "")
-    check("⑤f 读不到前台状态时判为未知（不误触发重启）",
+    check("⑤f 读不到前台状态时判为未知（不当成失败）",
           "fg == 0" in _src_act and "fg_ok = None" in _src_act, "")
     _src_oc2 = _ins.getsource(wb.open_client)
     check("⑤f open_client 改用 activate_windows_of（不再用只看可见的 focus_windows_of）",
           "activate_windows_of(pids)" in _src_oc2
           and "focus_windows_of(pids)" not in _src_oc2, "")
-    check("⑤f 唤出失败且窗口原在托盘 → 自动重启客户端",
-          "close_client(ch, log=log)" in _src_oc2
+    check("⑤f 窗口收在托盘 → 直接重启客户端（不依赖任何外部'可交互'判据）",
+          "close_client(ch, graceful_wait=4.0, log=log)" in _src_oc2
           and "_spawn_client(ch)" in _src_oc2, "")
-    check("⑤f 自检可关掉重启副作用（restart_on_failure 参数）",
-          "restart_on_failure" in _ins.signature(wb.open_client).parameters
-          and "restart_on_failure" in _src_oc2, "")
+    check("⑤f 自检可关掉重启副作用（allow_restart 参数）",
+          "allow_restart" in _ins.signature(wb.open_client).parameters
+          and "allow_restart" in _src_oc2, "")
     check("⑤f 启动后等窗口就绪再置前（不再启动完立刻返回）",
           hasattr(wb, "_wait_client_window")
           and "client_main_windows" in _ins.getsource(wb._wait_client_window)

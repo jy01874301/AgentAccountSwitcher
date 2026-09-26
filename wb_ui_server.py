@@ -947,16 +947,15 @@ def _wait_client_window(ch, log=None, timeout=8.0):
     return False
 
 
-def open_client(ch, log=None, restart_on_failure=True):
+def open_client(ch, log=None, allow_restart=True):
     """打开**该通道的**客户端；已在运行则把它唤到前台，不重复启动。
 
     切号之后客户端需要重新读取登录态 —— 但它自己不一定在跑，
     所以这里给一个一键入口，而不是让用户去开始菜单找。
     返回 (ok, message)。
 
-    `restart_on_failure`：客户端窗口**原本收在系统托盘里**、唤出后又确认没拿到前台时，
-    是否自动重启客户端（重开的窗口一定可交互）。自检里传 False，免得真去重启
-    用户正在用的客户端。
+    `allow_restart`：客户端窗口**收在系统托盘里**时是否允许重启客户端
+    （见下方"为什么不能外部唤出"）。自检里传 False，免得真去重启用户正在用的客户端。
     """
     ch = channel(ch)
     log = log or (lambda *a: None)
@@ -967,35 +966,43 @@ def open_client(ch, log=None, restart_on_failure=True):
     pids = _client_pids(procs, ch)
     if pids:
         # 客户端「关闭到托盘」时主窗口是隐藏的（进程在、图标在、窗口看不见）。
-        # 这种情况必须走"唤出"而不是"切前台"，否则点了没反应。
         hidden = [w for w in common.client_main_windows(pids)
                   if not w["visible"]]
-        # ⚠️ 这里用 activate_windows_of 而不是 focus_windows_of：后者把"看得见"当成功，
-        #    而托盘里的窗口被外部 ShowWindow 唤出后**可能看得见却收不到输入**
-        #    （Chromium 内部仍认为窗口隐藏/被遮挡，输入事件进不了渲染进程）——
-        #    用户实测表现就是「内容正常但完全点不动」。
-        found, fg_ok, _hwnd = common.activate_windows_of(pids)
-        if not found:
-            return True, ("%s已在运行（pid %s），但没找到它的主窗口，"
-                          "请从任务栏/托盘点开" % (label, pids[0]))
-        if fg_ok is False and hidden and restart_on_failure:
-            # 「唤出隐藏窗口」这条路不可靠 → 重启客户端，重开的窗口一定可交互
-            log("       窗口收在托盘且唤出后未拿到前台 → 重启客户端")
-            ok_c, msg_c, _was = close_client(ch, log=log)
+        if hidden:
+            # ⚠️ **不要用外部 ShowWindow 唤出隐藏的 Electron 窗口**（2026-09-26 实测）：
+            #    这样唤出来的窗口，Win32 层**一切正常** —— visible / enabled /
+            #    不 IsHungAppWindow / DWMWA_CLOAKED=0 / showCmd 正常 /
+            #    甚至 GetGUIThreadInfo 显示 hwndActive = hwndFocus = 它自己，
+            #    但**输入事件进不了渲染进程**，表现就是「能显示但完全点不动」。
+            #    而且这个故障态**从外部观测不到**（所有窗口属性都是正常值），
+            #    拿任何一项做判据都会把它误判成"成功"（上一版就栽在这里）。
+            #    用户实测：手动右键托盘图标 → 打开 是正常的 → 所以这里直接重启客户端，
+            #    新进程的新窗口一定可交互。
+            if not allow_restart:
+                common.activate_windows_of(pids)
+                return True, ("%s的窗口收在系统托盘里，已把它显示出来；"
+                              "若点不动请右键托盘图标选择打开" % label)
+            log("       窗口收在系统托盘 → 重启客户端（外部唤出不可靠，见 09-26 记录）")
+            ok_c, msg_c, _was = close_client(ch, graceful_wait=4.0, log=log)
             if not ok_c:
-                return True, ("%s窗口唤出后可能无法操作，自动重启也失败（%s）；"
-                              "请手动结束它再重开" % (label, msg_c))
+                common.activate_windows_of(pids)
+                return True, ("%s窗口收在托盘里，自动重启失败（%s）；已尝试唤出，"
+                              "若点不动请右键托盘图标选择打开" % (label, msg_c))
             invalidate_client_status(ch)
             ok_l, _exe, msg_l = _spawn_client(ch)
             if not ok_l:
                 return False, msg_l
             _wait_client_window(ch, log)
-            return True, ("%s的窗口原先收在系统托盘里、唤出后无法操作，"
-                          "已自动重启客户端" % label)
-        how = "窗口原先收在系统托盘里，已把它显示出来" if hidden \
-            else "已切到前台"
+            return True, ("%s的窗口原先收在系统托盘里（外部唤出后无法操作），"
+                          "已重启客户端，新窗口可正常操作" % label)
+        # 窗口本来可见 → 只置前，不重启
+        found, fg_ok, _hwnd = common.activate_windows_of(pids)
+        if not found:
+            return True, ("%s已在运行（pid %s），但没找到它的主窗口，"
+                          "请从任务栏/托盘点开" % (label, pids[0]))
+        how = "已切到前台"
         if fg_ok is False:
-            how += "；但它没能抢到前台，若点不动请右键托盘图标选择打开"
+            how += "；但它没能抢到前台，若点不动请从任务栏点开"
         return True, "%s已在运行（pid %s），%s" % (label, pids[0], how)
 
     ok_l, _exe, msg_l = _spawn_client(ch, procs)
